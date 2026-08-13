@@ -157,6 +157,15 @@ struct SelectTextArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct PressKeyArgs {
+    #[serde(flatten)]
+    target: ActionArgs,
+    /// Key or chord: `return`, `escape`, `up`, `down`, or with --allow-hid any
+    /// chord such as `cmd+shift+p`, `f5`, `ctrl+alt+delete`.
+    key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SecondaryActionArgs {
     #[serde(flatten)]
     target: ActionArgs,
@@ -446,6 +455,25 @@ impl CuaServer {
     }
 
     #[tool(
+        description = "Press a key on an element. `return`/`enter` and `escape` map to the accessibility verbs AXConfirm and AXCancel, and `up`/`down` to AXIncrement/AXDecrement on steppers and sliders — those work in the background without touching the cursor. Any other key or chord (cmd+shift+p, f5, ctrl+alt+delete) has NO accessibility equivalent and can only be sent as a real key event, which moves the cursor and steals focus; that is refused unless the server was started with --allow-hid. Every result reports `delivery: ax` or `delivery: hid` so you always know which happened."
+    )]
+    async fn press_key(
+        &self,
+        Parameters(a): Parameters<PressKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = match a.target.target() {
+            Ok(t) => t,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.target.app.clone();
+        let key = a.key.clone();
+        match self.native(move |c| c.press_key(&app, target, &key)).await {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
         description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions."
     )]
     async fn perform_secondary_action(
@@ -556,17 +584,24 @@ fn yes_no(b: bool) -> &'static str {
 /// observable — but hiding it would let an agent believe every dispatched action
 /// took effect, which is the failure mode that makes UI automation untrustworthy.
 fn render_action(r: &cua_core::ActionResult) -> String {
-    format!(
-        "{} on {}\nui_changed: {}{}",
+    let mut s = format!(
+        "{} on {}\ndelivery: {}{}\nui_changed: {}",
         r.verb,
         r.target,
-        r.ui_changed,
-        if r.ui_changed {
-            ""
+        r.delivery.as_str(),
+        if r.delivery == cua_core::Delivery::Hid {
+            "  (a real key event: the cursor and keyboard focus were used, exactly as if the user pressed the keys)"
         } else {
-            "  (no observable change; call get_app_state to check, or the control may be a no-op)"
-        }
-    )
+            "  (accessibility action: cursor, focus and frontmost app untouched)"
+        },
+        r.ui_changed,
+    );
+    if !r.ui_changed {
+        s.push_str(
+            "  (no observable change; call get_app_state to check, or the control may be a no-op)",
+        );
+    }
+    s
 }
 
 impl rmcp::ServerHandler for CuaServer {

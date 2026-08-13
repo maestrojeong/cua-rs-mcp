@@ -68,20 +68,39 @@ So the honest ceiling is: cua-rs drives *structured* UI extremely well and
 cannot drive canvas. That is an acceptable trade for the coexistence property,
 and it is written into the README rather than hidden.
 
-### The `press_key` question, open
+### `press_key`: decided
 
 Three options, none free:
 
-1. **`AXUIElementPostKeyboardEvent`** — app-scoped key event, in the crate,
-   deprecated, weak modifier support. Notably OpenAI does **not** use it.
-2. **`CGEventPost` fallback** — works everywhere, steals focus. The thing this
-   project exists to avoid.
-3. **Ship no `press_key`.** What OpenAI effectively did.
+1. **`AXUIElementPostKeyboardEvent`** — app-scoped, in the crate, deprecated, no
+   modifier-chord support. OpenAI does not link it. Rejected.
+2. **Ship no `press_key`** — what OpenAI effectively did. Leaves the most-asked-for
+   capability missing. Rejected.
+3. **AX where a verb exists, HID behind an explicit flag otherwise.** Chosen.
 
-Current plan: default to AX-only; if a HID path lands it must be enabled by an
-explicit flag *and* must report `delivery: hid` in the result, so an agent can
-never quietly grab the cursor. A silent fallback would destroy the one property
-that distinguishes this server.
+So `press_key` maps `return`/`enter` to `AXConfirm`, `escape` to `AXCancel`, and
+`up`/`down` to `AXIncrement`/`AXDecrement`. Those stay in the background. Anything
+else — every chord, every letter — requires starting the server with
+`--allow-hid`, and the result then says `delivery: hid`.
+
+Three properties make this safe rather than a loophole:
+
+- **The flag is start-time, not per-call.** If it were an argument, an agent
+  could grant itself the capability. A human decides once, at launch.
+- **The marker is on every result**, not just HID ones, so `delivery: ax` is a
+  positive assertion rather than an absence to be inferred.
+- **The code is in its own crate.** `cua-hid` is the only place `CGEventPost`
+  appears, and `cua-ax`/`cua-capture` do not depend on it. The boundary is
+  enforced by the dependency graph, not by a comment.
+
+One subtlety worth recording, because it produced a self-contradicting error
+message before it was fixed: a key can *have* an AX verb that the *target element*
+does not accept. A tab button has `AXPress` and `AXShowMenu` but not `AXCancel`, so
+`escape` on it used to fall through to the generic "no accessibility equivalent"
+refusal — text that named `escape` as something which works without HID. That case
+now has its own error naming the verb, listing what the element does accept, and
+pointing at where `AXCancel` usually lives (the window or a dialog's default
+button).
 
 ---
 
@@ -316,11 +335,8 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 
 | | Why |
 |---|:--|
-| `press_key` | see §1; strategy undecided on purpose |
-| `drag` | no AX verb; would require HID |
-| `type_text` | `set_value` covers the safe case; append semantics need a key path |
+| `drag` | no AX verb; would need HID pointer synthesis, which `cua-hid` does not do yet |
 | skeleton traversal / `scope_element_id` | the big token win, not yet needed at 1500 nodes |
-| `find` / `wait_for` | valuable; the model can currently grep the tree itself |
 | AX notification streams (`AXObserver`) | would replace the fingerprint heuristic in §10 |
 | menu invocation | needs temporary activation + focus restore; easy to get wrong |
 | Spaces handling | off-Space windows are observation-only, matching prior art |

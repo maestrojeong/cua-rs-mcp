@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 cua-ax.workspace = true
 cua-capture.workspace = true
+cua-hid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true

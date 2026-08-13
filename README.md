@@ -46,14 +46,22 @@ cua-rs delivers actions *directly to the target UI element* instead.
 | occluded / off-Space window | blank or stale capture | **captures correctly** |
 | you working simultaneously | input fights the agent | **works** |
 
-There is no `CGEventPost` call anywhere in this repository. The coexistence
-property is not a tuning choice — it falls straight out of never making one.
+There is exactly **one** line in this repository that posts an HID event, and it
+lives in `cua-hid`, which is unreachable unless you start the server with
+`--allow-hid`:
 
 ```console
-$ grep -rn 'CGEventPost' crates/ | grep -v '^.*//'
-$ echo $?
-1
+$ grep -rn 'CGEvent::post' crates/*/src/*.rs
+crates/cua-hid/src/lib.rs:131:  CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+
+$ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
+0
 ```
+
+The boundary is enforced by the dependency graph, not by discipline: the crates
+that do the actual driving cannot reach the one that can move your pointer. So
+the coexistence property is not a tuning choice — it is what the default build
+structurally *can* do. See [the one escape hatch](#the-one-escape-hatch).
 
 ## Quick start
 
@@ -211,6 +219,12 @@ dialect would cost recognition and buy nothing.
 | `click` | activate an element (`AXPress` → `AXPick` → `AXConfirm`) |
 | `set_value` | write a text element's value |
 | `scroll` | page a scroll area |
+| `type_text` | append text, preserving what is there |
+| `select_text` | select a substring, with prefix/suffix anchors |
+| `press_key` | Return / Escape / arrows via AX; chords need `--allow-hid` |
+| `perform_secondary_action` | any AX verb: `AXShowMenu`, `AXRaise`, `AXIncrement` |
+| `find` | search the snapshot by text |
+| `wait_for` | poll until text appears or disappears |
 
 `get_app_state` knobs: `include_screenshot` (drop it on follow-up calls — it is
 the expensive part), `max_image_dim`, `max_elements`, `verbose` (show the
@@ -225,15 +239,30 @@ Honest ones, not a roadmap.
 | buttons, menus, checkboxes, tabs, list rows | yes |
 | text fields, search fields, text areas | yes |
 | Electron apps (Slack, VS Code, Discord) | yes, after a one-time `AXManualAccessibility` poke |
-| arbitrary shortcuts (`⌘⇧P`) | **no** — AX has no general key verb |
+| Return, Escape, stepper arrows | yes — `AXConfirm` / `AXCancel` / `AXIncrement` |
+| arbitrary chords (`⌘⇧P`, `f5`) | only with `--allow-hid`, which moves the cursor |
 | canvas apps (Figma internals, games) | **no** — no AX elements to act on |
 | terminals | mostly no |
 | drag | **no** — macOS AX has no semantic drag |
 
-`set_value` **replaces** rather than appends, and apps that only react to real
-key events will ignore it. A HID fallback for these cases is deliberately not
-enabled; if it lands it will be opt-in and will say so in the result rather than
-quietly grabbing your cursor.
+`set_value` **replaces** rather than appends; `type_text` appends. Apps that only
+react to real key events will ignore both.
+
+### The one escape hatch
+
+`press_key` can send a real key event for chords AX cannot express, but only
+when the server was started with `--allow-hid`. That path moves the cursor and
+takes keyboard focus, so it is off by default and never silent:
+
+```text
+delivery: hid  (a real key event: the cursor and keyboard focus were used,
+                exactly as if the user pressed the keys)
+```
+
+Every action result carries `delivery: ax` or `delivery: hid`, so an agent can
+never mistake one for the other. All HID code lives in one crate, `cua-hid`,
+which `cua-ax` and `cua-capture` do not depend on — `grep -rl cua_hid crates/`
+enumerates every site that can touch your pointer.
 
 `ui_changed: false` in an action result is reported honestly. It does not always
 mean failure — some controls change nothing observable — but hiding it would let
@@ -243,7 +272,7 @@ an agent believe every dispatched action landed.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 18 tests, no permissions needed
+cargo test --workspace          # 50 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

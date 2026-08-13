@@ -4,6 +4,7 @@ members = [
     "crates/cua-ax",
     "crates/cua-capture",
     "crates/cua-core",
+    "crates/cua-hid",
     "crates/cua-mcp",
 ]
 
@@ -19,6 +20,7 @@ authors = ["Yeonwoo Jeong <maestrojeong@gmail.com>"]
 cua-ax = { path = "crates/cua-ax" }
 cua-capture = { path = "crates/cua-capture" }
 cua-core = { path = "crates/cua-core" }
+cua-hid = { path = "crates/cua-hid" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "process", "signal", "fs"] }
 futures = "0.3"

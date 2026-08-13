@@ -67,6 +67,30 @@ pub enum CoreError {
     #[error("`{app}` has no window that can be captured or driven right now")]
     NoWindow { app: String },
 
+    /// A key was requested that only a real key event can deliver, but the
+    /// server was not started with `--allow-hid`.
+    ///
+    /// Deliberately not a silent fallback: synthesizing the event would move the
+    /// user's cursor and steal their focus, which is the one thing this server
+    /// promises not to do. The operator, not the agent, decides to allow it.
+    #[error("`{key}` has no accessibility equivalent, so it can only be sent as a real key event. That moves the cursor and steals keyboard focus, so it requires starting the server with --allow-hid. Alternatives that stay in the background: return/enter and escape on an element that accepts AXConfirm/AXCancel, perform_secondary_action with AXShowMenu for a context menu, or clicking the menu item directly")]
+    HidRefused { key: String },
+
+    /// The key has an AX verb, but this particular element does not accept it.
+    ///
+    /// Kept distinct from [`CoreError::HidRefused`] so the message cannot
+    /// contradict itself by naming the very key it just refused as one that
+    /// works.
+    #[error("`{key}` maps to the accessibility verb {verb}, but this element does not accept it (it supports {available}). {verb} usually lives on the window or the dialog's default button, not on an inner control — target that instead, or start the server with --allow-hid to send a real key event")]
+    KeyVerbUnsupported {
+        key: String,
+        verb: &'static str,
+        available: String,
+    },
+
+    #[error("{0}")]
+    Hid(String),
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -166,6 +190,62 @@ pub struct ActionResult {
     pub target: String,
     /// True when the target's window changed in a way we could observe.
     pub ui_changed: bool,
+    /// Which mechanism carried the action.
+    ///
+    /// Present on every result, not just the interesting ones, so an agent never
+    /// has to infer it from the absence of a field.
+    pub delivery: Delivery,
+}
+
+impl ActionResult {
+    /// An action that went through the accessibility API, which is all of them
+    /// unless `--allow-hid` was passed.
+    fn ax(verb: impl Into<String>, target: String, ui_changed: bool) -> Self {
+        Self {
+            verb: verb.into(),
+            target,
+            ui_changed,
+            delivery: Delivery::Ax,
+        }
+    }
+}
+
+/// How an action reached the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Addressed to a specific UI element. Did not move the cursor, change
+    /// focus, or activate the app.
+    Ax,
+    /// Written to the session's shared HID event stream. Behaves exactly as if
+    /// the user pressed the keys: it goes to whatever has focus, and it competes
+    /// with the human at the keyboard.
+    Hid,
+}
+
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Ax => "ax",
+            Delivery::Hid => "hid",
+        }
+    }
+}
+
+/// Whether this process may synthesize HID input.
+///
+/// A process-global switch set once from the command line, rather than a
+/// per-call argument. If it were per-call, an agent could grant itself the
+/// capability by passing a flag — the point is that a *human* decides, at launch,
+/// whether this server is ever allowed to touch the shared cursor.
+static ALLOW_HID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the HID fallback. Call once, from argument parsing, before serving.
+pub fn allow_hid(allow: bool) {
+    ALLOW_HID.store(allow, Ordering::Relaxed);
+}
+
+pub fn hid_allowed() -> bool {
+    ALLOW_HID.load(Ordering::Relaxed)
 }
 
 // ── worker ───────────────────────────────────────────────────────────────────
@@ -358,6 +438,13 @@ impl Cua {
         self.exec(move |inner| {
             inner.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
         })?
+    }
+
+    /// Press a key, through AX when the key has a verb and HID otherwise.
+    pub fn press_key(&self, app: &str, target: Target, key: &str) -> Result<ActionResult> {
+        let app = app.to_string();
+        let key = key.to_string();
+        self.exec(move |inner| inner.press_key(&app, target, &key))?
     }
 
     /// Deliver an arbitrary AX action by name.
@@ -577,11 +664,8 @@ impl Inner {
         let (info, el, desc) = self.resolve(query, target)?;
         let before = self.window_fingerprint(info.pid);
         let verb = el.activate()?;
-        Ok(ActionResult {
-            verb: verb.to_string(),
-            target: desc,
-            ui_changed: self.changed_since(info.pid, before),
-        })
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult::ax(verb, desc, changed))
     }
 
     fn set_value(&mut self, query: &str, target: Target, value: &str) -> Result<ActionResult> {
@@ -589,11 +673,8 @@ impl Inner {
         let (info, el, desc) = self.resolve(query, target)?;
         let before = self.window_fingerprint(info.pid);
         el.set_string(cua_ax::attr::VALUE, value)?;
-        Ok(ActionResult {
-            verb: "AXValue=".to_string(),
-            target: desc,
-            ui_changed: self.changed_since(info.pid, before),
-        })
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult::ax("AXValue=", desc, changed))
     }
 
     fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
@@ -601,13 +682,14 @@ impl Inner {
         let (info, el, desc) = self.resolve(query, target)?;
         let before = self.window_fingerprint(info.pid);
         let write = el.append_text(text)?;
-        Ok(ActionResult {
-            // Name the mechanism, not just the intent. "typed" would imply
-            // keystrokes were synthesized, which is exactly what did not happen.
-            verb: format!("AXSelectedText+ ({})", write.as_str()),
-            target: desc,
-            ui_changed: self.changed_since(info.pid, before),
-        })
+        let changed = self.changed_since(info.pid, before);
+        // Name the mechanism, not just the intent. "typed" would imply
+        // keystrokes were synthesized, which is exactly what did not happen.
+        Ok(ActionResult::ax(
+            format!("AXSelectedText+ ({})", write.as_str()),
+            desc,
+            changed,
+        ))
     }
 
     fn select_text(
@@ -621,16 +703,71 @@ impl Inner {
         cua_ax::require_trusted()?;
         let (_, el, desc) = self.resolve(query, target)?;
         let range = el.select_text(text, prefix, suffix)?;
-        Ok(ActionResult {
-            verb: format!(
+        // Selecting text changes no window state the fingerprint can see, and
+        // claiming otherwise would be noise. The returned range is the evidence
+        // that it worked.
+        Ok(ActionResult::ax(
+            format!(
                 "AXSelectedTextRange={{offset:{},length:{}}}",
                 range.offset, range.length
             ),
-            target: desc,
-            // Selecting text changes no window state the fingerprint can see,
-            // and claiming otherwise would be noise. The returned range is the
-            // evidence that it worked.
-            ui_changed: false,
+            desc,
+            false,
+        ))
+    }
+
+    fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let (info, el, desc) = self.resolve(query, target)?;
+        let before = self.window_fingerprint(info.pid);
+
+        // AX first, for the handful of keys that have a semantic verb. This path
+        // keeps the guarantee: no cursor, no focus change, and it works on a
+        // background window.
+        let ax_verb = ax_verb_for_key(key);
+        if let Some(verb) = ax_verb {
+            let available = el.actions();
+            if available.iter().any(|a| a == verb) {
+                el.perform(verb)?;
+                let changed = self.changed_since(info.pid, before);
+                return Ok(ActionResult::ax(
+                    format!("{verb} (for {key})"),
+                    desc,
+                    changed,
+                ));
+            }
+            // The key *does* have an AX verb; this element just does not accept
+            // it. Reporting the generic "no accessibility verb" message here
+            // would contradict itself, since that message names `escape` as
+            // something that works without HID. Say what actually went wrong,
+            // and where the verb usually lives.
+            if !hid_allowed() {
+                return Err(CoreError::KeyVerbUnsupported {
+                    key: key.to_string(),
+                    verb,
+                    available: format!("{available:?}"),
+                });
+            }
+        }
+
+        // Everything else needs a real key event, which AX cannot express.
+        if !hid_allowed() {
+            return Err(CoreError::HidRefused {
+                key: key.to_string(),
+            });
+        }
+
+        let chord = cua_hid::parse_chord(key).map_err(|e| CoreError::Hid(e.to_string()))?;
+        cua_hid::post_chord(chord).map_err(|e| CoreError::Hid(e.to_string()))?;
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult {
+            verb: format!("HID key {key}"),
+            // The target is informational only here: a HID event goes to whatever
+            // has focus, not to the element the caller named. Say so rather than
+            // implying the element received it.
+            target: format!("{desc} — NOTE: delivered to the focused app, not this element"),
+            ui_changed: changed,
+            delivery: Delivery::Hid,
         })
     }
 
@@ -653,11 +790,8 @@ impl Inner {
         }
         let before = self.window_fingerprint(info.pid);
         el.perform(action)?;
-        Ok(ActionResult {
-            verb: action.to_string(),
-            target: desc,
-            ui_changed: self.changed_since(info.pid, before),
-        })
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult::ax(action, desc, changed))
     }
 
     fn find(&mut self, query: &str, needle: &str, limit: usize) -> Result<FindResult> {
@@ -750,11 +884,8 @@ impl Inner {
         for _ in 0..pages.max(1) {
             el.perform(verb)?;
         }
-        Ok(ActionResult {
-            verb: verb.to_string(),
-            target: desc,
-            ui_changed: self.changed_since(info.pid, before),
-        })
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult::ax(verb, desc, changed))
     }
 
     /// A cheap proxy for "did the UI move".
@@ -787,6 +918,23 @@ impl Inner {
         // and waiting longer would add latency to every single action.
         std::thread::sleep(std::time::Duration::from_millis(120));
         self.window_fingerprint(pid) != before
+    }
+}
+
+/// The AX verb that expresses a key, when one exists.
+///
+/// This list is short because AX genuinely has almost nothing here: it models
+/// *intents* (confirm, cancel, increment) rather than keys. Return and Escape map
+/// cleanly because "accept" and "dismiss" are intents; the arrows map only on
+/// elements that expose stepper semantics, and everything else — every modifier
+/// chord, every letter — has no representation at all.
+fn ax_verb_for_key(key: &str) -> Option<&'static str> {
+    match key.trim().to_lowercase().as_str() {
+        "return" | "enter" => Some(cua_ax::action::CONFIRM),
+        "escape" | "esc" => Some(cua_ax::action::CANCEL),
+        "up" => Some(cua_ax::action::INCREMENT),
+        "down" => Some(cua_ax::action::DECREMENT),
+        _ => None,
     }
 }
 
@@ -1074,6 +1222,70 @@ mod tests {
         let nodes = vec![tnode(0, "AXStaticText", Some("dup"), Some("dup"), true)];
         let hits = match_nodes(&nodes, "dup", 5);
         assert_eq!(hits[0].matches("dup").count(), 1, "got {:?}", hits[0]);
+    }
+
+    #[test]
+    fn only_intent_like_keys_have_an_ax_verb() {
+        assert_eq!(ax_verb_for_key("return"), Some("AXConfirm"));
+        assert_eq!(ax_verb_for_key("Enter"), Some("AXConfirm"));
+        assert_eq!(ax_verb_for_key(" ESC "), Some("AXCancel"));
+        assert_eq!(ax_verb_for_key("up"), Some("AXIncrement"));
+        assert_eq!(ax_verb_for_key("down"), Some("AXDecrement"));
+        // The whole reason cua-hid exists: AX cannot express these.
+        assert_eq!(ax_verb_for_key("cmd+shift+p"), None);
+        assert_eq!(ax_verb_for_key("a"), None);
+        assert_eq!(ax_verb_for_key("f5"), None);
+    }
+
+    #[test]
+    fn hid_is_off_until_a_human_turns_it_on() {
+        // The default matters: a server started without the flag must refuse.
+        assert!(!hid_allowed(), "HID must be opt-in, never the default");
+        allow_hid(true);
+        assert!(hid_allowed());
+        allow_hid(false);
+        assert!(!hid_allowed());
+    }
+
+    #[test]
+    fn delivery_labels_are_stable() {
+        assert_eq!(Delivery::Ax.as_str(), "ax");
+        assert_eq!(Delivery::Hid.as_str(), "hid");
+    }
+
+    #[test]
+    fn an_unsupported_ax_verb_does_not_contradict_itself() {
+        // The bug this guards: escape *does* have an AX verb, so refusing it
+        // with the generic HID message produced text that named escape as
+        // something that works without HID.
+        let msg = CoreError::KeyVerbUnsupported {
+            key: "escape".into(),
+            verb: "AXCancel",
+            available: r#"["AXPress"]"#.into(),
+        }
+        .to_string();
+        assert!(msg.contains("AXCancel"), "must name the verb: {msg}");
+        assert!(
+            msg.contains("[\"AXPress\"]"),
+            "must list what the element does accept: {msg}"
+        );
+        assert!(
+            !msg.contains("escape work"),
+            "must not claim escape works while refusing escape: {msg}"
+        );
+    }
+
+    #[test]
+    fn refusing_hid_explains_the_ax_alternatives() {
+        let msg = CoreError::HidRefused {
+            key: "cmd+shift+p".into(),
+        }
+        .to_string();
+        assert!(msg.contains("--allow-hid"), "must name the flag: {msg}");
+        assert!(
+            msg.contains("AXShowMenu") && msg.contains("return/enter"),
+            "must point at background-safe alternatives: {msg}"
+        );
     }
 
     #[test]

@@ -104,8 +104,29 @@ async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let arg = std::env::args().nth(1);
-    if let Some(a) = arg.as_deref() {
+    // `--allow-hid` is a start-time flag, never a per-call argument: the point is
+    // that a human decides once whether this server may ever touch the shared
+    // cursor. An agent must not be able to grant itself the capability.
+    let allow_hid = std::env::args().any(|a| a == "--allow-hid");
+
+    // Two separate questions, kept separate. `mode` is the first *recognized*
+    // argument, flag or not, so `--help` still prints help even though it starts
+    // with dashes; `bind` is the first argument that is not a flag at all, so
+    // `cua-rs --allow-hid 9331` binds a port rather than trying to serve on a
+    // host named "--allow-hid".
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = args
+        .iter()
+        .find(|a| {
+            matches!(
+                a.as_str(),
+                "--version" | "-V" | "--help" | "-h" | "permissions"
+            )
+        })
+        .cloned();
+    let bind = args.iter().find(|a| !a.starts_with('-')).cloned();
+
+    if let Some(a) = mode.as_deref() {
         match a {
             "--version" | "-V" => {
                 println!("cua-rs {}", env!("CARGO_PKG_VERSION"));
@@ -114,11 +135,18 @@ fn main() -> anyhow::Result<()> {
             "--help" | "-h" => {
                 println!(
                     "cua-rs {}\n\n\
-                     Drive native macOS apps over MCP, through the Accessibility API.\n\n\
+                     Drive native macOS apps over MCP, through the Accessibility API.\n\
+                     Does not move your cursor, change focus, or switch Space.\n\n\
                      USAGE:\n  \
                        cua-rs                 serve MCP over stdio (default)\n  \
                        cua-rs <port|addr>     serve Streamable HTTP on loopback\n  \
                        cua-rs permissions     print grant status and exit\n\n\
+                     OPTIONS:\n  \
+                       --allow-hid            permit synthesizing real key events for\n                         \
+                                              chords the accessibility API cannot express\n                         \
+                                              (cmd+shift+p, f5). THIS MOVES THE CURSOR and\n                         \
+                                              takes keyboard focus. Off by default; results\n                         \
+                                              that used it report delivery: hid.\n\n\
                      Requires Accessibility, and Screen Recording for screenshots.",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -148,10 +176,21 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    cua_core::allow_hid(allow_hid);
+    if allow_hid {
+        // Loud, because it silently changes the server's central promise. Anyone
+        // reading logs to work out why their cursor jumped should find this.
+        tracing::warn!(
+            "--allow-hid is ON: press_key may synthesize real key events for chords the \
+             accessibility API cannot express. Those MOVE THE CURSOR and take keyboard focus. \
+             Affected results report delivery: hid."
+        );
+    }
+
     let cua = Arc::new(Cua::new());
     warn_about_permissions(&cua);
 
-    let bind = arg.filter(|a| a != "stdio");
+    let bind = bind.filter(|a| a != "stdio");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
