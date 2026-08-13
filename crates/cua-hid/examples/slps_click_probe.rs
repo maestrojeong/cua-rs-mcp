@@ -133,6 +133,17 @@ fn cps_event(subtype: i16, window_id: u32) -> Option<objc2::rc::Retained<CGEvent
     ev.CGEvent()
 }
 
+/// Who the workspace currently considers frontmost, as `(pid, name)`.
+fn frontmost() -> Option<(i32, String)> {
+    let app = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    Some((
+        app.processIdentifier(),
+        app.localizedName()
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+    ))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
@@ -197,10 +208,18 @@ fn main() {
     println!("flags={flags:?} -> point ({:.0}, {:.0})", point.x, point.y);
 
     if has("front") {
+        // Report who holds the foreground before and after, because
+        // `_SLPSSetFrontProcessWithOptions` returning `CGError 0` means the
+        // call was accepted, not that anything changed. Trusting a
+        // fire-and-forget return value is the exact mistake that made an
+        // earlier `CGEventPostToPid` result look like a success for a week.
+        println!("  frontmost before: {:?}", frontmost());
         match set_front_process(&psn, w.id, K_CPS_USER_GENERATED) {
             Some(code) => println!("  _SLPSSetFrontProcessWithOptions -> CGError {code}"),
             None => println!("  _SLPSSetFrontProcessWithOptions NOT FOUND"),
         }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        println!("  frontmost after : {:?}  (target pid {pid})", frontmost());
     }
 
     if has("cps") {

@@ -26,6 +26,7 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "libc",
     "objc2-core-foundation",
     "objc2-core-graphics",
     "NSEvent",
@@ -33,6 +34,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
     "NSApplication",
     "NSRunningApplication",
+    "NSWorkspace",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
