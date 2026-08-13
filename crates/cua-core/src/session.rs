@@ -336,6 +336,60 @@ impl Cua {
         let app = app.to_string();
         self.exec(move |inner| inner.scroll(&app, target, dir, pages))?
     }
+
+    /// Append text to an element, preferring insertion over replacement.
+    pub fn type_text(&self, app: &str, target: Target, text: &str) -> Result<ActionResult> {
+        let app = app.to_string();
+        let text = text.to_string();
+        self.exec(move |inner| inner.type_text(&app, target, &text))?
+    }
+
+    /// Select a literal substring inside an element's text.
+    pub fn select_text(
+        &self,
+        app: &str,
+        target: Target,
+        text: &str,
+        prefix: Option<String>,
+        suffix: Option<String>,
+    ) -> Result<ActionResult> {
+        let app = app.to_string();
+        let text = text.to_string();
+        self.exec(move |inner| {
+            inner.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
+        })?
+    }
+
+    /// Deliver an arbitrary AX action by name.
+    pub fn perform_action(&self, app: &str, target: Target, action: &str) -> Result<ActionResult> {
+        let app = app.to_string();
+        let action = action.to_string();
+        self.exec(move |inner| inner.perform_action(&app, target, &action))?
+    }
+
+    /// Elements whose label, value or role contains `needle`.
+    ///
+    /// Reads the existing snapshot when there is one, and takes a fresh one
+    /// otherwise, so the caller does not have to sequence a `get_app_state`
+    /// first just to search.
+    pub fn find(&self, app: &str, needle: &str, limit: usize) -> Result<FindResult> {
+        let app = app.to_string();
+        let needle = needle.to_string();
+        self.exec(move |inner| inner.find(&app, &needle, limit))?
+    }
+
+    /// Poll until `needle` appears in (or disappears from) an app's tree.
+    pub fn wait_for(
+        &self,
+        app: &str,
+        needle: &str,
+        want: Presence,
+        timeout_ms: u64,
+    ) -> Result<WaitOutcome> {
+        let app = app.to_string();
+        let needle = needle.to_string();
+        self.exec(move |inner| inner.wait_for(&app, &needle, want, timeout_ms))?
+    }
 }
 
 impl Default for Cua {
@@ -542,6 +596,146 @@ impl Inner {
         })
     }
 
+    fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let (info, el, desc) = self.resolve(query, target)?;
+        let before = self.window_fingerprint(info.pid);
+        let write = el.append_text(text)?;
+        Ok(ActionResult {
+            // Name the mechanism, not just the intent. "typed" would imply
+            // keystrokes were synthesized, which is exactly what did not happen.
+            verb: format!("AXSelectedText+ ({})", write.as_str()),
+            target: desc,
+            ui_changed: self.changed_since(info.pid, before),
+        })
+    }
+
+    fn select_text(
+        &mut self,
+        query: &str,
+        target: Target,
+        text: &str,
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let (_, el, desc) = self.resolve(query, target)?;
+        let range = el.select_text(text, prefix, suffix)?;
+        Ok(ActionResult {
+            verb: format!(
+                "AXSelectedTextRange={{offset:{},length:{}}}",
+                range.offset, range.length
+            ),
+            target: desc,
+            // Selecting text changes no window state the fingerprint can see,
+            // and claiming otherwise would be noise. The returned range is the
+            // evidence that it worked.
+            ui_changed: false,
+        })
+    }
+
+    fn perform_action(
+        &mut self,
+        query: &str,
+        target: Target,
+        action: &str,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let (info, el, desc) = self.resolve(query, target)?;
+        let available = el.actions();
+        if !available.iter().any(|a| a == action) {
+            // List what the element *does* support: an agent that guessed a verb
+            // can fix itself in one step instead of retrying blindly.
+            return Err(CoreError::Ax(cua_ax::AxError::Unsupported {
+                what: "action",
+                name: format!("{action} (this element supports {available:?})"),
+            }));
+        }
+        let before = self.window_fingerprint(info.pid);
+        el.perform(action)?;
+        Ok(ActionResult {
+            verb: action.to_string(),
+            target: desc,
+            ui_changed: self.changed_since(info.pid, before),
+        })
+    }
+
+    fn find(&mut self, query: &str, needle: &str, limit: usize) -> Result<FindResult> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+
+        // Search the snapshot the agent is already holding, so the indices it
+        // gets back stay valid against the state it has seen. Only walk afresh
+        // when there is nothing to search.
+        let snapshot_id = match self.snapshots.get(&info.pid) {
+            Some(s) => s.id,
+            None => {
+                let opts = StateOptions {
+                    include_screenshot: false,
+                    ..Default::default()
+                };
+                self.get_app_state(query, opts)?.snapshot_id
+            }
+        };
+
+        let snap = self
+            .snapshots
+            .get(&info.pid)
+            .ok_or_else(|| CoreError::NoSnapshot {
+                app: info.name.clone(),
+            })?;
+
+        let hits = match_nodes(&snap.nodes, needle, limit);
+        Ok(FindResult {
+            snapshot_id,
+            total: hits.len(),
+            lines: hits,
+            searched: snap.nodes.len(),
+        })
+    }
+
+    fn wait_for(
+        &mut self,
+        query: &str,
+        needle: &str,
+        want: Presence,
+        timeout_ms: u64,
+    ) -> Result<WaitOutcome> {
+        cua_ax::require_trusted()?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let opts = StateOptions {
+            include_screenshot: false,
+            ..Default::default()
+        };
+
+        let mut polls = 0u32;
+        loop {
+            polls += 1;
+            let state = self.get_app_state(query, opts)?;
+            let present = state.tree.contains(needle);
+            if present == want.wants_present() {
+                return Ok(WaitOutcome {
+                    satisfied: true,
+                    polls,
+                    snapshot_id: state.snapshot_id,
+                    elapsed_ms: elapsed_ms_until(deadline, timeout_ms),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Ok(WaitOutcome {
+                    satisfied: false,
+                    polls,
+                    snapshot_id: state.snapshot_id,
+                    elapsed_ms: timeout_ms,
+                });
+            }
+            // A full tree walk per poll is not cheap, so the floor here is what
+            // keeps `wait_for` from becoming a busy loop that starves the app it
+            // is watching.
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
     fn scroll(
         &mut self,
         query: &str,
@@ -594,6 +788,123 @@ impl Inner {
         std::thread::sleep(std::time::Duration::from_millis(120));
         self.window_fingerprint(pid) != before
     }
+}
+
+// ── find / wait ──────────────────────────────────────────────────────────────
+
+/// Minimum gap between `wait_for` polls.
+///
+/// Each poll is a full tree walk plus AX IPC, so polling tighter than this would
+/// spend more of the target app's main-thread time answering us than letting it
+/// make the progress we are waiting for.
+const POLL_INTERVAL_MS: u64 = 250;
+
+/// Whether the caller is waiting for text to appear or to go away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Appears,
+    Disappears,
+}
+
+impl Presence {
+    fn wants_present(self) -> bool {
+        matches!(self, Presence::Appears)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FindResult {
+    pub snapshot_id: u64,
+    /// Matching lines, already rendered.
+    pub lines: Vec<String>,
+    pub total: usize,
+    /// How many nodes were scanned, so "0 matches" can be told apart from "the
+    /// tree was empty because the app exposes nothing".
+    pub searched: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WaitOutcome {
+    pub satisfied: bool,
+    pub polls: u32,
+    pub snapshot_id: u64,
+    pub elapsed_ms: u64,
+}
+
+fn elapsed_ms_until(deadline: Instant, timeout_ms: u64) -> u64 {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    timeout_ms.saturating_sub(remaining)
+}
+
+/// Case-insensitive substring search over a snapshot's nodes.
+///
+/// Searches label, value and role, in that priority order — a query like
+/// "Send" should find the button labeled Send before it finds an `AXSendButton`
+/// role — and returns rendered lines rather than raw nodes so the output format
+/// matches what `get_app_state` already showed the agent.
+///
+/// Actionable matches are listed first: a search is almost always the prelude to
+/// an action, and a non-actionable static-text hit is context at best.
+fn match_nodes(nodes: &[AxNode], needle: &str, limit: usize) -> Vec<String> {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(u8, &AxNode)> = Vec::new();
+    for node in nodes {
+        let rank = if node
+            .label
+            .as_deref()
+            .is_some_and(|l| l.to_lowercase().contains(&needle))
+        {
+            0
+        } else if node
+            .value
+            .as_deref()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        {
+            1
+        } else if node.role.to_lowercase().contains(&needle) {
+            2
+        } else {
+            continue;
+        };
+        // Actionable-first, then match quality, then document order.
+        scored.push((rank + if node.is_actionable() { 0 } else { 3 }, node));
+    }
+
+    scored.sort_by_key(|(rank, node)| (*rank, node.index));
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|(_, node)| render_match(node))
+        .collect()
+}
+
+fn render_match(node: &AxNode) -> String {
+    let mut s = String::new();
+    if node.is_actionable() {
+        s.push_str(&format!("[{}] ", node.index));
+    } else {
+        s.push_str("(not actionable) ");
+    }
+    s.push_str(&node.role);
+    if let Some(l) = &node.label {
+        s.push_str(&format!(" {l:?}"));
+    }
+    if let Some(v) = &node.value {
+        if node.label.as_deref() != Some(v.as_str()) {
+            let short: String = v.chars().take(80).collect();
+            s.push_str(&format!(" = {short:?}"));
+        }
+    }
+    if !node.enabled {
+        s.push_str(" (disabled)");
+    }
+    s
 }
 
 /// Pick the SCK window that corresponds to an AX window.
@@ -655,6 +966,7 @@ fn describe_node(node: &AxNode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cua_ax::Element;
     use objc2_core_foundation::{CGPoint, CGSize};
 
     fn win(id: u32, pid: libc::pid_t, x: f64, y: f64, w: f64, h: f64) -> WindowInfo {
@@ -684,6 +996,90 @@ mod tests {
                 height: h,
             },
         }
+    }
+
+    fn tnode(
+        index: usize,
+        role: &str,
+        label: Option<&str>,
+        value: Option<&str>,
+        act: bool,
+    ) -> AxNode {
+        AxNode {
+            index,
+            depth: 0,
+            parent: None,
+            role: role.to_string(),
+            subrole: None,
+            label: label.map(str::to_string),
+            value: value.map(str::to_string),
+            help: None,
+            frame: None,
+            enabled: true,
+            focused: false,
+            selected: false,
+            actions: if act {
+                vec!["AXPress".to_string()]
+            } else {
+                vec![]
+            },
+            settable: false,
+            element: Element::system_wide(),
+        }
+    }
+
+    #[test]
+    fn find_matches_case_insensitively_across_label_value_and_role() {
+        let nodes = vec![
+            tnode(0, "AXButton", Some("Send"), None, true),
+            tnode(1, "AXTextArea", None, Some("please SEND it"), true),
+            tnode(2, "AXSendButton", None, None, true),
+            tnode(3, "AXButton", Some("Cancel"), None, true),
+        ];
+        let hits = match_nodes(&nodes, "send", 10);
+        assert_eq!(hits.len(), 3, "got {hits:?}");
+        // Label match ranks above value match, which ranks above role match.
+        assert!(hits[0].contains("\"Send\""), "got {:?}", hits[0]);
+        assert!(hits[1].contains("please SEND it"), "got {:?}", hits[1]);
+        assert!(hits[2].contains("AXSendButton"), "got {:?}", hits[2]);
+    }
+
+    #[test]
+    fn find_puts_actionable_matches_before_context() {
+        let nodes = vec![
+            tnode(0, "AXStaticText", Some("Save now"), None, false),
+            tnode(1, "AXButton", Some("Save"), None, true),
+        ];
+        let hits = match_nodes(&nodes, "save", 10);
+        assert!(
+            hits[0].starts_with("[1] "),
+            "actionable first, got {hits:?}"
+        );
+        assert!(hits[1].starts_with("(not actionable)"), "got {hits:?}");
+    }
+
+    #[test]
+    fn find_respects_the_limit_and_rejects_an_empty_needle() {
+        let nodes: Vec<AxNode> = (0..10)
+            .map(|i| tnode(i, "AXButton", Some("item"), None, true))
+            .collect();
+        assert_eq!(match_nodes(&nodes, "item", 3).len(), 3);
+        // A zero limit must still return something rather than silently nothing.
+        assert_eq!(match_nodes(&nodes, "item", 0).len(), 1);
+        assert!(match_nodes(&nodes, "", 5).is_empty());
+    }
+
+    #[test]
+    fn find_does_not_print_a_value_that_repeats_the_label() {
+        let nodes = vec![tnode(0, "AXStaticText", Some("dup"), Some("dup"), true)];
+        let hits = match_nodes(&nodes, "dup", 5);
+        assert_eq!(hits[0].matches("dup").count(), 1, "got {:?}", hits[0]);
+    }
+
+    #[test]
+    fn presence_maps_to_the_expected_polarity() {
+        assert!(Presence::Appears.wants_present());
+        assert!(!Presence::Disappears.wants_present());
     }
 
     #[test]

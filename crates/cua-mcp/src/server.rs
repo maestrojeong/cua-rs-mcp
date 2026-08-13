@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use cua_core::{Cua, ScrollDir, StateOptions, Target};
+use cua_core::{Cua, Presence, ScrollDir, StateOptions, Target};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -132,6 +132,61 @@ struct ScrollArgs {
     /// Number of pages. Defaults to 1.
     #[serde(default)]
     pages: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TypeTextArgs {
+    #[serde(flatten)]
+    target: ActionArgs,
+    /// Text to append after the element's current contents.
+    text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SelectTextArgs {
+    #[serde(flatten)]
+    target: ActionArgs,
+    /// Literal substring to select, exactly as it appears in the tree.
+    text: String,
+    /// Text immediately before the target, to pick one of several occurrences.
+    #[serde(default)]
+    prefix: Option<String>,
+    /// Text immediately after the target.
+    #[serde(default)]
+    suffix: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SecondaryActionArgs {
+    #[serde(flatten)]
+    target: ActionArgs,
+    /// AX action name, e.g. `AXShowMenu`, `AXRaise`, `AXIncrement`.
+    action: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    /// Substring to look for in labels, values and roles.
+    text: String,
+    /// Maximum matches to return. Defaults to 20.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WaitForArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    /// Substring to wait for.
+    text: String,
+    /// Wait for the text to *disappear* instead of appear.
+    #[serde(default)]
+    gone: Option<bool>,
+    /// Give up after this many milliseconds. Defaults to 5000, capped at 60000.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 // ── server ───────────────────────────────────────────────────────────────────
@@ -345,6 +400,142 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Append text to a text element. Unlike set_value this preserves what is already there: it collapses the caret at the end and writes through AXSelectedText, falling back to a whole-value rewrite when the element exposes no settable selection (the result says which happened). Delivered through the accessibility API, so it needs no focus and does not move the cursor — but for the same reason apps that only react to real key events (terminals, canvas editors) will ignore it."
+    )]
+    async fn type_text(
+        &self,
+        Parameters(a): Parameters<TypeTextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = match a.target.target() {
+            Ok(t) => t,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.target.app.clone();
+        let text = a.text.clone();
+        match self.native(move |c| c.type_text(&app, target, &text)).await {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Select a literal substring inside a text element, so a following type_text overwrites exactly that span. Pass `prefix` and/or `suffix` to disambiguate a repeated string: the search matches prefix+text+suffix and selects only the `text` part. Without them the first occurrence wins. Returns the character range that was selected."
+    )]
+    async fn select_text(
+        &self,
+        Parameters(a): Parameters<SelectTextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = match a.target.target() {
+            Ok(t) => t,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.target.app.clone();
+        let (text, prefix, suffix) = (a.text.clone(), a.prefix.clone(), a.suffix.clone());
+        match self
+            .native(move |c| c.select_text(&app, target, &text, prefix, suffix))
+            .await
+        {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions."
+    )]
+    async fn perform_secondary_action(
+        &self,
+        Parameters(a): Parameters<SecondaryActionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = match a.target.target() {
+            Ok(t) => t,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.target.app.clone();
+        let action = a.action.clone();
+        match self
+            .native(move |c| c.perform_action(&app, target, &action))
+            .await
+        {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Search the current snapshot for elements whose label, value or role contains a string, case-insensitively. Much cheaper than re-reading a whole tree when you already know what you are looking for. Actionable matches are listed first, and label matches rank above value and role matches. Searches the snapshot you already have so the returned indices stay valid; takes a fresh one only if none exists."
+    )]
+    async fn find(&self, Parameters(a): Parameters<FindArgs>) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let text = a.text.clone();
+        let limit = a.limit.unwrap_or(20).clamp(1, 200);
+        match self.native(move |c| c.find(&app, &text, limit)).await {
+            Ok(r) => {
+                if r.lines.is_empty() {
+                    return Ok(ok(format!(
+                        "no element matching {:?} among {} elements (snapshot {})",
+                        a.text, r.searched, r.snapshot_id
+                    )));
+                }
+                Ok(ok(format!(
+                    "{} match(es) for {:?}  snapshot_id={}\n\n{}",
+                    r.total,
+                    a.text,
+                    r.snapshot_id,
+                    r.lines.join("\n")
+                )))
+            }
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Poll an app until a string appears in (or disappears from) its accessibility tree, or the timeout expires. Use this instead of guessing a sleep after an action that triggers loading, a dialog, or a navigation. Each poll re-walks the tree, so the interval is floored at 250ms. Returns whether the condition was met plus the snapshot_id of the final read."
+    )]
+    async fn wait_for(
+        &self,
+        Parameters(a): Parameters<WaitForArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let text = a.text.clone();
+        let want = if a.gone.unwrap_or(false) {
+            Presence::Disappears
+        } else {
+            Presence::Appears
+        };
+        // Capped: a tool call that can block for minutes will hit the MCP
+        // client's own timeout and strand the poll loop.
+        let timeout_ms = a.timeout_ms.unwrap_or(5_000).clamp(250, 60_000);
+        match self
+            .native(move |c| c.wait_for(&app, &text, want, timeout_ms))
+            .await
+        {
+            Ok(r) => {
+                let verb = if want == Presence::Appears {
+                    "appeared"
+                } else {
+                    "disappeared"
+                };
+                let head = if r.satisfied {
+                    format!("{:?} {verb} after {}ms", a.text, r.elapsed_ms)
+                } else {
+                    format!(
+                        "timed out after {}ms: {:?} never {verb}",
+                        r.elapsed_ms, a.text
+                    )
+                };
+                let body = format!("{head}\npolls: {}\nsnapshot_id: {}", r.polls, r.snapshot_id);
+                if r.satisfied {
+                    Ok(ok(body))
+                } else {
+                    Ok(fail(body))
+                }
+            }
             Err(e) => Ok(fail(e.to_string())),
         }
     }

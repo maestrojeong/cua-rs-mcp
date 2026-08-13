@@ -42,25 +42,47 @@ pub fn render_tree(nodes: &[AxNode], opts: RenderOptions) -> String {
     let mut out = String::with_capacity(nodes.len() * 48);
     let mut skipped = 0usize;
 
-    // Depth is remapped so that dropping a wrapper does not leave a visual gap:
-    // a child of a hidden group is drawn at the group's own indent level.
-    let mut visible_depth: Vec<usize> = vec![0; nodes.len()];
+    // The walk is breadth-first (so the element budget is spent on shallow,
+    // likely-relevant elements) but an indented outline is only readable in
+    // depth-first order: printed in BFS order, a node's children appear far
+    // below it, after every one of its cousins, and the indentation looks like
+    // it is lying. So reconstruct parent→children links and emit depth-first,
+    // keeping the indices the BFS walk assigned.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    let mut roots: Vec<usize> = Vec::new();
+    for (pos, node) in nodes.iter().enumerate() {
+        match node.parent {
+            // A parent beyond the slice means the walk was truncated between
+            // this node and its parent; treat it as a root rather than dropping
+            // the whole subtree.
+            Some(p) if p < nodes.len() && p != pos => children[p].push(pos),
+            _ => roots.push(pos),
+        }
+    }
 
-    for node in nodes {
-        let indent = node.parent.map(|p| visible_depth[p]).unwrap_or(0);
+    // (position, indent) — an explicit stack, because a real AX tree can nest
+    // deeply enough to blow a recursive renderer's stack.
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&r| (r, 0)).collect();
+    while let Some((pos, indent)) = stack.pop() {
+        let node = &nodes[pos];
 
-        if !should_render(node, opts) {
+        // Dropping a wrapper must not leave a phantom indent step, so children
+        // of a hidden node are drawn at the hidden node's own level.
+        let child_indent = if should_render(node, opts) {
+            for _ in 0..indent {
+                out.push_str("  ");
+            }
+            write_node(&mut out, node, opts);
+            out.push('\n');
+            indent + 1
+        } else {
             skipped += 1;
-            visible_depth[node.index] = indent;
-            continue;
-        }
-        visible_depth[node.index] = indent + 1;
+            indent
+        };
 
-        for _ in 0..indent {
-            out.push_str("  ");
+        for &child in children[pos].iter().rev() {
+            stack.push((child, child_indent));
         }
-        write_node(&mut out, node, opts);
-        out.push('\n');
     }
 
     if skipped > 0 && opts.note_omissions {
@@ -92,6 +114,33 @@ impl Default for RenderOptions {
             note_omissions: true,
         }
     }
+}
+
+/// Roles whose `AXValue` is actually text a caller can write.
+const TEXT_ROLES: &[&str] = &[
+    "AXTextField",
+    "AXTextArea",
+    "AXSearchField",
+    "AXComboBox",
+    "AXStaticText",
+];
+
+/// Whether `editable` is worth printing for this node.
+///
+/// `AXUIElementIsAttributeSettable(AXValue)` is not the right test on its own.
+/// Chromium reports `AXValue` as settable on essentially every element it
+/// exposes — buttons, groups, toolbars — so trusting it alone tags a whole
+/// Chrome window `(editable)` and trains the model to try `set_value` on a
+/// toolbar. Require the role to be one where writing text is meaningful.
+fn is_text_editable(node: &AxNode) -> bool {
+    if !node.settable {
+        return false;
+    }
+    TEXT_ROLES.contains(&node.role.as_str())
+        || node
+            .subrole
+            .as_deref()
+            .is_some_and(|s| s.contains("Text") || s.contains("SearchField"))
 }
 
 fn should_render(node: &AxNode, opts: RenderOptions) -> bool {
@@ -149,7 +198,7 @@ fn write_node(out: &mut String, node: &AxNode, opts: RenderOptions) {
     if node.selected {
         flags.push("selected");
     }
-    if node.settable {
+    if is_text_editable(node) {
         flags.push("editable");
     }
     if !flags.is_empty() {
@@ -241,6 +290,58 @@ mod tests {
         // group must not leave a phantom indent step.
         let line = out.lines().find(|l| l.contains("AXButton")).unwrap();
         assert_eq!(line, "  [2] AXButton \"OK\"", "got {line:?}");
+    }
+
+    #[test]
+    fn output_is_depth_first_even_though_the_walk_was_breadth_first() {
+        // BFS order: window, then both toolbars, then their buttons. Printed in
+        // that order the indentation would be a lie, so the renderer must
+        // regroup each toolbar with its own child.
+        let nodes = vec![
+            node(0, None, "AXWindow", Some("W")),
+            node(1, Some(0), "AXToolbar", Some("top")),
+            node(2, Some(0), "AXToolbar", Some("bottom")),
+            actionable(node(3, Some(1), "AXButton", Some("in-top"))),
+            actionable(node(4, Some(2), "AXButton", Some("in-bottom"))),
+        ];
+        let out = render_tree(&nodes, RenderOptions::default());
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "AXWindow \"W\"",
+                "  AXToolbar \"top\"",
+                "    [3] AXButton \"in-top\"",
+                "  AXToolbar \"bottom\"",
+                "    [4] AXButton \"in-bottom\"",
+            ],
+            "got {out}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_parent_link_does_not_drop_the_subtree() {
+        // The walk hit its budget, so node 0's parent (index 9) is not present.
+        // It must still be rendered, as a root.
+        let mut orphan = actionable(node(0, Some(9), "AXButton", Some("orphan")));
+        orphan.parent = Some(9);
+        let out = render_tree(&[orphan], RenderOptions::default());
+        assert!(out.contains("[0] AXButton \"orphan\""), "got {out}");
+    }
+
+    #[test]
+    fn settable_alone_does_not_earn_the_editable_flag() {
+        // Chromium marks AXValue settable on buttons and groups; tagging those
+        // "editable" would invite set_value on a toolbar.
+        let mut button = actionable(node(0, None, "AXButton", Some("Reload")));
+        button.settable = true;
+        let out = render_tree(&[button], RenderOptions::default());
+        assert!(!out.contains("editable"), "got {out}");
+
+        let mut field = actionable(node(1, None, "AXTextField", Some("Address")));
+        field.settable = true;
+        let out = render_tree(&[field], RenderOptions::default());
+        assert!(out.contains("(editable)"), "got {out}");
     }
 
     #[test]

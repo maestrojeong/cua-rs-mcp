@@ -48,7 +48,8 @@ use std::ptr::NonNull;
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
+    CFArray, CFBoolean, CFNumber, CFRange, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    Type,
 };
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -474,6 +475,138 @@ impl Element {
         let _ = self.set_bool(attr::ENHANCED_USER_INTERFACE, true);
     }
 
+    // ── text ─────────────────────────────────────────────────────────────
+
+    /// Current selection as `(offset, length)` in characters.
+    ///
+    /// A zero length means a collapsed caret at `offset`, which is how "where
+    /// would typing go" is expressed.
+    pub fn selected_range(&self) -> Option<TextRange> {
+        let v = self.attribute(attr::SELECTED_TEXT_RANGE).ok()??;
+        let ax = v.downcast_ref::<AXValue>()?;
+        let mut r = CFRange {
+            location: 0,
+            length: 0,
+        };
+        let ok = unsafe {
+            ax.value(
+                AXValueType::CFRange,
+                NonNull::new((&mut r as *mut CFRange).cast::<c_void>())?,
+            )
+        };
+        ok.then_some(TextRange {
+            offset: r.location.max(0) as usize,
+            length: r.length.max(0) as usize,
+        })
+    }
+
+    /// Move or extend the selection.
+    pub fn set_selected_range(&self, range: TextRange) -> Result<()> {
+        let mut r = CFRange {
+            location: range.offset as isize,
+            length: range.length as isize,
+        };
+        // SAFETY: the pointer is a live `CFRange`, matching `AXValueType::CFRange`.
+        let value = unsafe {
+            AXValue::new(
+                AXValueType::CFRange,
+                NonNull::new((&mut r as *mut CFRange).cast::<c_void>())
+                    .ok_or(AxError::NoValue("range".into()))?,
+            )
+        }
+        .ok_or(AxError::NoValue("AXValueCreate(CFRange)".into()))?;
+
+        let key = CFString::from_str(attr::SELECTED_TEXT_RANGE);
+        check(
+            unsafe { self.0.set_attribute_value(&key, value.as_ref()) },
+            Ctx::Attr(attr::SELECTED_TEXT_RANGE),
+        )
+    }
+
+    /// Number of characters this element holds, when it says.
+    pub fn text_length(&self) -> Option<usize> {
+        self.number(attr::NUMBER_OF_CHARACTERS)
+            .map(|n| n.max(0.0) as usize)
+            .or_else(|| self.string(attr::VALUE).map(|s| s.chars().count()))
+    }
+
+    /// Replace the current selection with `text`.
+    ///
+    /// This is the *insert* primitive: with a collapsed caret it inserts, with a
+    /// selection it overwrites. `AXSelectedText` is the only AX attribute that
+    /// edits text without replacing the whole field, so it is what makes
+    /// appending possible at all.
+    pub fn set_selected_text(&self, text: &str) -> Result<()> {
+        self.set_string(attr::SELECTED_TEXT, text)
+    }
+
+    /// Append `text`, preferring the least destructive mechanism available.
+    ///
+    /// Two paths, and the difference is visible to the caller through
+    /// [`TextWrite`] because it changes what the app's undo stack and change
+    /// notifications see:
+    ///
+    /// - [`TextWrite::Inserted`] — move the caret to the end, then write through
+    ///   `AXSelectedText`. The field keeps its existing contents and the app
+    ///   observes a normal edit.
+    /// - [`TextWrite::Replaced`] — read `AXValue`, concatenate, write it back.
+    ///   The fallback for fields that do not expose a settable selection. It is
+    ///   a whole-value replacement, so an app watching for incremental edits may
+    ///   see one bulk change instead.
+    ///
+    /// Neither path synthesizes keystrokes, so neither requires focus — and
+    /// neither will satisfy an app that only reacts to real key events.
+    pub fn append_text(&self, text: &str) -> Result<TextWrite> {
+        if self.is_settable(attr::SELECTED_TEXT) {
+            let end = self.text_length().unwrap_or(0);
+            // Collapse the caret at the end first. Skipping this would overwrite
+            // whatever the user happens to have selected.
+            self.set_selected_range(TextRange {
+                offset: end,
+                length: 0,
+            })?;
+            self.set_selected_text(text)?;
+            return Ok(TextWrite::Inserted);
+        }
+
+        let existing = self.string(attr::VALUE).unwrap_or_default();
+        self.set_string(attr::VALUE, &format!("{existing}{text}"))?;
+        Ok(TextWrite::Replaced)
+    }
+
+    /// Select a literal substring of this element's text.
+    ///
+    /// `prefix` and `suffix` disambiguate repeated matches: the search finds an
+    /// occurrence of `prefix + needle + suffix` and selects only the `needle`
+    /// part. Without them the first occurrence wins.
+    ///
+    /// Offsets are computed in `char`s and converted for AX, which counts UTF-16
+    /// units — see [`utf16_offset`]. Getting that wrong silently misplaces the
+    /// selection in any text containing emoji or CJK.
+    pub fn select_text(
+        &self,
+        needle: &str,
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) -> Result<TextRange> {
+        let haystack = self
+            .string(attr::VALUE)
+            .or_else(|| self.string(attr::TITLE))
+            .ok_or(AxError::NoValue(attr::VALUE.into()))?;
+
+        let range = find_text_range(&haystack, needle, prefix, suffix).ok_or_else(|| {
+            AxError::NoValue(format!("text {needle:?} was not found in this element"))
+        })?;
+
+        let ax_range = TextRange {
+            offset: utf16_offset(&haystack, range.offset),
+            length: utf16_offset(&haystack, range.offset + range.length)
+                - utf16_offset(&haystack, range.offset),
+        };
+        self.set_selected_range(ax_range)?;
+        Ok(range)
+    }
+
     // ── actions ──────────────────────────────────────────────────────────
 
     /// Action names this element advertises.
@@ -733,6 +866,76 @@ impl AxNode {
     }
 }
 
+// ── text types ───────────────────────────────────────────────────────────────
+
+/// A character range inside an element's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextRange {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// Which mechanism [`Element::append_text`] ended up using.
+///
+/// Surfaced rather than hidden because the two are not equivalent from the app's
+/// point of view, and a caller debugging "my text went in but the app did not
+/// notice" needs to know which one happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextWrite {
+    /// Written through `AXSelectedText` at a collapsed caret. Existing contents
+    /// preserved.
+    Inserted,
+    /// Whole `AXValue` replaced with old + new.
+    Replaced,
+}
+
+impl TextWrite {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextWrite::Inserted => "inserted",
+            TextWrite::Replaced => "replaced",
+        }
+    }
+}
+
+/// Locate `needle` in `haystack`, optionally anchored by `prefix`/`suffix`.
+///
+/// Returns a **char**-based range covering only `needle`. Pure and total: no AX
+/// involved, which is what makes the disambiguation logic testable.
+pub fn find_text_range(
+    haystack: &str,
+    needle: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> Option<TextRange> {
+    if needle.is_empty() {
+        return None;
+    }
+    let pre = prefix.unwrap_or("");
+    let suf = suffix.unwrap_or("");
+    let pattern = format!("{pre}{needle}{suf}");
+
+    let byte_at = haystack.find(&pattern)?;
+    // Skip past the prefix so the returned range covers the needle alone.
+    let needle_byte = byte_at + pre.len();
+
+    Some(TextRange {
+        offset: haystack[..needle_byte].chars().count(),
+        length: needle.chars().count(),
+    })
+}
+
+/// Convert a char offset to a UTF-16 code-unit offset.
+///
+/// AX text ranges are counted in UTF-16 units because the API predates any
+/// notion of scalar-based indexing. For ASCII the two agree, which is exactly
+/// why this bug survives testing: it only appears once the text contains CJK,
+/// emoji, or anything else outside the BMP. An emoji is one `char` and two UTF-16
+/// units, so a selection past one is off by one per emoji.
+pub fn utf16_offset(s: &str, char_offset: usize) -> usize {
+    s.chars().take(char_offset).map(char::len_utf16).sum()
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn check(err: AXError, ctx: Ctx<'_>) -> Result<()> {
@@ -775,6 +978,85 @@ mod tests {
     fn default_limits_are_bounded() {
         let l = Limits::default();
         assert!(l.max_nodes > 0 && l.max_depth > 0 && l.max_children > 0);
+    }
+
+    #[test]
+    fn find_text_range_returns_char_offsets() {
+        let r = find_text_range("hello world", "world", None, None).unwrap();
+        assert_eq!(
+            r,
+            TextRange {
+                offset: 6,
+                length: 5
+            }
+        );
+    }
+
+    #[test]
+    fn find_text_range_takes_the_first_match_without_anchors() {
+        let r = find_text_range("ab ab ab", "ab", None, None).unwrap();
+        assert_eq!(r.offset, 0);
+    }
+
+    #[test]
+    fn prefix_and_suffix_disambiguate_repeats_and_are_excluded() {
+        // Select the "ab" that follows "2:" -- and only the "ab".
+        let r = find_text_range("1:ab 2:ab 3:ab", "ab", Some("2:"), None).unwrap();
+        assert_eq!(
+            r,
+            TextRange {
+                offset: 7,
+                length: 2
+            }
+        );
+
+        let r = find_text_range("ab) ab] ab}", "ab", None, Some("]")).unwrap();
+        assert_eq!(
+            r,
+            TextRange {
+                offset: 4,
+                length: 2
+            }
+        );
+    }
+
+    #[test]
+    fn find_text_range_offsets_are_chars_not_bytes() {
+        // Every Korean syllable is 3 bytes; a byte-based offset would report 9.
+        let r = find_text_range("가나다hi", "hi", None, None).unwrap();
+        assert_eq!(r.offset, 3, "offset must be in chars");
+    }
+
+    #[test]
+    fn find_text_range_rejects_an_empty_needle() {
+        assert!(find_text_range("anything", "", None, None).is_none());
+    }
+
+    #[test]
+    fn find_text_range_misses_are_none() {
+        assert!(find_text_range("hello", "world", None, None).is_none());
+        // Anchored search must fail when the anchor does not match, even though
+        // the needle alone is present.
+        assert!(find_text_range("1:ab", "ab", Some("9:"), None).is_none());
+    }
+
+    #[test]
+    fn utf16_offset_matches_chars_for_ascii_and_diverges_for_astral() {
+        assert_eq!(utf16_offset("hello", 5), 5);
+        // CJK is one UTF-16 unit each, so still equal.
+        assert_eq!(utf16_offset("가나다", 3), 3);
+        // An emoji is one char but two UTF-16 units -- the case that breaks
+        // naive selection math.
+        assert_eq!(utf16_offset("a\u{1F600}b", 3), 4);
+        assert_eq!(utf16_offset("", 0), 0);
+        // Overshooting must saturate, not panic.
+        assert_eq!(utf16_offset("ab", 99), 2);
+    }
+
+    #[test]
+    fn text_write_labels_are_stable() {
+        assert_eq!(TextWrite::Inserted.as_str(), "inserted");
+        assert_eq!(TextWrite::Replaced.as_str(), "replaced");
     }
 
     /// The system-wide element always exists, so this exercises the FFI
