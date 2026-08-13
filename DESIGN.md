@@ -169,6 +169,39 @@ Indentation rather than JSON: roughly a third of the tokens for the same
 information, and a truncated outline is still readable where truncated JSON is
 not.
 
+### Skeleton mode
+
+`max_nodes` bounds the walk; skeleton mode bounds the *rendering*, which is a
+different problem. A 12k-element Slack window truncated at 1500 nodes is still
+1500 lines of prompt, most of them message rows the agent did not ask for.
+
+So with `skeleton: true`, a subtree deeper than `skeleton_depth` (2) with more
+than `collapse_over` (8) descendants renders as one line naming its size and its
+own index:
+
+```text
+[5] AXGroup  (+40 elements — pass scope_element_id=5 to expand)
+```
+
+Three details that matter:
+
+- **Subtree sizes are computed bottom-up over the flat list**, exploiting the
+  fact that a BFS walk always places a parent before its children. Iterating in
+  reverse therefore visits every child before its parent, so no second traversal
+  is needed. The count is whole-subtree, not direct children — a list of 10 rows
+  each holding a button reports 20.
+- **Depth 0 and 1 never collapse.** The window and its direct children are the
+  map; collapsing them would hide the territory and the map together.
+- **The summary states the index outright** rather than relying on the `[N]`
+  prefix, because `scope_element_id` works on any element while `[N]` only
+  appears on actionable ones. A non-actionable `AXGroup` is a perfectly good
+  drill-in root.
+
+The drill-in walk starts from that element instead of the window, and re-numbers
+from zero under a new `snapshot_id` — it is a new snapshot, so treating its
+indices as continuous with the previous one would be exactly the staleness bug
+§3 exists to prevent.
+
 ### Budgets are correctness, not tuning
 
 `Limits { max_nodes: 1500, max_depth: 40, max_children: 200 }`.
@@ -336,7 +369,6 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 | | Why |
 |---|:--|
 | `drag` | no AX verb; would need HID pointer synthesis, which `cua-hid` does not do yet |
-| skeleton traversal / `scope_element_id` | the big token win, not yet needed at 1500 nodes |
 | AX notification streams (`AXObserver`) | would replace the fingerprint heuristic in §10 |
 | menu invocation | needs temporary activation + focus restore; easy to get wrong |
 | Spaces handling | off-Space windows are observation-only, matching prior art |

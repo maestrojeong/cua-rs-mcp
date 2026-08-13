@@ -60,35 +60,80 @@ pub fn render_tree(nodes: &[AxNode], opts: RenderOptions) -> String {
         }
     }
 
+    // Subtree sizes, needed only to decide what to collapse in skeleton mode.
+    // Computed bottom-up over the flat list: a BFS walk guarantees a parent's
+    // position precedes its children's, so iterating in reverse visits every
+    // child before its parent.
+    let mut subtree: Vec<usize> = vec![1; nodes.len()];
+    if opts.skeleton {
+        for pos in (0..nodes.len()).rev() {
+            let own: usize = children[pos].iter().map(|&c| subtree[c]).sum();
+            subtree[pos] += own;
+        }
+    }
+
     // (position, indent) — an explicit stack, because a real AX tree can nest
     // deeply enough to blow a recursive renderer's stack.
     let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&r| (r, 0)).collect();
+    let mut collapsed = 0usize;
     while let Some((pos, indent)) = stack.pop() {
         let node = &nodes[pos];
 
         // Dropping a wrapper must not leave a phantom indent step, so children
         // of a hidden node are drawn at the hidden node's own level.
-        let child_indent = if should_render(node, opts) {
+        let rendered = should_render(node, opts);
+        let child_indent = if rendered {
             for _ in 0..indent {
                 out.push_str("  ");
             }
             write_node(&mut out, node, opts);
-            out.push('\n');
             indent + 1
         } else {
             skipped += 1;
             indent
         };
 
-        for &child in children[pos].iter().rev() {
-            stack.push((child, child_indent));
+        // Skeleton mode: past a certain depth, a large subtree is summarized by
+        // its size instead of expanded. The node keeps its handle, so it doubles
+        // as the drill-in root for a follow-up `scope_element_id` call. This is
+        // the difference between a 12k-element Slack window costing the whole
+        // context window and costing forty lines.
+        let descendants = subtree[pos].saturating_sub(1);
+        let collapse = opts.skeleton
+            && rendered
+            && indent >= opts.skeleton_depth
+            && descendants > opts.collapse_over;
+
+        if collapse {
+            out.push_str(&format!(
+                "  (+{descendants} elements — pass scope_element_id={} to expand)",
+                node.index
+            ));
+            collapsed += descendants;
+        }
+        if rendered {
+            out.push('\n');
+        }
+
+        if !collapse {
+            for &child in children[pos].iter().rev() {
+                stack.push((child, child_indent));
+            }
         }
     }
 
-    if skipped > 0 && opts.note_omissions {
-        out.push_str(&format!(
-            "\n({skipped} structural or empty elements omitted)\n"
-        ));
+    if opts.note_omissions {
+        if collapsed > 0 {
+            out.push_str(&format!(
+                "\n(skeleton: {collapsed} elements collapsed into their containers; \
+                 pass scope_element_id=N to expand one, or skeleton=false for everything)\n"
+            ));
+        }
+        if skipped > 0 {
+            out.push_str(&format!(
+                "\n({skipped} structural or empty elements omitted)\n"
+            ));
+        }
     }
     out
 }
@@ -104,6 +149,22 @@ pub struct RenderOptions {
     pub include_frames: bool,
     /// Print the trailing "N elements omitted" note.
     pub note_omissions: bool,
+    /// Summarize large deep subtrees by their size instead of expanding them.
+    pub skeleton: bool,
+    /// Indent level below which nothing is collapsed.
+    ///
+    /// Shallow structure is where an agent orients itself — window, then toolbar
+    /// / sidebar / content area — so collapsing at the top would hide the map
+    /// along with the territory. `2` keeps the window and its direct children
+    /// always expanded, which is the smallest useful map; a table of 40 rows
+    /// hanging off a toolbar sits at exactly this depth and is precisely what
+    /// should collapse.
+    pub skeleton_depth: usize,
+    /// Minimum descendant count before a subtree is worth collapsing.
+    ///
+    /// Below this, the summary line costs about as much as the elements it
+    /// replaces while being strictly less useful.
+    pub collapse_over: usize,
 }
 
 impl Default for RenderOptions {
@@ -112,6 +173,9 @@ impl Default for RenderOptions {
             include_noise: false,
             include_frames: false,
             note_omissions: true,
+            skeleton: false,
+            skeleton_depth: 2,
+            collapse_over: 8,
         }
     }
 }
@@ -342,6 +406,120 @@ mod tests {
         field.settable = true;
         let out = render_tree(&[field], RenderOptions::default());
         assert!(out.contains("(editable)"), "got {out}");
+    }
+
+    /// A window > toolbar > deep container holding `n` leaf buttons.
+    fn wide_tree(n: usize) -> Vec<AxNode> {
+        let mut v = vec![
+            node(0, None, "AXWindow", Some("W")),
+            node(1, Some(0), "AXToolbar", Some("bar")),
+            node(2, Some(1), "AXTable", Some("rows")),
+        ];
+        for i in 0..n {
+            v.push(actionable(node(3 + i, Some(2), "AXRow", Some("row"))));
+        }
+        v
+    }
+
+    fn skeleton_opts() -> RenderOptions {
+        RenderOptions {
+            skeleton: true,
+            ..RenderOptions::default()
+        }
+    }
+
+    #[test]
+    fn skeleton_collapses_a_big_subtree_into_a_countable_summary() {
+        let nodes = wide_tree(40);
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(
+            out.contains("(+40 elements — pass scope_element_id=2 to expand)"),
+            "got {out}"
+        );
+        // The rows themselves must be gone, not merely reordered.
+        assert_eq!(out.matches("AXRow").count(), 0, "got {out}");
+    }
+
+    #[test]
+    fn a_collapsed_container_names_its_index_even_without_a_handle() {
+        // scope_element_id does not require the container to be actionable, so
+        // the summary must state the index outright rather than relying on a
+        // "[N]" prefix that non-actionable nodes never get.
+        let nodes = wide_tree(40);
+        assert!(
+            !nodes[2].is_actionable(),
+            "fixture precondition: the container has no actions"
+        );
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(!out.contains("[2] AXTable"), "no handle expected: {out}");
+        assert!(out.contains("scope_element_id=2"), "got {out}");
+    }
+
+    #[test]
+    fn a_collapsed_container_that_is_actionable_keeps_its_handle() {
+        let mut nodes = wide_tree(40);
+        nodes[2] = actionable(nodes[2].clone());
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(out.contains("[2] AXTable"), "got {out}");
+        assert!(out.contains("scope_element_id=2"), "got {out}");
+    }
+
+    #[test]
+    fn skeleton_leaves_shallow_structure_alone() {
+        // The map must survive: window/toolbar/container are how an agent
+        // orients itself, so nothing at or above skeleton_depth collapses.
+        let nodes = wide_tree(40);
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(out.contains("AXWindow \"W\""), "got {out}");
+        assert!(out.contains("AXToolbar \"bar\""), "got {out}");
+    }
+
+    #[test]
+    fn skeleton_does_not_collapse_a_subtree_too_small_to_be_worth_it() {
+        // 4 children < collapse_over (8): a summary line would cost about what
+        // the elements cost while being strictly less useful.
+        let nodes = wide_tree(4);
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(!out.contains("scope_element_id"), "got {out}");
+        assert_eq!(out.matches("AXRow").count(), 4, "got {out}");
+    }
+
+    #[test]
+    fn skeleton_is_off_by_default() {
+        let nodes = wide_tree(40);
+        let out = render_tree(&nodes, RenderOptions::default());
+        assert!(!out.contains("scope_element_id"), "got {out}");
+        assert_eq!(out.matches("AXRow").count(), 40);
+    }
+
+    #[test]
+    fn skeleton_counts_whole_subtrees_not_just_direct_children() {
+        // window > group > container > 10 rows, each row holding one button.
+        // The container's summary must say 20, not 10.
+        let mut nodes = vec![
+            node(0, None, "AXWindow", Some("W")),
+            node(1, Some(0), "AXToolbar", Some("bar")),
+            node(2, Some(1), "AXList", Some("list")),
+        ];
+        for i in 0..10 {
+            nodes.push(actionable(node(3 + i, Some(2), "AXRow", Some("r"))));
+        }
+        for i in 0..10 {
+            nodes.push(actionable(node(13 + i, Some(3 + i), "AXButton", Some("b"))));
+        }
+        let out = render_tree(&nodes, skeleton_opts());
+        assert!(out.contains("(+20 elements"), "got {out}");
+    }
+
+    #[test]
+    fn skeleton_summary_totals_are_reported_once_at_the_end() {
+        let nodes = wide_tree(40);
+        let out = render_tree(&nodes, skeleton_opts());
+        assert_eq!(
+            out.matches("skeleton: 40 elements collapsed").count(),
+            1,
+            "got {out}"
+        );
     }
 
     #[test]

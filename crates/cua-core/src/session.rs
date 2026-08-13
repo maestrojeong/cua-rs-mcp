@@ -154,6 +154,14 @@ pub struct StateOptions {
     pub include_screenshot: bool,
     /// Longest screenshot edge in pixels, `0` for native.
     pub max_image_dim: u32,
+    /// Walk from this element index in the app's *current* snapshot instead of
+    /// from the window.
+    ///
+    /// The drill-in half of skeleton mode: the summary line names the index, the
+    /// caller passes it back, and the next walk spends its whole budget inside
+    /// that subtree. Requires an existing snapshot, since that is where the index
+    /// comes from.
+    pub scope: Option<usize>,
 }
 
 impl Default for StateOptions {
@@ -163,6 +171,7 @@ impl Default for StateOptions {
             render: crate::snapshot::RenderOptions::default(),
             include_screenshot: true,
             max_image_dim: 1400,
+            scope: None,
         }
     }
 }
@@ -543,7 +552,27 @@ impl Inner {
                 app: info.name.clone(),
             })?;
 
-        let nodes = window_el.snapshot_tree(opts.limits);
+        // A scoped walk starts from an element the caller saw in the previous
+        // snapshot, not from the window. Resolved before the new snapshot
+        // replaces the old one, since that is where the index lives.
+        let root = match opts.scope {
+            None => window_el.clone(),
+            Some(index) => {
+                let snap = self
+                    .snapshots
+                    .get(&info.pid)
+                    .ok_or_else(|| CoreError::NoSnapshot {
+                        app: info.name.clone(),
+                    })?;
+                let node = snap.nodes.get(index).ok_or(CoreError::BadIndex {
+                    index,
+                    count: snap.nodes.len(),
+                })?;
+                node.element.clone()
+            }
+        };
+
+        let nodes = root.snapshot_tree(opts.limits);
         if nodes.len() >= opts.limits.max_nodes {
             warnings.push(format!(
                 "tree truncated at {} elements; pass a larger max_nodes or narrow the target",

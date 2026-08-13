@@ -228,7 +228,36 @@ dialect would cost recognition and buy nothing.
 
 `get_app_state` knobs: `include_screenshot` (drop it on follow-up calls — it is
 the expensive part), `max_image_dim`, `max_elements`, `verbose` (show the
-filtered-out containers and frame geometry when a control seems missing).
+filtered-out containers and frame geometry when a control seems missing),
+`skeleton` + `scope_element_id` (below).
+
+### Dense apps: skeleton, then drill in
+
+A Slack or VS Code window can expose thousands of elements. `skeleton=true`
+summarizes large deep subtrees instead of expanding them, so the overall map
+stays cheap:
+
+```text
+[0] AXWindow:StandardWindow "(5) Home • Threads - Chrome"
+  AXGroup "(5) Home • Threads - Chrome"
+    [5] AXGroup  (+40 elements — pass scope_element_id=5 to expand)
+  [2] AXButton:CloseButton
+  [3] AXButton:FullScreenButton
+  [4] AXButton:MinimizeButton
+
+(skeleton: 40 elements collapsed into their containers; pass
+ scope_element_id=N to expand one, or skeleton=false for everything)
+```
+
+Then spend the whole element budget inside just that subtree:
+
+```json
+{ "app": "Google Chrome", "scope_element_id": "5" }
+```
+
+The window and its direct children never collapse — that is the map an agent
+orients itself with. Only depth 2 and below, and only subtrees big enough that a
+summary line is cheaper than the elements it replaces.
 
 ## Known limits
 

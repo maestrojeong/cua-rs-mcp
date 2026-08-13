@@ -64,6 +64,15 @@ struct AppArgs {
     /// filtered out. Only useful when an expected control is missing.
     #[serde(default)]
     verbose: bool,
+    /// Summarize large deep subtrees as `(+N elements)` instead of expanding
+    /// them. Turn this on first for a dense app, then drill in.
+    #[serde(default)]
+    skeleton: bool,
+    /// Walk from this element index (from the app's most recent snapshot)
+    /// instead of from the window. This is how you expand a subtree that
+    /// `skeleton` collapsed.
+    #[serde(default)]
+    scope_element_id: Option<String>,
 }
 
 fn yes() -> bool {
@@ -286,7 +295,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Read one app's front window: returns its accessibility tree and, by default, a screenshot taken from the same moment. This MUST be called before acting on an app, because it assigns the `element_index` handles that click/set_value/scroll refer to. Lines starting with `[N]` are actionable targets; lines without a bracket are context only. Does not activate the app, move the cursor, or change focus, so it is safe to call while the user is working."
+        description = "Read one app's front window: returns its accessibility tree and, by default, a screenshot taken from the same moment. For a dense app, pass skeleton=true first: large deep subtrees collapse to `(+N elements — pass scope_element_id=K to expand)`, which keeps the overall map cheap, then call again with scope_element_id=K to spend the whole element budget inside just that subtree. This MUST be called before acting on an app, because it assigns the `element_index` handles that click/set_value/scroll refer to. Lines starting with `[N]` are actionable targets; lines without a bracket are context only. Does not activate the app, move the cursor, or change focus, so it is safe to call while the user is working."
     )]
     async fn get_app_state(
         &self,
@@ -305,6 +314,17 @@ impl CuaServer {
         if a.verbose {
             opts.render.include_noise = true;
             opts.render.include_frames = true;
+        }
+        opts.render.skeleton = a.skeleton;
+        if let Some(raw) = &a.scope_element_id {
+            match raw.trim().parse::<usize>() {
+                Ok(i) => opts.scope = Some(i),
+                Err(_) => {
+                    return Ok(fail(format!(
+                        "scope_element_id must be a whole number, got {raw:?}"
+                    )))
+                }
+            }
         }
 
         let app = a.app.clone();
