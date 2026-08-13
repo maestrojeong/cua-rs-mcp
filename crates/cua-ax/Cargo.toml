@@ -1,0 +1,15 @@
+[package]
+name = "cua-ax"
+description = "Safe wrappers over the macOS Accessibility (AXUIElement) API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+objc2-core-foundation.workspace = true
+objc2-application-services.workspace = true

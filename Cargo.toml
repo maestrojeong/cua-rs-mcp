@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cua-ax",
+    "crates/cua-capture",
+    "crates/cua-core",
+    "crates/cua-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/maestrojeong/cua-rs-mcp"
+authors = ["Yeonwoo Jeong <maestrojeong@gmail.com>"]
+
+[workspace.dependencies]
+cua-ax = { path = "crates/cua-ax" }
+cua-capture = { path = "crates/cua-capture" }
+cua-core = { path = "crates/cua-core" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "process", "signal", "fs"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+libc = "0.2"
+axum = "0.8"
+http = "1"
+rmcp = { version = "2.2", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+schemars = "1"
+
+# macOS native. The whole point of this crate: the Accessibility API is the
+# action path (no CGEvent synthesis), ScreenCaptureKit is the pixel path.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFBase",
+    "CFCGTypes",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFRunLoop",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGWindow",
+    "CGDirectDisplay",
+    "CGError",
+    "CGGeometry",
+] }
+objc2-application-services = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
+    "HIServices",
+    "AXUIElement",
+    "AXError",
+    "AXValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "NSApplication",
+] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-media",
+    "SCShareableContent",
+    "SCContentFilter",
+    "SCStreamManager",
+    "SCStream",
+    "SCScreenshotManager",
+    "SCError",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# NOTE: unlike browser-rs / bash-rs we do NOT abort on panic. Rust panics must
+# not unwind across the ObjC/CF FFI boundary, but they also must not take the
+# whole MCP server down when one malformed accessibility tree trips an
+# assertion inside a single tool call. `catch_unwind` at the tool boundary in
+# cua-mcp needs unwinding to work.
+panic = "unwind"

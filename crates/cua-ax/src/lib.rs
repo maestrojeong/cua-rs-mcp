@@ -1,0 +1,789 @@
+//! Safe, agent-oriented wrappers over the macOS Accessibility API.
+//!
+//! # Why this crate exists
+//!
+//! Every mainstream "computer use" implementation drives macOS by *pretending
+//! to be a human*: warp the cursor with `CGWarpMouseCursorPosition`, then post
+//! synthetic events into the global HID tap with `CGEventPost`. That works, but
+//! it is fundamentally a shared, single-writer channel — there is exactly one
+//! mouse cursor and one keyboard focus on a Mac, so an agent driving the
+//! machine that way is *competing with the human sitting at it*. It steals the
+//! cursor mid-sentence, it steals keyboard focus, it drags the active Space
+//! out from under you.
+//!
+//! This crate takes the other road. Actions are delivered *directly to the
+//! target UI element* through the Accessibility API — `AXUIElementPerformAction`
+//! for presses, `AXUIElementSetAttributeValue` for text — which never touches
+//! the cursor, never changes focus, and never activates an app. The agent and
+//! the human can work at the same time, on different windows, without fighting.
+//!
+//! That property is not a tuning detail; it falls straight out of never calling
+//! `CGEventPost`. Note that this crate links `CoreGraphics` only to *read*
+//! modifier state and enumerate windows. HID synthesis, if ever added, belongs
+//! behind an explicit opt-in fallback in a higher layer — never here.
+//!
+//! # The two things that make AX usable for an agent
+//!
+//! Raw AX is a chatty, deeply-nested, cyclic object graph with no stable
+//! identifiers. Two pieces of policy turn it into something an LLM can drive:
+//!
+//! 1. [`Element::snapshot_tree`] walks it *once*, breadth-first, with hard
+//!    caps, and hands back a flat [`AxNode`] list. One walk per turn, not one
+//!    IPC round-trip per question.
+//! 2. Every node gets an `index` — its position in that flat list. The agent
+//!    says "click 42"; we look up node 42's retained `AXUIElement`. No
+//!    coordinates, no fragile "third button in the second group" paths.
+//!
+//! # Threading
+//!
+//! AX calls are synchronous IPC into the target app's main run loop. A hung or
+//! modal app will block the caller, which is why [`Element::set_timeout`] is
+//! applied to every app element we create. None of these types are `Send`:
+//! `CFRetained` is not thread-safe here by design. Callers must confine an
+//! `Element` to the thread that made it (see `cua-core`'s worker thread).
+
+use std::ffi::c_void;
+use std::fmt;
+use std::ptr::NonNull;
+
+use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
+};
+
+// ── errors ───────────────────────────────────────────────────────────────────
+
+/// A failed AX call, mapped to something a tool response can explain.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AxError {
+    /// The process is not trusted for Accessibility. This is the error the user
+    /// actually has to *do* something about, so it carries its own remedy text.
+    #[error("accessibility permission denied. Grant it in System Settings > Privacy & Security > Accessibility, then restart this server")]
+    NotTrusted,
+
+    /// The element went away — window closed, view recycled, app quit. Callers
+    /// should treat this as "your snapshot is stale, take a new one", not as a
+    /// hard failure.
+    #[error("stale element (the UI changed since the last snapshot; call get_app_state again)")]
+    Stale,
+
+    /// The element does not expose that attribute or action at all.
+    #[error("{what} `{name}` is not supported by this element")]
+    Unsupported { what: &'static str, name: String },
+
+    /// The attribute exists but currently holds nothing.
+    #[error("no value for `{0}`")]
+    NoValue(String),
+
+    /// AX refused, usually because the app is busy, modal, or wedged.
+    #[error("the app did not complete the request in time (busy, modal, or not responding)")]
+    CannotComplete,
+
+    /// Anything else, kept verbatim so bug reports stay useful.
+    #[error("accessibility error: {0:?}")]
+    Other(i32),
+}
+
+impl AxError {
+    fn from_ax(err: AXError, ctx: Ctx<'_>) -> Self {
+        match err {
+            AXError::APIDisabled => Self::NotTrusted,
+            AXError::InvalidUIElement | AXError::InvalidUIElementObserver => Self::Stale,
+            AXError::CannotComplete => Self::CannotComplete,
+            AXError::NoValue => Self::NoValue(ctx.name().to_string()),
+            AXError::AttributeUnsupported | AXError::ParameterizedAttributeUnsupported => {
+                Self::Unsupported {
+                    what: "attribute",
+                    name: ctx.name().to_string(),
+                }
+            }
+            AXError::ActionUnsupported => Self::Unsupported {
+                what: "action",
+                name: ctx.name().to_string(),
+            },
+            other => Self::Other(other.0),
+        }
+    }
+}
+
+/// What we were asking for when a call failed, so the error can name it.
+#[derive(Copy, Clone)]
+enum Ctx<'a> {
+    Attr(&'a str),
+    Action(&'a str),
+    None,
+}
+
+impl Ctx<'_> {
+    fn name(&self) -> &str {
+        match self {
+            Ctx::Attr(n) | Ctx::Action(n) => n,
+            Ctx::None => "",
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, AxError>;
+
+// ── attribute / action name constants ────────────────────────────────────────
+
+/// AX attribute names.
+///
+/// These are spelled out rather than pulled from the framework's `kAX*`
+/// globals on purpose: the C constants are just `CFSTR("AXRole")` and friends,
+/// so string literals are exactly equivalent while keeping this crate's
+/// feature surface (and build time) small.
+pub mod attr {
+    pub const ROLE: &str = "AXRole";
+    pub const SUBROLE: &str = "AXSubrole";
+    pub const ROLE_DESCRIPTION: &str = "AXRoleDescription";
+    pub const TITLE: &str = "AXTitle";
+    pub const VALUE: &str = "AXValue";
+    pub const DESCRIPTION: &str = "AXDescription";
+    pub const HELP: &str = "AXHelp";
+    pub const PLACEHOLDER: &str = "AXPlaceholderValue";
+    pub const IDENTIFIER: &str = "AXIdentifier";
+    pub const CHILDREN: &str = "AXChildren";
+    pub const PARENT: &str = "AXParent";
+    pub const WINDOWS: &str = "AXWindows";
+    pub const MAIN_WINDOW: &str = "AXMainWindow";
+    pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    pub const FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
+    pub const POSITION: &str = "AXPosition";
+    pub const SIZE: &str = "AXSize";
+    pub const ENABLED: &str = "AXEnabled";
+    pub const FOCUSED: &str = "AXFocused";
+    pub const SELECTED: &str = "AXSelected";
+    pub const SELECTED_TEXT: &str = "AXSelectedText";
+    pub const SELECTED_TEXT_RANGE: &str = "AXSelectedTextRange";
+    pub const NUMBER_OF_CHARACTERS: &str = "AXNumberOfCharacters";
+    pub const MENU_BAR: &str = "AXMenuBar";
+    pub const TITLE_UI_ELEMENT: &str = "AXTitleUIElement";
+    pub const LINKED_UI_ELEMENTS: &str = "AXLinkedUIElements";
+
+    /// Setting this on an *application* element makes Chromium and Electron
+    /// apps build and expose their accessibility tree.
+    ///
+    /// Chromium keeps its AX tree switched off until something signals that an
+    /// assistive client is watching, because maintaining it is expensive. Without
+    /// this poke, Slack / VS Code / Discord / Notion / Figma and every other
+    /// Electron app look like a single empty `AXWindow` with no children, which
+    /// reads exactly like a bug in *our* tree walker. Set it once per app,
+    /// before the first snapshot.
+    pub const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+
+    /// The older, broader equivalent of [`MANUAL_ACCESSIBILITY`], honored by
+    /// Cocoa apps that gate rich AX output (notably anything AppKit-based that
+    /// checks for VoiceOver). Harmless when unsupported.
+    pub const ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
+}
+
+/// AX action names, i.e. the verbs this crate can deliver to an element.
+pub mod action {
+    /// The default activation. Buttons, links, menu items, checkboxes.
+    pub const PRESS: &str = "AXPress";
+    /// Select, for things that are selected rather than pressed (list rows,
+    /// tabs, menu items in some apps, radio buttons).
+    pub const PICK: &str = "AXPick";
+    /// "Accept" — what Return does in a text field or a default dialog button.
+    pub const CONFIRM: &str = "AXConfirm";
+    /// "Dismiss" — what Escape does.
+    pub const CANCEL: &str = "AXCancel";
+    /// Open the element's contextual menu (the right-click equivalent).
+    pub const SHOW_MENU: &str = "AXShowMenu";
+    /// Raise the element's window without activating the app.
+    pub const RAISE: &str = "AXRaise";
+    pub const INCREMENT: &str = "AXIncrement";
+    pub const DECREMENT: &str = "AXDecrement";
+    pub const SCROLL_UP_BY_PAGE: &str = "AXScrollUpByPage";
+    pub const SCROLL_DOWN_BY_PAGE: &str = "AXScrollDownByPage";
+    pub const SCROLL_LEFT_BY_PAGE: &str = "AXScrollLeftByPage";
+    pub const SCROLL_RIGHT_BY_PAGE: &str = "AXScrollRightByPage";
+    /// Scroll the element into view. Cheap and side-effect-free, so it is worth
+    /// calling before acting on something that may be clipped.
+    pub const SCROLL_TO_VISIBLE: &str = "AXScrollToVisible";
+}
+
+// ── trust ────────────────────────────────────────────────────────────────────
+
+/// Whether this process currently holds the Accessibility grant.
+///
+/// This is deliberately the *non*-prompting variant. An MCP server usually
+/// runs headless under a supervisor, where the system prompt would appear
+/// detached from any UI the user is looking at (or not appear at all), so we
+/// report the state and let the caller surface actionable instructions instead.
+pub fn is_trusted() -> bool {
+    extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+    }
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// [`is_trusted`] as a `Result`, for `?` at the top of a tool call.
+pub fn require_trusted() -> Result<()> {
+    if is_trusted() {
+        Ok(())
+    } else {
+        Err(AxError::NotTrusted)
+    }
+}
+
+// ── Element ──────────────────────────────────────────────────────────────────
+
+/// A retained handle on one accessibility object.
+///
+/// Not `Send`/`Sync`: confine it to the thread that created it.
+#[derive(Clone)]
+pub struct Element(CFRetained<AXUIElement>);
+
+impl fmt::Debug for Element {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Element")
+            .field("role", &self.role().unwrap_or_default())
+            .field("title", &self.string(attr::TITLE).unwrap_or_default())
+            .finish()
+    }
+}
+
+impl Element {
+    /// The system-wide element. Its `AXFocusedApplication` is how you find out
+    /// what the human is actually looking at.
+    pub fn system_wide() -> Self {
+        Self(unsafe { AXUIElement::new_system_wide() })
+    }
+
+    /// The application element for a pid.
+    ///
+    /// A timeout is applied immediately, before the caller can make any other
+    /// call: without it a wedged or modal app blocks our thread on the very
+    /// first attribute read, and a "computer use" server that hangs forever on
+    /// one bad app is worse than one that reports a timeout.
+    pub fn for_pid(pid: libc::pid_t) -> Self {
+        let el = Self(unsafe { AXUIElement::new_application(pid) });
+        let _ = el.set_timeout(DEFAULT_TIMEOUT_SECS);
+        el
+    }
+
+    /// Wrap an already-retained raw element.
+    ///
+    /// # Safety
+    /// `raw` must be a valid, owned (+1 retain count) `AXUIElementRef`.
+    pub unsafe fn from_retained(raw: CFRetained<AXUIElement>) -> Self {
+        Self(raw)
+    }
+
+    pub fn as_raw(&self) -> &AXUIElement {
+        &self.0
+    }
+
+    /// Per-element ceiling on how long AX will wait for the target app.
+    pub fn set_timeout(&self, secs: f32) -> Result<()> {
+        check(unsafe { self.0.set_messaging_timeout(secs) }, Ctx::None)
+    }
+
+    /// The pid that owns this element.
+    pub fn pid(&self) -> Result<libc::pid_t> {
+        let mut pid: libc::pid_t = 0;
+        check(unsafe { self.0.pid(NonNull::from(&mut pid)) }, Ctx::None)?;
+        Ok(pid)
+    }
+
+    // ── attribute reads ──────────────────────────────────────────────────
+
+    /// Raw attribute read. `Ok(None)` means "asked, nothing there" — an absent
+    /// title is normal, not an error, and collapsing both AX spellings of
+    /// absence (`AttributeUnsupported`, `NoValue`) here keeps every caller from
+    /// having to.
+    pub fn attribute(&self, name: &str) -> Result<Option<CFRetained<CFType>>> {
+        let key = CFString::from_str(name);
+        let mut out: *const CFType = std::ptr::null();
+        let err = unsafe { self.0.copy_attribute_value(&key, NonNull::from(&mut out)) };
+        match err {
+            AXError::Success => {}
+            AXError::AttributeUnsupported | AXError::NoValue => return Ok(None),
+            other => return Err(AxError::from_ax(other, Ctx::Attr(name))),
+        }
+        let Some(ptr) = NonNull::new(out.cast_mut()) else {
+            return Ok(None);
+        };
+        Ok(Some(unsafe { CFRetained::from_raw(ptr) }))
+    }
+
+    pub fn string(&self, name: &str) -> Option<String> {
+        let v = self.attribute(name).ok()??;
+        v.downcast_ref::<CFString>().map(|s| s.to_string())
+    }
+
+    pub fn bool(&self, name: &str) -> Option<bool> {
+        let v = self.attribute(name).ok()??;
+        if let Some(b) = v.downcast_ref::<CFBoolean>() {
+            return Some(b.as_bool());
+        }
+        // Several apps hand back 0/1 as CFNumber where the spec says CFBoolean.
+        v.downcast_ref::<CFNumber>()
+            .and_then(|n| n.as_i64())
+            .map(|n| n != 0)
+    }
+
+    pub fn number(&self, name: &str) -> Option<f64> {
+        let v = self.attribute(name).ok()??;
+        v.downcast_ref::<CFNumber>().and_then(|n| n.as_f64())
+    }
+
+    /// Read a text-ish attribute. `AXValue` is `CFString` on a text field but
+    /// `CFNumber` on a slider and `CFBoolean` on a checkbox, and an agent wants
+    /// to read all three the same way, so normalize to a display string.
+    pub fn value_string(&self, name: &str) -> Option<String> {
+        let v = self.attribute(name).ok()??;
+        if let Some(s) = v.downcast_ref::<CFString>() {
+            return Some(s.to_string());
+        }
+        if let Some(b) = v.downcast_ref::<CFBoolean>() {
+            return Some(b.as_bool().to_string());
+        }
+        if let Some(n) = v.downcast_ref::<CFNumber>() {
+            return n.as_f64().map(fmt_number);
+        }
+        None
+    }
+
+    pub fn element(&self, name: &str) -> Option<Element> {
+        let v = self.attribute(name).ok()??;
+        v.downcast::<AXUIElement>().ok().map(Element)
+    }
+
+    /// Child elements under `name`.
+    ///
+    /// Yields an empty `Vec` rather than an error when the attribute is missing:
+    /// leaf elements are the common case, not an exceptional one.
+    pub fn elements(&self, name: &str) -> Vec<Element> {
+        let Ok(Some(v)) = self.attribute(name) else {
+            return Vec::new();
+        };
+        let Some(arr) = v.downcast_ref::<CFArray>() else {
+            return Vec::new();
+        };
+        let n = arr.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let raw = unsafe { arr.value_at_index(i as isize) };
+            if raw.is_null() {
+                continue;
+            }
+            // SAFETY: an AX array under AXChildren/AXWindows holds
+            // AXUIElementRefs; we retain before the array can be mutated.
+            let el = unsafe { &*(raw as *const AXUIElement) };
+            out.push(Element(el.retain()));
+        }
+        out
+    }
+
+    pub fn children(&self) -> Vec<Element> {
+        self.elements(attr::CHILDREN)
+    }
+
+    pub fn role(&self) -> Option<String> {
+        self.string(attr::ROLE)
+    }
+
+    /// Screen position of the element's top-left corner, in points, in the
+    /// global (top-left origin) coordinate space AX reports.
+    pub fn position(&self) -> Option<CGPoint> {
+        let v = self.attribute(attr::POSITION).ok()??;
+        let ax = v.downcast_ref::<AXValue>()?;
+        let mut p = CGPoint { x: 0.0, y: 0.0 };
+        let ok = unsafe {
+            ax.value(
+                AXValueType::CGPoint,
+                NonNull::new((&mut p as *mut CGPoint).cast::<c_void>())?,
+            )
+        };
+        ok.then_some(p)
+    }
+
+    pub fn size(&self) -> Option<CGSize> {
+        let v = self.attribute(attr::SIZE).ok()??;
+        let ax = v.downcast_ref::<AXValue>()?;
+        let mut s = CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        let ok = unsafe {
+            ax.value(
+                AXValueType::CGSize,
+                NonNull::new((&mut s as *mut CGSize).cast::<c_void>())?,
+            )
+        };
+        ok.then_some(s)
+    }
+
+    pub fn frame(&self) -> Option<CGRect> {
+        Some(CGRect {
+            origin: self.position()?,
+            size: self.size()?,
+        })
+    }
+
+    // ── attribute writes ─────────────────────────────────────────────────
+
+    /// Replace a text attribute's contents.
+    ///
+    /// This is the no-focus-stealing way to type: it writes the field's value
+    /// directly instead of synthesizing keystrokes, so it does not depend on
+    /// the app being frontmost or the field being focused. The trade-off is
+    /// that it *replaces* rather than appends, and apps that only react to real
+    /// key events (canvas editors, terminals, games) will ignore it — which is
+    /// precisely the case a HID fallback exists for, one layer up.
+    pub fn set_string(&self, name: &str, value: &str) -> Result<()> {
+        let key = CFString::from_str(name);
+        let val = CFString::from_str(value);
+        check(
+            unsafe { self.0.set_attribute_value(&key, val.as_ref()) },
+            Ctx::Attr(name),
+        )
+    }
+
+    pub fn set_bool(&self, name: &str, value: bool) -> Result<()> {
+        let key = CFString::from_str(name);
+        let val = CFBoolean::new(value);
+        check(
+            unsafe { self.0.set_attribute_value(&key, val.as_ref()) },
+            Ctx::Attr(name),
+        )
+    }
+
+    pub fn is_settable(&self, name: &str) -> bool {
+        let key = CFString::from_str(name);
+        let mut settable: u8 = 0;
+        let err = unsafe {
+            self.0
+                .is_attribute_settable(&key, NonNull::from(&mut settable))
+        };
+        err == AXError::Success && settable != 0
+    }
+
+    /// Ask an app to build a full accessibility tree.
+    ///
+    /// Call this on an *application* element before the first snapshot. It is
+    /// what makes Electron and Chromium apps show up as more than an empty
+    /// window (see [`attr::MANUAL_ACCESSIBILITY`]). Both pokes are best-effort:
+    /// native apps simply do not support these attributes, and that is not a
+    /// failure, so this returns `()` rather than a `Result`.
+    pub fn enable_rich_accessibility(&self) {
+        let _ = self.set_bool(attr::MANUAL_ACCESSIBILITY, true);
+        let _ = self.set_bool(attr::ENHANCED_USER_INTERFACE, true);
+    }
+
+    // ── actions ──────────────────────────────────────────────────────────
+
+    /// Action names this element advertises.
+    pub fn actions(&self) -> Vec<String> {
+        let mut out: *const CFArray = std::ptr::null();
+        let err = unsafe { self.0.copy_action_names(NonNull::from(&mut out)) };
+        if err != AXError::Success {
+            return Vec::new();
+        }
+        let Some(ptr) = NonNull::new(out.cast_mut()) else {
+            return Vec::new();
+        };
+        let arr = unsafe { CFRetained::from_raw(ptr) };
+        let n = arr.len();
+        let mut names = Vec::with_capacity(n);
+        for i in 0..n {
+            let raw = unsafe { arr.value_at_index(i as isize) };
+            if raw.is_null() {
+                continue;
+            }
+            let s = unsafe { &*(raw as *const CFString) };
+            names.push(s.to_string());
+        }
+        names
+    }
+
+    /// Deliver one action to this element.
+    pub fn perform(&self, name: &str) -> Result<()> {
+        let key = CFString::from_str(name);
+        check(unsafe { self.0.perform_action(&key) }, Ctx::Action(name))
+    }
+
+    /// Activate the element the way a click would, picking whichever verb it
+    /// actually supports.
+    ///
+    /// AX has no single "click": buttons take `AXPress`, list rows and tabs take
+    /// `AXPick`, and a default dialog button may only take `AXConfirm`. Rather
+    /// than make the agent guess (and get `ActionUnsupported` back), try the
+    /// plausible verbs in order of specificity and report which one landed.
+    pub fn activate(&self) -> Result<&'static str> {
+        const CANDIDATES: [&str; 3] = [action::PRESS, action::PICK, action::CONFIRM];
+        let available = self.actions();
+        let mut last = None;
+        for verb in CANDIDATES {
+            if !available.iter().any(|a| a == verb) {
+                continue;
+            }
+            match self.perform(verb) {
+                Ok(()) => return Ok(verb),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or(AxError::Unsupported {
+            what: "action",
+            name: format!("any of {CANDIDATES:?} (element advertises {available:?})"),
+        }))
+    }
+
+    /// Hit-test a point, in AX global coordinates.
+    ///
+    /// Used for the coordinate form of `click`. Note the result is still an
+    /// *element*, and we still act on it via [`Element::activate`] — taking
+    /// coordinates as input never means we start synthesizing mouse events.
+    pub fn element_at(&self, x: f32, y: f32) -> Result<Element> {
+        let mut out: *const AXUIElement = std::ptr::null();
+        check(
+            unsafe {
+                self.0
+                    .copy_element_at_position(x, y, NonNull::from(&mut out))
+            },
+            Ctx::None,
+        )?;
+        let ptr = NonNull::new(out.cast_mut()).ok_or(AxError::NoValue("element_at".into()))?;
+        Ok(Element(unsafe { CFRetained::from_raw(ptr) }))
+    }
+
+    // ── tree walk ────────────────────────────────────────────────────────
+
+    /// Flatten this subtree, breadth-first, under explicit caps.
+    ///
+    /// Breadth-first, not depth-first, and that choice matters: real UIs nest
+    /// wrappers dozens of levels deep, so a depth-first walk that hits
+    /// `max_nodes` burns the whole budget inside the first sidebar and never
+    /// reaches the main content. BFS spends the budget on the shallow elements
+    /// an agent is most likely to want.
+    ///
+    /// The caps are not defensive padding. An AX tree can be effectively
+    /// unbounded (virtualized 100k-row tables) and is not guaranteed acyclic,
+    /// so an uncapped walk is a hang, not a slow path.
+    pub fn snapshot_tree(&self, limits: Limits) -> Vec<AxNode> {
+        let mut nodes: Vec<AxNode> = Vec::new();
+        // (element, depth, parent index in `nodes`)
+        let mut queue: std::collections::VecDeque<(Element, u32, Option<usize>)> =
+            std::collections::VecDeque::new();
+        queue.push_back((self.clone(), 0, None));
+
+        while let Some((el, depth, parent)) = queue.pop_front() {
+            if nodes.len() >= limits.max_nodes {
+                break;
+            }
+
+            let index = nodes.len();
+            let info = AxNode::read(&el, index, depth, parent);
+            let descend = depth < limits.max_depth && info.should_descend(limits);
+            nodes.push(info);
+
+            if descend {
+                for child in el.children().into_iter().take(limits.max_children) {
+                    queue.push_back((child, depth + 1, Some(index)));
+                }
+            }
+        }
+        nodes
+    }
+}
+
+// ── limits ───────────────────────────────────────────────────────────────────
+
+/// Caps for one [`Element::snapshot_tree`] walk.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Hard ceiling on nodes returned. The real constraint is the agent's
+    /// context window, not memory.
+    pub max_nodes: usize,
+    /// Hard ceiling on nesting. Anything deeper is virtually always layout
+    /// scaffolding, not content.
+    pub max_depth: u32,
+    /// Per-parent child cap, so one 50k-row table cannot consume the whole
+    /// `max_nodes` budget by itself.
+    pub max_children: usize,
+    /// Do not walk into a subtree whose root is entirely off-screen. A window's
+    /// off-screen halves and collapsed drawers are the bulk of a naive tree and
+    /// none of it is actionable.
+    pub skip_offscreen: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 1500,
+            max_depth: 40,
+            max_children: 200,
+            skip_offscreen: true,
+        }
+    }
+}
+
+/// Default AX messaging timeout, in seconds.
+///
+/// Long enough for a busy Electron app to answer, short enough that a wedged
+/// app fails the tool call instead of the whole server.
+pub const DEFAULT_TIMEOUT_SECS: f32 = 2.0;
+
+// ── AxNode ───────────────────────────────────────────────────────────────────
+
+/// One element, read once, in a form that can be serialized for an LLM.
+///
+/// Every field is captured in a single pass while the element is in hand. AX
+/// reads are synchronous IPC, so re-reading a title later would be another
+/// round-trip *and* could observe a different UI than the screenshot did.
+#[derive(Debug, Clone)]
+pub struct AxNode {
+    /// Position in the flat snapshot. This is the handle the agent quotes back.
+    pub index: usize,
+    pub depth: u32,
+    pub parent: Option<usize>,
+    pub role: String,
+    pub subrole: Option<String>,
+    /// Best available human-readable label, resolved from several attributes.
+    pub label: Option<String>,
+    /// Current contents, for elements that hold a value.
+    pub value: Option<String>,
+    pub help: Option<String>,
+    pub frame: Option<CGRect>,
+    pub enabled: bool,
+    pub focused: bool,
+    pub selected: bool,
+    /// Actions this element advertises, minus the ones no agent should call.
+    pub actions: Vec<String>,
+    /// Whether the value is writable, i.e. whether `set_value` can work here.
+    pub settable: bool,
+    /// Retained handle, so acting on `index` needs no second lookup.
+    pub element: Element,
+}
+
+impl AxNode {
+    fn read(el: &Element, index: usize, depth: u32, parent: Option<usize>) -> Self {
+        let role = el.role().unwrap_or_else(|| "AXUnknown".to_string());
+
+        // Resolve a label from the attributes apps actually populate, in
+        // descending order of intent. AXTitle is the label a developer chose;
+        // AXDescription is what VoiceOver reads; AXPlaceholderValue is the only
+        // hint an empty search field ever gives. Falling all the way through to
+        // AXRoleDescription ("button") is still better than an unlabeled node.
+        let label = el
+            .string(attr::TITLE)
+            .or_else(|| el.string(attr::DESCRIPTION))
+            .or_else(|| el.string(attr::PLACEHOLDER))
+            .or_else(|| el.string(attr::IDENTIFIER))
+            .or_else(|| {
+                // Some apps put the label in a *separate* element and only
+                // cross-reference it. Follow that one hop.
+                el.element(attr::TITLE_UI_ELEMENT)
+                    .and_then(|t| t.string(attr::VALUE).or_else(|| t.string(attr::TITLE)))
+            })
+            .filter(|s| !s.trim().is_empty());
+
+        let value = el
+            .value_string(attr::VALUE)
+            .filter(|s| !s.trim().is_empty());
+
+        let mut actions = el.actions();
+        // AXShowMenu on a container opens a context menu, which changes the UI
+        // out from under the snapshot the agent is holding. Keep it out of the
+        // advertised surface; a dedicated tool can still ask for it explicitly.
+        actions.retain(|a| a != action::SCROLL_TO_VISIBLE);
+
+        Self {
+            index,
+            depth,
+            parent,
+            subrole: el.string(attr::SUBROLE),
+            label,
+            value,
+            help: el.string(attr::HELP),
+            frame: el.frame(),
+            enabled: el.bool(attr::ENABLED).unwrap_or(true),
+            focused: el.bool(attr::FOCUSED).unwrap_or(false),
+            selected: el.bool(attr::SELECTED).unwrap_or(false),
+            settable: el.is_settable(attr::VALUE),
+            actions,
+            role,
+            element: el.clone(),
+        }
+    }
+
+    /// Whether this node can be acted on, i.e. whether it is worth showing to
+    /// the agent as a target.
+    pub fn is_actionable(&self) -> bool {
+        self.enabled && !self.actions.is_empty()
+    }
+
+    /// Whether the walk should continue into this node's children.
+    fn should_descend(&self, limits: Limits) -> bool {
+        if !limits.skip_offscreen {
+            return true;
+        }
+        // A zero-area or negatively-positioned frame means collapsed, hidden,
+        // or scrolled fully out of view. Note we still *keep* the node (its
+        // existence is information); we just do not pay to walk into it.
+        match self.frame {
+            Some(f) => f.size.width > 0.5 && f.size.height > 0.5,
+            // No frame at all is normal for menu bars and non-visual groups,
+            // which do have useful children — so descend.
+            None => true,
+        }
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn check(err: AXError, ctx: Ctx<'_>) -> Result<()> {
+    if err == AXError::Success {
+        Ok(())
+    } else {
+        Err(AxError::from_ax(err, ctx))
+    }
+}
+
+/// Render a number the way a UI would, not the way `f64` prints.
+///
+/// AX hands back `1.0` for a checked checkbox and `0.6000000000000001` for a
+/// slider; both are noise in a prompt. Integers print without a decimal point
+/// and fractions get clamped to three places.
+fn fmt_number(n: f64) -> String {
+    if n.fract().abs() < f64::EPSILON && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        let s = format!("{n:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_render_like_a_ui_not_like_a_float() {
+        assert_eq!(fmt_number(1.0), "1");
+        assert_eq!(fmt_number(0.0), "0");
+        assert_eq!(fmt_number(-3.0), "-3");
+        assert_eq!(fmt_number(0.6000000000000001), "0.6");
+        assert_eq!(fmt_number(0.5), "0.5");
+        assert_eq!(fmt_number(1.2345), "1.234");
+    }
+
+    #[test]
+    fn default_limits_are_bounded() {
+        let l = Limits::default();
+        assert!(l.max_nodes > 0 && l.max_depth > 0 && l.max_children > 0);
+    }
+
+    /// The system-wide element always exists, so this exercises the FFI
+    /// round-trip without needing the Accessibility grant or any running app.
+    #[test]
+    fn system_wide_element_is_constructible() {
+        let el = Element::system_wide();
+        // Reading an unsupported attribute must be `Ok(None)`, not an error:
+        // the whole crate's ergonomics depend on that distinction.
+        assert!(el.attribute("AXDefinitelyNotARealAttribute").is_ok());
+    }
+}

@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Rename asset
+        run: cp target/release/cua-rs cua-rs-macos-arm64
+
+      # Ad-hoc signing keeps a stable identifier across rebuilds. TCC keys a
+      # grant on the binary's code signature, so an unsigned or randomly-signed
+      # release makes the user re-approve Accessibility on every version bump.
+      #
+      # This is a stopgap. A Developer ID signature plus notarization is the only
+      # thing that makes grants survive properly; wire MACOS_CERT_P12 +
+      # MACOS_CERT_PASSWORD + notarytool credentials in when an Apple developer
+      # account is available. See DESIGN.md.
+      - name: Sign (ad-hoc, stable identifier)
+        run: |
+          codesign --force --sign - \
+            --identifier com.maestrojeong.cua-rs \
+            --options runtime \
+            cua-rs-macos-arm64
+          codesign -dv cua-rs-macos-arm64 2>&1 | head -5
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cua-rs-macos-arm64
+          generate_release_notes: true

@@ -1,0 +1,33 @@
+[package]
+name = "cua-core"
+description = "Snapshot model, app resolution and stable element handles for cua-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cua-ax.workspace = true
+cua-capture.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+serde.workspace = true
+base64.workspace = true
+objc2 = { workspace = true }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSEnumerator",
+    "NSObject",
+    "NSString",
+    "NSURL",
+] }
+objc2-core-foundation.workspace = true
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }

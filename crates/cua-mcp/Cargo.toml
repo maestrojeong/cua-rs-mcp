@@ -1,0 +1,27 @@
+[package]
+name = "cua-mcp"
+description = "MCP server that drives native macOS apps through the Accessibility API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cua-rs"
+path = "src/main.rs"
+
+[dependencies]
+cua-core.workspace = true
+cua-ax.workspace = true
+cua-capture.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+axum.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+schemars.workspace = true

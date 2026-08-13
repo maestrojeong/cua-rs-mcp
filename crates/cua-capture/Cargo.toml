@@ -1,0 +1,52 @@
+[package]
+name = "cua-capture"
+description = "Per-window macOS screen capture via ScreenCaptureKit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+block2 = "0.6"
+objc2 = { workspace = true }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSString",
+] }
+objc2-core-foundation.workspace = true
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGImage",
+    "CGWindow",
+    "CGDirectDisplay",
+    "CGError",
+    "CGGeometry",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-graphics",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSGraphics",
+] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "libc",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "SCShareableContent",
+    "SCStream",
+    "SCScreenshotManager",
+    "SCError",
+] }
