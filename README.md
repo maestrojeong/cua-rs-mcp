@@ -85,10 +85,19 @@ Or from source:
 cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp
 ```
 
+> **Downloaded the binary by hand from the Releases page?** Clear the quarantine
+> flag first, or it will hang on launch rather than erroring:
+> `xattr -d com.apple.quarantine ./cua-rs`. The `curl | sh` installer above
+> handles this for you.
+
 **2. Grant permissions** — two of them, and **they attach to the process that
 launches `cua-rs`, not to `cua-rs` itself**. macOS credits the request to the
 responsible process, so a grant given to iTerm does not carry over to Claude
 Desktop, Cursor, or Codex CLI.
+
+The upside of that rule: **upgrading `cua-rs` never costs you a re-approval.**
+The grant was never on this binary. Verified by running a byte-mutated copy from
+an unrelated path — it still holds both grants.
 
 | Grant | Needed for | Without it |
 |---|:--|:--|

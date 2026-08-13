@@ -42,6 +42,13 @@ fi
 echo "Downloading $ASSET ($VERSION) -> $DEST/cua-rs"
 curl -fsSL "$URL" -o "$DEST/cua-rs"
 chmod +x "$DEST/cua-rs"
+
+# curl does not set com.apple.quarantine, so this is belt-and-braces -- but the
+# failure it prevents is bad enough to be worth two lines. A quarantined ad-hoc
+# binary does not error on launch, it *blocks*, and an MCP client that spawned it
+# then waits forever for a handshake that will never arrive.
+xattr -d com.apple.quarantine "$DEST/cua-rs" 2>/dev/null || true
+
 echo "Installed: $DEST/cua-rs"
 
 # TCC grants attach to the launching process, so the install path alone is not

@@ -367,15 +367,51 @@ supervisor where a system prompt appears detached from anything the user is
 looking at, or not at all. `is_trusted()` is the non-prompting
 `AXIsProcessTrusted`, deliberately not `AXIsProcessTrustedWithOptions`.
 
-**Signing is the only durable fix.** TCC keys a grant on the code signature, so
-an unsigned or randomly-signed release forces re-approval on every version bump.
-Current state, honestly:
+**A version bump does *not* cost a re-approval, and an earlier draft of this
+document was wrong to say it did.** The claim was inherited from projects whose
+binary is its own responsible process. It does not apply here, and the test is
+three lines:
 
-- **now:** ad-hoc signature with a stable `--identifier` in `release.yml`. Keeps
-  the identity stable across rebuilds. Not sufficient.
-- **needed:** Developer ID + notarization. Requires an Apple developer account.
-  `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD` / notarytool credentials are the
-  intended secret names.
+```console
+$ cp target/debug/cua-rs /tmp/elsewhere/cua-rs        # different path
+$ printf '\x00' | dd of=/tmp/elsewhere/cua-rs bs=1 \   # different cdhash
+    seek=$(($(stat -f%z /tmp/elsewhere/cua-rs) - 1)) conv=notrunc
+$ /tmp/elsewhere/cua-rs permissions
+accessibility:    true
+screen_recording: true
+```
+
+A byte-mutated copy at an unrelated path still holds both grants, because TCC
+never keyed them to this binary — it keyed them to the terminal that launched it.
+So Developer ID signing would not buy fewer re-approvals for the MCP use case;
+the grant is not on our artifact to begin with.
+
+Re-approval happens when the **host** changes, which is the same statement as the
+first point above, not a second problem.
+
+What the lack of a Developer ID actually costs is **Gatekeeper on download**, and
+only on one path:
+
+| How the binary arrives | `com.apple.quarantine` | Result |
+|---|:--|:--|
+| `curl ... \| sh` (install.sh) | absent — measured | runs immediately |
+| downloaded in a browser from Releases | present | **blocks on launch** |
+
+The second row hangs rather than erroring, which is the worst possible failure
+mode for something an MCP client spawns: the client waits forever on a handshake
+that will never arrive. `install.sh` therefore strips the attribute defensively
+even though its own `curl` path never sets it, and the README says what to run if
+someone downloaded the asset by hand.
+
+Signing state, then, is a Gatekeeper question rather than a TCC one:
+
+- **now:** ad-hoc signature with a stable `--identifier` in `release.yml`, plus
+  quarantine handling in `install.sh`. Sufficient for `curl | sh`.
+- **would be nicer:** Developer ID + notarization, so browser downloads also just
+  work. Requires an Apple developer account; `MACOS_CERT_P12` /
+  `MACOS_CERT_PASSWORD` / notarytool credentials are the intended secret names.
+  Deliberately not pursued — it buys one download path, not fewer permission
+  prompts.
 
 **Screen lock.** Not handled yet. Mutating tools should return a recoverable
 error while locked rather than failing opaquely.
