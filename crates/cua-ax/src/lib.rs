@@ -80,6 +80,11 @@ pub enum AxError {
     #[error("the app did not complete the request in time (busy, modal, or not responding)")]
     CannotComplete,
 
+    /// The app advertises the attribute or action and then declines to implement
+    /// it. Not the caller's mistake, and not fixable by retrying.
+    #[error("the app advertises `{0}` but has not implemented it")]
+    NotImplemented(String),
+
     /// Anything else, kept verbatim so bug reports stay useful.
     #[error("accessibility error: {0:?}")]
     Other(i32),
@@ -102,6 +107,11 @@ impl AxError {
                 what: "action",
                 name: ctx.name().to_string(),
             },
+            // Distinct from Unsupported: the app declares the attribute and even
+            // reports it as settable, then refuses the write. Common for
+            // AXEnhancedUserInterface, which many apps advertise and none of the
+            // modern ones implement.
+            AXError::NotImplemented => Self::NotImplemented(ctx.name().to_string()),
             other => Self::Other(other.0),
         }
     }
@@ -463,16 +473,51 @@ impl Element {
         err == AXError::Success && settable != 0
     }
 
-    /// Ask an app to build a full accessibility tree.
+    /// Ask an app to build a full accessibility tree, and report whether it
+    /// listened.
     ///
-    /// Call this on an *application* element before the first snapshot. It is
-    /// what makes Electron and Chromium apps show up as more than an empty
-    /// window (see [`attr::MANUAL_ACCESSIBILITY`]). Both pokes are best-effort:
-    /// native apps simply do not support these attributes, and that is not a
-    /// failure, so this returns `()` rather than a `Result`.
-    pub fn enable_rich_accessibility(&self) {
-        let _ = self.set_bool(attr::MANUAL_ACCESSIBILITY, true);
-        let _ = self.set_bool(attr::ENHANCED_USER_INTERFACE, true);
+    /// Call this on an *application* element before the first snapshot. For
+    /// Chromium and Electron apps it is what turns a single empty `AXWindow` into
+    /// a real tree (see [`attr::MANUAL_ACCESSIBILITY`]).
+    ///
+    /// Two things measured on macOS 26 that the obvious implementation gets
+    /// wrong:
+    ///
+    /// - **The read-back lies.** Slack accepts `AXManualAccessibility = true`,
+    ///   reports success, and then reads the attribute back as `false` — forever,
+    ///   even once it is demonstrably exposing a 367-element tree with an
+    ///   `AXWebArea`. So the returned [`Enablement`] must not be used to conclude
+    ///   that an app refused; see [`Enablement::reads_back_enabled`].
+    /// - **`AXEnhancedUserInterface` advertises itself and is not implemented.**
+    ///   `is_settable` says `true`, the write fails with `NotImplemented`. Kept
+    ///   anyway because it costs one call and older AppKit apps still honor it.
+    ///
+    /// And the tree does not appear promptly. Slack showed 13 elements for at
+    /// least 3.2 seconds after the poke and 367 a minute later, so a caller that
+    /// sleeps briefly and then declares the window empty will be wrong. The
+    /// honest response to a small tree right after a first poke is "ask again",
+    /// not "this app has no content".
+    pub fn enable_rich_accessibility(&self) -> Enablement {
+        // Read back rather than trusting the write. `Ok(())` here means "the app
+        // accepted the message", which is a weaker claim than "the app changed
+        // its behavior".
+        let manual_write = self.set_bool(attr::MANUAL_ACCESSIBILITY, true).is_ok();
+        let manual_took = self.bool(attr::MANUAL_ACCESSIBILITY).unwrap_or(false);
+        // Legacy fallback, kept because it costs one call and still works on some
+        // older AppKit apps that gate rich output on VoiceOver. Every app measured
+        // so far fails this write with NotImplemented while still reporting the
+        // attribute as settable.
+        let enhanced_took = if self.set_bool(attr::ENHANCED_USER_INTERFACE, true).is_ok() {
+            self.bool(attr::ENHANCED_USER_INTERFACE).unwrap_or(false)
+        } else {
+            false
+        };
+
+        Enablement {
+            requested: manual_write,
+            manual: manual_took,
+            enhanced: enhanced_took,
+        }
     }
 
     // ── text ─────────────────────────────────────────────────────────────
@@ -863,6 +908,34 @@ impl AxNode {
             // which do have useful children — so descend.
             None => true,
         }
+    }
+}
+
+/// What [`Element::enable_rich_accessibility`] actually achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Enablement {
+    /// The write was accepted. Says nothing about whether it had any effect.
+    pub requested: bool,
+    /// `AXManualAccessibility` reads back as `true`.
+    pub manual: bool,
+    /// `AXEnhancedUserInterface` reads back as `true`.
+    pub enhanced: bool,
+}
+
+impl Enablement {
+    /// Whether either attribute reads back as enabled.
+    ///
+    /// **Do not use this to decide that an app refuses enablement.** Measured on
+    /// macOS 26, Slack reads `AXManualAccessibility` back as `false` forever and
+    /// still ends up exposing a 367-element tree with an `AXWebArea`. The
+    /// attribute is effectively write-only: the read is not a mirror of the
+    /// state, so a `false` here means nothing.
+    ///
+    /// It is kept because a `true` is still informative when debugging, and
+    /// because a diagnostic that prints both the write result and the read-back
+    /// is how the discrepancy was found in the first place.
+    pub fn reads_back_enabled(&self) -> bool {
+        self.manual || self.enhanced
     }
 }
 

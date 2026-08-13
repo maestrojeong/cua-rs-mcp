@@ -44,6 +44,7 @@ cua-rs delivers actions *directly to the target UI element* instead.
 | your keyboard focus | changes | **never changes** |
 | your active Space | can switch | **never switches** |
 | occluded / off-Space window | blank or stale capture | **captures correctly** |
+| window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
 | you working simultaneously | input fights the agent | **works** |
 
 There is exactly **one** line in this repository that posts an HID event, and it
@@ -267,7 +268,7 @@ Honest ones, not a roadmap.
 |---|:--|
 | buttons, menus, checkboxes, tabs, list rows | yes |
 | text fields, search fields, text areas | yes |
-| Electron apps (Slack, VS Code, Discord) | yes, after a one-time `AXManualAccessibility` poke |
+| Electron apps (Slack, VS Code, Discord) | yes — but the tree builds lazily, so the first read can be nearly empty; call `get_app_state` again |
 | Return, Escape, stepper arrows | yes — `AXConfirm` / `AXCancel` / `AXIncrement` |
 | arbitrary chords (`⌘⇧P`, `f5`) | only with `--allow-hid`, which moves the cursor |
 | canvas apps (Figma internals, games) | **no** — no AX elements to act on |

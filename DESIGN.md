@@ -255,23 +255,79 @@ asks, because maintaining it is expensive. Without a poke, Slack / VS Code /
 Discord / Notion look like one empty `AXWindow` — which reads exactly like a bug
 in our walker.
 
-The fix is one attribute write, plus two things that are easy to get wrong:
+The fix is one attribute write on the *application* element:
 
 ```rust
 app.set_bool("AXManualAccessibility", true);      // modern
 app.set_bool("AXEnhancedUserInterface", true);    // legacy fallback
-std::thread::sleep(Duration::from_millis(400));   // the tree builds async
 ```
 
-**Do it once per process, not once per snapshot.** Setting it repeatedly makes
-every renderer rebuild its tree in a loop and pegs WindowServer — a documented
-production failure in other projects, not a theoretical one.
+**Do it once per process lifetime, not once per snapshot.** Setting it repeatedly
+makes every renderer rebuild its tree in a loop and pegs WindowServer — a
+documented production failure in other projects, not a theoretical one. Keyed on
+`(pid, start_time)` rather than pid, because pids are recycled and a relaunched
+Electron app must not inherit its predecessor's "already enabled" decision.
+Start time comes from `proc_pidinfo(PROC_PIDTBSDINFO)`; `sysctl(KERN_PROC_PID)`
+would need `struct kinfo_proc`, which the `libc` crate does not expose on Apple
+platforms.
 
-**Key on `(pid, start_time)`, not pid.** Pids are recycled. A relaunched Electron
-app can land on its predecessor's pid, inherit the "already enabled" decision,
-skip the poke, and return a permanently empty tree. Start time comes from
-`proc_pidinfo(PROC_PIDTBSDINFO)` — `sysctl(KERN_PROC_PID)` would need
-`struct kinfo_proc`, which the `libc` crate does not expose on Apple platforms.
+### What was actually measured
+
+Three things here are not what the obvious implementation assumes. All measured
+on macOS 26.5 with the `ax_poke` example in `crates/cua-ax/examples/`:
+
+**The read-back lies.** Slack accepts `AXManualAccessibility = true`, reports
+success, and then reads the attribute back as `false` — permanently, even while
+it is demonstrably exposing a 367-element tree containing an `AXWebArea`:
+
+```text
+AXManualAccessibility   settable=true  write=ok  after=Some(false)
+  +0ms  367 elements, 355 actionable, 106 with text
+```
+
+So a `false` read means nothing, and any logic that concludes "this app refused
+enablement" from it is wrong. An earlier version of this code did exactly that
+and would have emitted a confident, false warning on Slack.
+
+**`AXEnhancedUserInterface` advertises itself and is not implemented.**
+`is_settable` returns `true`; the write fails with `NotImplemented` (-25208) on
+both apps tested. Kept anyway because it costs one call and older AppKit apps
+still honor it.
+
+**The tree does not appear promptly.** Slack held at 13 elements for at least
+3.2 seconds after the poke and was at 367 about a minute later. Chrome went from
+48 elements (native chrome only) to 413 (web content included) over a similar
+span. So the 400 ms settle in `get_app_state` is a courtesy for apps that are
+quick, not a wait for completion — and a caller that sleeps briefly and then
+declares the window empty will be wrong.
+
+Hence the design: a small tree on the *first* read of an app produces a warning
+that says the tree may still be building, says to call again, and says what a
+persistently small tree means. That is correct in both branches, which neither
+"it is empty" nor "it refuses AX" is.
+
+### Frontmost does not matter, and this was checked
+
+The natural suspicion about the 13 → 367 jump is that the window had to be
+frontmost. It did not. Controlled by activating each app and restoring focus:
+
+| App | background | frontmost |
+|---|--:|--:|
+| Google Chrome | 413 | 413 |
+| Finder | 4 | 4 |
+| Slack | 367 | 373 |
+
+Identical for Chrome and Finder; Slack's +6 is a focus ring and hover affordances
+appearing, not content. Slack was also *occluded* by the terminal throughout the
+background measurements.
+
+This is a positive result for the project's central claim rather than a
+footnote: reading and driving a window does not require it to be visible, on top,
+or active.
+
+The remaining honest gap is that the exact settle time is bounded, not known:
+longer than 3.2 s, shorter than ~1 minute, measured on two apps. Pinning it down
+needs a never-before-poked app launched under controlled conditions.
 
 Longer term the better answer for Chromium content is not AX at all: hand it to
 [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) over CDP.

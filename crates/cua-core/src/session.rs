@@ -279,6 +279,12 @@ struct Inner {
     /// had, and inheriting that "already enabled" decision would skip the poke
     /// and hand back a permanently empty web-content tree.
     enabled: HashSet<ProcessKey>,
+    /// What the poke actually achieved, per process lifetime.
+    ///
+    /// Kept because the write is unreliable and fails silently, so "the tree is
+    /// empty" and "the app refused to build one" have to be told apart in the
+    /// response rather than guessed at by the caller.
+    enablement: HashMap<ProcessKey, cua_ax::Enablement>,
 }
 
 /// Identifies a process incarnation, not just a pid slot.
@@ -532,10 +538,16 @@ impl Inner {
         // the same empty window we are trying to fix.
         // `insert` returns false when the key was already present, which makes
         // "poke once per process lifetime" a single atomic step.
-        if self.enabled.insert(ProcessKey::for_pid(info.pid)) {
-            app_el.enable_rich_accessibility();
-            // The tree is built asynchronously, so reading immediately would
-            // return the same empty window we are trying to fix.
+        let key = ProcessKey::for_pid(info.pid);
+        let first_read = self.enabled.insert(key);
+        if first_read {
+            let enablement = app_el.enable_rich_accessibility();
+            tracing::debug!(?enablement, pid = info.pid, "requested rich accessibility");
+            self.enablement.insert(key, enablement);
+            // A short settle, not a wait for completion. Some apps do publish
+            // within a few hundred milliseconds; the ones that take seconds are
+            // handled by telling the caller to ask again rather than by blocking
+            // every first call for that long.
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
 
@@ -573,6 +585,33 @@ impl Inner {
         };
 
         let nodes = root.snapshot_tree(opts.limits);
+
+        // A small tree on the *first* read of an app is ambiguous, and the
+        // ambiguity is worth stating rather than resolving badly.
+        //
+        // Chromium and Electron build their accessibility tree lazily once poked,
+        // and it does not arrive promptly: Slack measured 13 elements for over
+        // three seconds after the poke and 367 a minute later. Deciding "this
+        // window is empty" from the first read is therefore wrong, and so is
+        // deciding "this app refuses AX" — the read-back of
+        // AXManualAccessibility is `false` on Slack even when it is plainly
+        // working, so there is no signal there either.
+        //
+        // What is honest and actionable in both cases: say the tree may still be
+        // building, say to ask again, and say what it means if it never grows.
+        const LOOKS_EMPTY: usize = 20;
+        if nodes.len() < LOOKS_EMPTY && first_read {
+            warnings.push(format!(
+                "only {} elements on the first read of this app. Chromium and Electron apps build \
+                 their accessibility tree lazily after being asked, and it can take several \
+                 seconds to appear — call get_app_state again. If it stays this small across a \
+                 few tries, this app does not expose its web content over the accessibility API \
+                 at all and has to be driven over CDP instead; its native chrome (window buttons, \
+                 menu bar) is still reachable here.",
+                nodes.len()
+            ));
+        }
+
         if nodes.len() >= opts.limits.max_nodes {
             warnings.push(format!(
                 "tree truncated at {} elements; pass a larger max_nodes or narrow the target",
