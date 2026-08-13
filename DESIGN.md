@@ -429,8 +429,13 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 - [ ] launched from a different host app → grants do not carry over
 
 **Coexistence — the point of the project**
-- [x] cursor does not move during any action (Chrome, verified byte-identical
-      `CGEvent(source: nil).location` before and after `AXPress`)
+- [x] cursor does not move during any action **on the AX path** (Chrome,
+      verified byte-identical `CGEvent(source: nil).location` before and after
+      `AXPress`)
+- [x] the `--allow-hid` click fallback *does* move the cursor, and restores it —
+      this is the one place the coexistence property is traded away on purpose,
+      for elements no accessibility action can reach (KakaoTalk conversation
+      rows, measured)
 - [x] frontmost app unchanged after `click` (Terminal stayed frontmost)
 - [x] tree is identical whether the target is frontmost or occluded — Chrome
       413/413, Finder 4/4, Slack 367/373 (+6 = focus ring). See §5.

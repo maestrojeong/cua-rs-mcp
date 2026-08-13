@@ -1,6 +1,6 @@
 # cua-rs
 
-**Your Mac, driven by an agent. Your cursor, still yours.**
+**Your Mac, driven by an agent. Your cursor stays yours — until you say otherwise.**
 
 [![ci](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/maestrojeong/cua-rs-mcp)](https://github.com/maestrojeong/cua-rs-mcp/releases)
@@ -8,10 +8,19 @@
 ![platforms](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
 
 cua-rs is a macOS computer-use MCP server that drives native apps through the
-**Accessibility API** instead of synthesizing mouse and keyboard input. Nothing
-moves your pointer, nothing steals keyboard focus, nothing switches your Space.
-An agent can work in a background window while you keep typing in another — on
-the same Mac, at the same time. One Rust binary, no Node.js, no Python.
+**Accessibility API** instead of synthesizing mouse and keyboard input. On the
+default path nothing moves your pointer, nothing steals keyboard focus, nothing
+switches your Space: an agent can work in a background window while you keep
+typing in another, on the same Mac at the same time. One Rust binary, no
+Node.js, no Python.
+
+Some controls cannot be reached that way at all — a chat app's conversation
+row that advertises no accessibility action and ignores every accessibility
+write. For those, and only when you start the server with `--allow-hid`, there
+is a fallback that borrows your pointer for a few frames and puts it back. It
+is off by default, it says so in every result, and it refuses to fire when the
+pixels it is aiming at do not belong to the app it was asked to click. See
+[The escape hatches](#the-escape-hatches).
 
 ```mermaid
 flowchart LR
@@ -36,24 +45,24 @@ cua-rs delivers actions *directly to the target UI element* instead.
 
 | | HID-synthesis tools | cua-rs |
 |---|:--|:--|
-| click | move cursor, post mouse down/up | `AXUIElementPerformAction(AXPress)` |
+| click | move cursor, post mouse down/up | `AXUIElementPerformAction(AXPress)`, falling back to a guarded real click only with `--allow-hid` |
 | type | post key events to whatever has focus | `AXUIElementSetAttributeValue(AXValue)` |
 | scroll | post wheel events at a point | `AXScrollDownByPage` |
 | screenshot | `CGWindowListCreateImage` (deprecated) | ScreenCaptureKit, per window |
-| your cursor | moves | **never touched** |
-| your keyboard focus | changes | **never changes** |
-| your active Space | can switch | **never switches** |
+| your cursor | moves | **untouched on the AX path**; borrowed and restored by the `--allow-hid` click fallback |
+| your keyboard focus | changes | **unchanged on the AX path** |
+| your active Space | can switch | **never switches on the AX path** |
 | occluded / off-Space window | blank or stale capture | **captures correctly** |
 | window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
 | you working simultaneously | input fights the agent | **works** |
 
-There is exactly **one** line in this repository that posts an HID event, and it
-lives in `cua-hid`, which is unreachable unless you start the server with
-`--allow-hid`:
+Every line in this repository that can post an HID event lives in `cua-hid`,
+which is unreachable unless you start the server with `--allow-hid`. The
+dependency graph enforces that, not a comment:
 
 ```console
-$ grep -rn 'CGEvent::post' crates/*/src/*.rs
-crates/cua-hid/src/lib.rs:131:  CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+$ grep -rln 'CGEvent::post' crates/*/src/*.rs
+crates/cua-hid/src/lib.rs
 
 $ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
 0
@@ -287,25 +296,40 @@ Honest ones, not a roadmap.
 `set_value` **replaces** rather than appends; `type_text` appends. Apps that only
 react to real key events will ignore both.
 
-### The one escape hatch
+### The escape hatches
 
-`press_key` can send a real key event for chords AX cannot express, but only
-when the server was started with `--allow-hid`. That path moves the cursor and
-takes keyboard focus, so it is off by default and never silent:
+Two of them, both behind `--allow-hid`, both loud about it.
+
+`press_key` sends a real key event for chords AX cannot express. `click` falls
+back to a real mouse click for an element that advertises no `AXPress`,
+`AXPick` or `AXConfirm` at all — measured against KakaoTalk's conversation
+list, where every accessibility route returns success and does nothing. That
+fallback moves the pointer onto the target, clicks, and puts the pointer and
+the previously frontmost app back:
 
 ```text
-delivery: hid  (a real key event: the cursor and keyboard focus were used,
-                exactly as if the user pressed the keys)
+delivery: hid  (a real input event through the shared HID stream: the cursor
+                and keyboard focus were used, exactly as if the user acted)
 ```
+
+Before it fires it hit-tests the target point system-wide and refuses unless
+those pixels currently belong to the target app — a window on another Space
+reports ordinary screen coordinates, and an earlier version of this clicked an
+innocent Terminal window because of it. It also re-reads the element's visible
+text and refuses if it no longer shows what the snapshot recorded, because list
+views recycle their cells.
 
 Every action result carries `delivery: ax` or `delivery: hid`, so an agent can
 never mistake one for the other. All HID code lives in one crate, `cua-hid`,
 which `cua-ax` and `cua-capture` do not depend on — `grep -rl cua_hid crates/`
 enumerates every site that can touch your pointer.
 
-`ui_changed: false` in an action result is reported honestly. It does not always
-mean failure — some controls change nothing observable — but hiding it would let
-an agent believe every dispatched action landed.
+`ui_changed` is reported honestly and has three values, not two: `yes`, `no`,
+and `unknown`. `no` does not mean failure — some controls change nothing
+observable. `unknown` means the app published nothing to compare, which is a
+different claim: KakaoTalk exposes zero `AXWindows` while backgrounded, so both
+ends of the before/after fingerprint come back empty and prove nothing.
+Collapsing that into `false` tells an agent an action failed when it did not.
 
 ## Development
 
