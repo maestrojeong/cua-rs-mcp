@@ -11,7 +11,7 @@ repository.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
-objc2-core-foundation.workspace = true
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFMachPort", "CFRunLoop", "CFBase", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
     "libc",
@@ -19,6 +19,7 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGEventTypes",
     "CGEventSource",
     "CGRemoteOperation",
+    "CGEventTypes",
     "CGError",
     "CGGeometry",
 ] }

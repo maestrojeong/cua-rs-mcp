@@ -28,6 +28,10 @@
 //!   full    fill the fields a shipping implementation sets and we did not:
 //!           button number, mouse subtype, and the target unix pid
 //!   nsapp   become a real (accessory) application before posting
+//!   hidsrc  build the event from a HIDSystemState source rather than
+//!           CombinedSessionState
+//!   annot   post to the *annotated session* tap: the session's own event
+//!           queue, which does not drag the hardware cursor with it
 //!
 //! The interesting run is `front cps flip`: if that toggles the control while
 //! the pointer never moves, the "no cursor" property is real.
@@ -239,8 +243,19 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
 
-    let source =
-        CGEventSource::new(CGEventSourceStateID::CombinedSessionState).expect("event source");
+    // Which state the event source claims to come from. The shipping
+    // implementation passes `1` — `HIDSystemState` — where every attempt here
+    // so far used `CombinedSessionState`. An event built from the HID system
+    // state is the one the window server treats as having come from a real
+    // input device, which is exactly the distinction a background click would
+    // turn on.
+    let state = if has("hidsrc") {
+        CGEventSourceStateID::HIDSystemState
+    } else {
+        CGEventSourceStateID::CombinedSessionState
+    };
+    println!("  event source state = {state:?}");
+    let source = CGEventSource::new(state).expect("event source");
     for kind in [CGEventType::LeftMouseDown, CGEventType::LeftMouseUp] {
         let event = CGEvent::new_mouse_event(Some(&source), kind, point, CGMouseButton::Left)
             .expect("mouse event");
@@ -267,7 +282,20 @@ fn main() {
                 packed as i64,
             );
         }
-        if has("global") {
+        if has("annot") {
+            // The tap location is the whole answer. `HIDEventTap` is the
+            // hardware stream — posting there moves the real pointer, which is
+            // what every visible-cursor click in this project has been doing.
+            // `AnnotatedSessionEventTap` puts the event into the session's own
+            // queue instead: apps and passive taps see it as ordinary input,
+            // and the physical cursor stays where the human left it.
+            //
+            // A captured trace of a shipping implementation clicking a
+            // background app shows its events arriving through a session tap
+            // with no source pid, `SourceStateID = 1` and `MouseEventSubtype
+            // = 3` — i.e. this path, not `CGEventPostToPid`.
+            CGEvent::post(CGEventTapLocation::AnnotatedSessionEventTap, Some(&event));
+        } else if has("global") {
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
         } else {
             CGEvent::post_to_pid(pid, Some(&event));
