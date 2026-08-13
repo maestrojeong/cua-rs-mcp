@@ -1061,7 +1061,7 @@ impl Inner {
             }
         }
 
-        cua_hid::click_by_warping(x, y, count).map_err(|e| CoreError::Hid(e.to_string()))?;
+        cua_hid::click_by_moving_pointer(x, y, count).map_err(|e| CoreError::Hid(e.to_string()))?;
         // Observe first, hand the foreground back second. `changed_since`
         // already waits for the app to settle, and restoring before the click
         // has been processed is how a click gets cancelled by the window that
@@ -1071,7 +1071,7 @@ impl Inner {
             apps::activate(pid);
         }
         Ok(ActionResult {
-            verb: format!("HID {count}-click at ({x:.0}, {y:.0}) via pointer warp"),
+            verb: format!("HID {count}-click at ({x:.0}, {y:.0}) by moving the pointer"),
             target: desc,
             ui_changed: changed,
             delivery: Delivery::Hid,

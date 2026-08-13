@@ -13,9 +13,9 @@
 //!   API worth trusting — so it moves the cursor, takes keyboard focus, and
 //!   competes with whatever the human is physically doing. Tagged
 //!   `delivery: hid`.
-//! - [`click_by_warping`] moves the real pointer to a screen point, clicks
-//!   through the same shared stream, and puts the pointer back. Also tagged
-//!   `delivery: hid`.
+//! - [`click_by_moving_pointer`] moves the real pointer to a screen point,
+//!   clicks through the same shared stream, and puts the pointer back. Also
+//!   tagged `delivery: hid`.
 //!
 //! There is no third, quieter option, and not for lack of trying:
 //! [`post_click_to_pid`] wraps the `CGEventPostToPid` call that is supposed to
@@ -27,7 +27,7 @@
 //! verb: there is `AXConfirm` for Return and `AXCancel` for Escape, and after
 //! that nothing — no way to express `⌘⇧P`, no way to drive a terminal, no way
 //! to reach a canvas app that only listens for real key events.
-//! `click_by_warping` exists for the mouse equivalent: some custom-drawn
+//! `click_by_moving_pointer` exists for the mouse equivalent: some custom-drawn
 //! controls (a chat app's conversation-list row, for instance) advertise no
 //! `AXPress`, `AXPick`, or `AXConfirm` and only ever respond to a real click.
 //! Refusing to implement either (which is effectively what OpenAI's
@@ -167,7 +167,7 @@ pub fn post_chord(chord: Chord) -> Result<()> {
 /// | path | checkbox value |
 /// |---|---|
 /// | `post_click_to_pid` (this function) | 0 → 0 |
-/// | same coordinates via [`click_by_warping`]'s global HID tap | 0 → 1 |
+/// | same coordinates via [`click_by_moving_pointer`]'s global HID tap | 0 → 1 |
 /// | this function plus the real window id in `kCGMouseEventWindowUnderMousePointer` | 0 → 0 |
 ///
 /// `CGEventPostToPid` returns no status and is fire-and-forget, so a caller
@@ -211,35 +211,33 @@ pub fn cursor_position() -> Result<CGPoint> {
 /// back where the user left it. `count` is the click count: 1 for a single
 /// click, 2 for a double-click.
 ///
-/// This is the honest last resort, and the only one measured to work on
-/// controls that ignore both accessibility actions and
-/// [`post_click_to_pid`]. `CGEventPostToPid` is accepted silently by the
-/// window server and then dropped for AppKit targets, and some custom-drawn
-/// views (KakaoTalk's conversation rows, for one) ignore accessibility
-/// entirely — writes and actions both report success and do nothing. Those
-/// views only respond to input that arrived through the real event stream,
-/// which means the pointer has to be there.
+/// This is the honest last resort, and the only path measured to work on
+/// controls that ignore both accessibility actions and [`post_click_to_pid`].
+/// Some custom-drawn views (KakaoTalk's conversation rows, for one) ignore
+/// accessibility entirely — writes and actions both report success and do
+/// nothing — and only respond to input that arrived through the real event
+/// stream.
 ///
-/// So this warps the cursor, posts the click to the shared HID tap, and warps
-/// back to the saved position. The restore is not cosmetic: without it every
-/// fallback click strands the user's pointer somewhere they did not put it.
-/// It is still visible — the pointer jumps and returns within a frame or two,
-/// and a click delivered this way lands on whatever is topmost at that point,
-/// so the caller is responsible for the window being unobscured. Results that
-/// came through here are tagged `delivery: hid` for exactly that reason.
-pub fn click_by_warping(x: f64, y: f64, count: u8) -> Result<()> {
+/// There is no outbound warp. A mouse event posted to the HID tap carries a
+/// location, and the window server moves the pointer to it; warping first was
+/// measured to be redundant (the control toggles either way). What the warp
+/// cannot be replaced by is the *return* trip, which is why one call remains
+/// at the end: without it every fallback click strands the pointer somewhere
+/// the user did not put it.
+///
+/// The pointer visibly jumps and returns within a frame or two, and the click
+/// lands on whatever is topmost at that point, so the caller is responsible for
+/// the window being unobscured. Results that came through here are tagged
+/// `delivery: hid` for exactly that reason.
+pub fn click_by_moving_pointer(x: f64, y: f64, count: u8) -> Result<()> {
     let source =
         CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok_or(HidError::NoSource)?;
     let restore_to = cursor_position()?;
     let target = CGPoint::new(x, y);
 
-    CGWarpMouseCursorPosition(target);
-
-    // Warping alone does not tell the target view the pointer arrived:
-    // `CGWarpMouseCursorPosition` moves the cursor without generating a move
-    // event, so a view that only arms itself on mouse-entered/mouse-moved sees
-    // a click from a pointer it never saw arrive. Post the move explicitly and
-    // give the app a run-loop turn to process it.
+    // Announce the arrival. A view that only arms itself on mouse-entered or
+    // mouse-moved never sees a pointer that teleports, and discards the click
+    // that follows.
     let moved = CGEvent::new_mouse_event(
         Some(&source),
         CGEventType::MouseMoved,
@@ -278,7 +276,7 @@ pub fn click_by_warping(x: f64, y: f64, count: u8) -> Result<()> {
     }
 
     // Let the target process pull the events off its queue before the pointer
-    // leaves. Warping back too early has been observed to cancel the click on
+    // leaves. Returning too early has been observed to cancel the click on
     // views that track the pointer between down and up.
     std::thread::sleep(std::time::Duration::from_millis(40));
     CGWarpMouseCursorPosition(restore_to);
