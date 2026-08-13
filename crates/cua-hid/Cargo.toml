@@ -10,9 +10,11 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+libc.workspace = true
 objc2-core-foundation.workspace = true
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
+    "libc",
     "CGEvent",
     "CGEventTypes",
     "CGEventSource",
@@ -20,3 +22,25 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGError",
     "CGGeometry",
 ] }
+
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSResponder",
+    "NSApplication",
+    "NSRunningApplication",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSString",
+    "NSThread",
+] }
+
+[dev-dependencies]
+cua-capture.workspace = true
+cua-ax.workspace = true

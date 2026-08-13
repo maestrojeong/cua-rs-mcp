@@ -142,11 +142,18 @@ fn main() -> anyhow::Result<()> {
                        cua-rs <port|addr>     serve Streamable HTTP on loopback\n  \
                        cua-rs permissions     print grant status and exit\n\n\
                      OPTIONS:\n  \
-                       --allow-hid            permit synthesizing real key events for\n                         \
-                                              chords the accessibility API cannot express\n                         \
-                                              (cmd+shift+p, f5). THIS MOVES THE CURSOR and\n                         \
-                                              takes keyboard focus. Off by default; results\n                         \
-                                              that used it report delivery: hid.\n\n\
+                       --allow-hid            permit two real-input fallbacks that the\n                         \
+                                              accessibility API cannot express on its own:\n                         \
+                                              (1) key chords (cmd+shift+p, f5) via the shared\n                         \
+                                              HID stream -- THIS MOVES THE CURSOR and takes\n                         \
+                                              keyboard focus, reported as delivery: hid; and\n                         \
+                                              (2) a click on an element with no AXPress/\n                         \
+                                              AXPick/AXConfirm verb (custom-drawn rows), by\n                         \
+                                              warping the real pointer there and back -- THIS\n                         \
+                                              MOVES THE CURSOR too, also reported as\n                         \
+                                              delivery: hid, and refused when those screen\n                         \
+                                              coordinates do not currently belong to the\n                         \
+                                              target app. Both off by default.\n\n\
                      Requires Accessibility, and Screen Recording for screenshots.",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -182,8 +189,10 @@ fn main() -> anyhow::Result<()> {
         // reading logs to work out why their cursor jumped should find this.
         tracing::warn!(
             "--allow-hid is ON: press_key may synthesize real key events for chords the \
-             accessibility API cannot express. Those MOVE THE CURSOR and take keyboard focus. \
-             Affected results report delivery: hid."
+             accessibility API cannot express (delivery: hid; MOVES THE CURSOR and takes \
+             keyboard focus), and click may fall back to warping the real pointer onto an \
+             unresponsive element, clicking, and warping it back (delivery: hid; MOVES THE \
+             CURSOR for a frame)."
         );
     }
 

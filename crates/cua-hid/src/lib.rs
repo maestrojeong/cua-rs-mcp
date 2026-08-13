@@ -1,34 +1,54 @@
-//! Opt-in HID event synthesis.
+//! Opt-in real-input synthesis.
 //!
 //! # Read this before using this crate
 //!
-//! This is the **only** crate in the workspace that can move the cursor or take
-//! keyboard focus. Everything else drives macOS through the Accessibility API,
-//! which addresses a UI element directly and therefore coexists with the human
-//! at the keyboard. This crate does the opposite: it writes into the session's
-//! single, shared HID event stream.
+//! This is the **only** crate in the workspace that can synthesize real input
+//! that bypasses the accessibility API. Everything else drives macOS through
+//! AX, which addresses a UI element directly and therefore coexists with the
+//! human at the keyboard and mouse. This crate holds the two escape hatches
+//! for what AX cannot express, and they are not equally invasive:
 //!
-//! It exists because the Accessibility API has no general keyboard verb. There
-//! is `AXConfirm` for Return and `AXCancel` for Escape, and after that nothing —
-//! no way to express `⌘⇧P`, no way to drive a terminal, no way to reach a canvas
-//! app that only listens for real key events. Refusing to implement that at all
-//! (which is effectively what OpenAI's implementation does) leaves a large hole;
-//! implementing it silently would destroy the property that makes the rest of
-//! this project worth using.
+//! - [`post_chord`] writes into the session's single, shared HID event
+//!   stream. It is global by necessity — there is no per-app keyboard focus
+//!   API worth trusting — so it moves the cursor, takes keyboard focus, and
+//!   competes with whatever the human is physically doing. Tagged
+//!   `delivery: hid`.
+//! - [`click_by_warping`] moves the real pointer to a screen point, clicks
+//!   through the same shared stream, and puts the pointer back. Also tagged
+//!   `delivery: hid`.
 //!
-//! So it is isolated here, and the isolation is enforced by the dependency
+//! There is no third, quieter option, and not for lack of trying:
+//! [`post_click_to_pid`] wraps the `CGEventPostToPid` call that is supposed to
+//! deliver a click into one process's queue without touching the pointer, and
+//! it is kept only as the harness that proves it does not work. See its own
+//! documentation for the measurement.
+//!
+//! `post_chord` exists because the Accessibility API has no general keyboard
+//! verb: there is `AXConfirm` for Return and `AXCancel` for Escape, and after
+//! that nothing — no way to express `⌘⇧P`, no way to drive a terminal, no way
+//! to reach a canvas app that only listens for real key events.
+//! `click_by_warping` exists for the mouse equivalent: some custom-drawn
+//! controls (a chat app's conversation-list row, for instance) advertise no
+//! `AXPress`, `AXPick`, or `AXConfirm` and only ever respond to a real click.
+//! Refusing to implement either (which is effectively what OpenAI's
+//! implementation does) leaves a real hole; implementing them silently would
+//! destroy the property that makes the rest of this project worth using.
+//!
+//! So both are isolated here, and the isolation is enforced by the dependency
 //! graph rather than by a comment: `cua-ax` and `cua-capture` do not depend on
 //! this crate and cannot reach it. `grep -rl cua_hid crates/` enumerates every
-//! call site that can touch the user's pointer.
+//! call site that can touch real input.
 //!
 //! Reachable only when the server was started with `--allow-hid`, and every
-//! result that came through here is tagged `delivery: hid` so an agent can never
-//! mistake it for a background action.
+//! result that came through here is tagged `delivery: hid` so an agent can
+//! never mistake it for a background AX action.
 
 use std::collections::HashMap;
 
+use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
-    CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
+    CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
+    CGEventType, CGMouseButton, CGWarpMouseCursorPosition,
 };
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -130,6 +150,138 @@ pub fn post_chord(chord: Chord) -> Result<()> {
         CGEvent::set_flags(Some(&event), chord.flags);
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     }
+    Ok(())
+}
+
+/// Post a left click at a screen point, addressed to one process.
+///
+/// **This does not deliver a usable click on current macOS, and nothing in
+/// this workspace calls it.** It is kept only as the reproduction harness for
+/// that finding (`cargo run -p cua-hid --example click_probe`), because the
+/// API is advertised everywhere as the polite way to click a background window
+/// and the failure is completely silent.
+///
+/// Measured, against a TextEdit checkbox — a control accessibility *can*
+/// drive, so a miss is unambiguous:
+///
+/// | path | checkbox value |
+/// |---|---|
+/// | `post_click_to_pid` (this function) | 0 → 0 |
+/// | same coordinates via [`click_by_warping`]'s global HID tap | 0 → 1 |
+/// | this function plus the real window id in `kCGMouseEventWindowUnderMousePointer` | 0 → 0 |
+///
+/// `CGEventPostToPid` returns no status and is fire-and-forget, so a caller
+/// that trusts it reports every click as a success. The click ladder in
+/// `cua-core` used to try this first and verify the result; the step was
+/// removed once the table above showed it never contributes.
+pub fn post_click_to_pid(pid: i32, x: f64, y: f64) -> Result<()> {
+    let source =
+        CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok_or(HidError::NoSource)?;
+    let point = CGPoint::new(x, y);
+
+    for (kind, button) in [
+        (CGEventType::LeftMouseDown, CGMouseButton::Left),
+        (CGEventType::LeftMouseUp, CGMouseButton::Left),
+    ] {
+        let event = CGEvent::new_mouse_event(Some(&source), kind, point, button)
+            .ok_or(HidError::NoSource)?;
+        // AppKit's click-to-select/click-to-open handlers read
+        // `-[NSEvent clickCount]`, which comes straight from this field. A
+        // synthetic event that leaves it at its default of 0 is
+        // indistinguishable from a click with no clicks in it, and some
+        // custom views (table rows in particular) silently ignore that rather
+        // than treating it as a single click.
+        CGEvent::set_integer_value_field(Some(&event), CGEventField::MouseEventClickState, 1);
+        CGEvent::post_to_pid(pid, Some(&event));
+    }
+    Ok(())
+}
+
+/// Read the pointer's current screen position, in points.
+///
+/// Uses a null-type `CGEvent` purely as a carrier: `CGEventCreate` fills it
+/// with the *current* input state, so its location field is where the pointer
+/// actually is. Cheaper and more accurate than tracking it ourselves.
+pub fn cursor_position() -> Result<CGPoint> {
+    let event = CGEvent::new(None).ok_or(HidError::NoSource)?;
+    Ok(CGEvent::location(Some(&event)))
+}
+
+/// Click at a screen point by *actually moving the pointer there*, then put it
+/// back where the user left it. `count` is the click count: 1 for a single
+/// click, 2 for a double-click.
+///
+/// This is the honest last resort, and the only one measured to work on
+/// controls that ignore both accessibility actions and
+/// [`post_click_to_pid`]. `CGEventPostToPid` is accepted silently by the
+/// window server and then dropped for AppKit targets, and some custom-drawn
+/// views (KakaoTalk's conversation rows, for one) ignore accessibility
+/// entirely — writes and actions both report success and do nothing. Those
+/// views only respond to input that arrived through the real event stream,
+/// which means the pointer has to be there.
+///
+/// So this warps the cursor, posts the click to the shared HID tap, and warps
+/// back to the saved position. The restore is not cosmetic: without it every
+/// fallback click strands the user's pointer somewhere they did not put it.
+/// It is still visible — the pointer jumps and returns within a frame or two,
+/// and a click delivered this way lands on whatever is topmost at that point,
+/// so the caller is responsible for the window being unobscured. Results that
+/// came through here are tagged `delivery: hid` for exactly that reason.
+pub fn click_by_warping(x: f64, y: f64, count: u8) -> Result<()> {
+    let source =
+        CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok_or(HidError::NoSource)?;
+    let restore_to = cursor_position()?;
+    let target = CGPoint::new(x, y);
+
+    CGWarpMouseCursorPosition(target);
+
+    // Warping alone does not tell the target view the pointer arrived:
+    // `CGWarpMouseCursorPosition` moves the cursor without generating a move
+    // event, so a view that only arms itself on mouse-entered/mouse-moved sees
+    // a click from a pointer it never saw arrive. Post the move explicitly and
+    // give the app a run-loop turn to process it.
+    let moved = CGEvent::new_mouse_event(
+        Some(&source),
+        CGEventType::MouseMoved,
+        target,
+        CGMouseButton::Left,
+    )
+    .ok_or(HidError::NoSource)?;
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&moved));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    for click in 1..=count.max(1) {
+        // Real double-clicks are separated in time. Posting both pairs in the
+        // same instant has been observed to leave the second one unprocessed;
+        // 60 ms is well inside the system double-click interval (500 ms by
+        // default) while still reading as deliberate.
+        if click > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        for (kind, button) in [
+            (CGEventType::LeftMouseDown, CGMouseButton::Left),
+            (CGEventType::LeftMouseUp, CGMouseButton::Left),
+        ] {
+            let event = CGEvent::new_mouse_event(Some(&source), kind, target, button)
+                .ok_or(HidError::NoSource)?;
+            // This field, not the timing, is what makes a double-click a
+            // double-click: AppKit reads `-[NSEvent clickCount]` straight from
+            // it. Two separate events both carrying 1 are two single clicks no
+            // matter how fast they arrive.
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::MouseEventClickState,
+                click as i64,
+            );
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        }
+    }
+
+    // Let the target process pull the events off its queue before the pointer
+    // leaves. Warping back too early has been observed to cancel the click on
+    // views that track the pointer between down and up.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    CGWarpMouseCursorPosition(restore_to);
     Ok(())
 }
 

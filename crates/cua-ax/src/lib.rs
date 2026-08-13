@@ -157,11 +157,22 @@ pub mod attr {
     pub const CHILDREN: &str = "AXChildren";
     pub const PARENT: &str = "AXParent";
     pub const WINDOWS: &str = "AXWindows";
+    /// The window an arbitrary element belongs to. Published by most elements,
+    /// which makes it much cheaper than walking `AXParent` to the top.
+    pub const WINDOW: &str = "AXWindow";
     pub const MAIN_WINDOW: &str = "AXMainWindow";
     pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
+    /// The point the *app itself* nominates as where this element is clicked.
+    ///
+    /// Optional and often absent, but when present it beats the frame centre:
+    /// for a wide list row, a disclosure triangle, or a control with a large
+    /// transparent hit area, the geometric middle can be dead space while this
+    /// is the live pixel. AppKit fills it in automatically for standard
+    /// controls, and VoiceOver uses it for exactly the same purpose.
+    pub const ACTIVATION_POINT: &str = "AXActivationPoint";
     pub const ENABLED: &str = "AXEnabled";
     pub const FOCUSED: &str = "AXFocused";
     pub const SELECTED: &str = "AXSelected";
@@ -412,6 +423,24 @@ impl Element {
         ok.then_some(p)
     }
 
+    /// [`attr::ACTIVATION_POINT`], if the app publishes one.
+    ///
+    /// Same `AXValue`-wrapped `CGPoint` shape as [`Element::position`]; kept
+    /// separate rather than folded into it because the two mean different
+    /// things and only one of them is optional.
+    pub fn activation_point(&self) -> Option<CGPoint> {
+        let v = self.attribute(attr::ACTIVATION_POINT).ok()??;
+        let ax = v.downcast_ref::<AXValue>()?;
+        let mut p = CGPoint { x: 0.0, y: 0.0 };
+        let ok = unsafe {
+            ax.value(
+                AXValueType::CGPoint,
+                NonNull::new((&mut p as *mut CGPoint).cast::<c_void>())?,
+            )
+        };
+        ok.then_some(p)
+    }
+
     pub fn size(&self) -> Option<CGSize> {
         let v = self.attribute(attr::SIZE).ok()??;
         let ax = v.downcast_ref::<AXValue>()?;
@@ -459,6 +488,24 @@ impl Element {
         let val = CFBoolean::new(value);
         check(
             unsafe { self.0.set_attribute_value(&key, val.as_ref()) },
+            Ctx::Attr(name),
+        )
+    }
+
+    /// Replace an attribute that holds an array of elements, e.g.
+    /// `AXSelectedRows` on a table or outline.
+    ///
+    /// Exists for the same reason [`Element::set_string`] does: some
+    /// controls have no activation verb at all (a custom-drawn table row is
+    /// the common case) but do let a caller drive selection by writing the
+    /// container's selection attribute directly, which several apps treat as
+    /// equivalent to the user clicking that row.
+    pub fn set_element_array(&self, name: &str, elements: &[Element]) -> Result<()> {
+        let key = CFString::from_str(name);
+        let refs: Vec<CFRetained<AXUIElement>> = elements.iter().map(|e| e.0.clone()).collect();
+        let arr = CFArray::from_retained_objects(&refs);
+        check(
+            unsafe { self.0.set_attribute_value(&key, arr.as_ref()) },
             Ctx::Attr(name),
         )
     }

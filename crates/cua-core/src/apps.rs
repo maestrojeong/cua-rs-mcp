@@ -1,6 +1,9 @@
 //! Finding the app the agent asked for.
 
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication,
+    NSWorkspace,
+};
 
 /// A running application, as an agent should see it.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -142,6 +145,29 @@ fn describe(apps: &[AppInfo]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Bring an app to the front, the way clicking its Dock icon would.
+///
+/// This is `NSRunningApplication.activate`, not an event: no cursor moves and
+/// nothing is typed. It still changes what the human is looking at — and if
+/// the app's windows live on another Space, macOS switches Spaces — so it is
+/// never called on the AX path. Its one caller is the pointer-warp click
+/// fallback, which is already about to move the real pointer and therefore
+/// cannot avoid disturbing the user anyway; there, foregrounding is what makes
+/// the click land on the intended window instead of whatever is on top of it.
+///
+/// Returns whether AppKit accepted the request. Activation is asynchronous
+/// either way, so callers must poll for the state they actually need rather
+/// than trusting `true`.
+pub fn activate(pid: libc::pid_t) -> bool {
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+        return false;
+    };
+    // `ActivateAllWindows` rather than the default: a click aimed at a
+    // background window of an app whose *other* window is frontmost would
+    // otherwise stay occluded by its own sibling.
+    app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
 }
 
 #[cfg(test)]

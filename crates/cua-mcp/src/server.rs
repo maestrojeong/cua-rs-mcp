@@ -124,6 +124,19 @@ impl ActionArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ClickArgs {
+    #[serde(flatten)]
+    target: ActionArgs,
+    /// Click count. `2` for a double-click, for targets that open on
+    /// double-click and merely select on single-click — chat and file lists,
+    /// typically. Anything above 1 skips the accessibility path entirely
+    /// (`AXPress` has no notion of click count) and therefore requires
+    /// --allow-hid.
+    #[serde(default)]
+    count: Option<u8>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SetValueArgs {
     #[serde(flatten)]
     target: ActionArgs,
@@ -361,18 +374,19 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Activate an element: the equivalent of clicking it. Delivered as an accessibility action (AXPress, falling back to AXPick or AXConfirm depending on what the element supports), so the pointer never moves and the app is never brought to the front. Prefer `element_index` from the latest get_app_state; x/y is a fallback that is still hit-tested to an element rather than posting a mouse event."
+        description = "Activate an element: the equivalent of clicking it. Delivered as an accessibility action (AXPress, falling back to AXPick or AXConfirm depending on what the element supports), so the pointer never moves and the app is never brought to the front. Prefer `element_index` from the latest get_app_state; x/y is a fallback that is still hit-tested to an element rather than posting a mouse event. If the element advertises none of those verbs (common for custom-drawn list rows, e.g. chat apps' conversation lists) and the server was started with --allow-hid, this falls back to briefly warping the real pointer onto the element, clicking, and restoring it; the result's `delivery` field says `hid` when that happened. That fallback is refused unless the target's own screen coordinates currently belong to the target app, so a window on another Space cannot make it click an innocent bystander. Pass count=2 for a target that only opens on a double-click (chat and file lists): accessibility cannot express a click count, so that always takes the real-mouse path."
     )]
     async fn click(
         &self,
-        Parameters(a): Parameters<ActionArgs>,
+        Parameters(a): Parameters<ClickArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target() {
+        let target = match a.target.target() {
             Ok(t) => t,
             Err(e) => return Ok(fail(e)),
         };
-        let app = a.app.clone();
-        match self.native(move |c| c.click(&app, target)).await {
+        let app = a.target.app.clone();
+        let count = a.count.unwrap_or(1).clamp(1, 3);
+        match self.native(move |c| c.click(&app, target, count)).await {
             Ok(r) => Ok(ok(render_action(&r))),
             Err(e) => Ok(fail(e.to_string())),
         }
@@ -599,28 +613,37 @@ fn yes_no(b: bool) -> &'static str {
 
 /// Render an action outcome.
 ///
-/// `ui_changed` is reported honestly, including when it is `false`. A `false`
-/// here does not always mean the action failed — some controls change nothing
-/// observable — but hiding it would let an agent believe every dispatched action
-/// took effect, which is the failure mode that makes UI automation untrustworthy.
+/// `ui_changed` is reported honestly, including when the answer is "no" or
+/// "unknown". `no` does not mean the action failed — plenty of controls change
+/// nothing observable — and `unknown` means the app published nothing to
+/// compare, which is not the same claim at all. Collapsing either into a
+/// confident `false` is the failure mode that makes UI automation
+/// untrustworthy.
 fn render_action(r: &cua_core::ActionResult) -> String {
     let mut s = format!(
         "{} on {}\ndelivery: {}{}\nui_changed: {}",
         r.verb,
         r.target,
         r.delivery.as_str(),
-        if r.delivery == cua_core::Delivery::Hid {
-            "  (a real key event: the cursor and keyboard focus were used, exactly as if the user pressed the keys)"
-        } else {
-            "  (accessibility action: cursor, focus and frontmost app untouched)"
+        match r.delivery {
+            cua_core::Delivery::Hid => {
+                "  (a real input event through the shared HID stream: the cursor and keyboard focus were used, exactly as if the user acted)"
+            }
+            cua_core::Delivery::Ax => {
+                "  (accessibility action: cursor, focus and frontmost app untouched)"
+            }
         },
-        r.ui_changed,
+        r.ui_changed.as_str(),
     );
-    if !r.ui_changed {
-        s.push_str(
-            "  (no observable change; call get_app_state to check, or the control may be a no-op)",
-        );
-    }
+    s.push_str(match r.ui_changed {
+        cua_core::Observed::Changed => "",
+        cua_core::Observed::Unchanged => {
+            "  (no observable change; call get_app_state to check, or the control may be a no-op)"
+        }
+        cua_core::Observed::Unknown => {
+            "  (nothing to compare: this app published no window state before or after, so this is NOT evidence the action failed. Verify with get_app_state)"
+        }
+    });
     s
 }
 
