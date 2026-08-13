@@ -785,6 +785,20 @@ impl Inner {
     }
 
     fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {
+        // Capability first, before anything that touches AX or needs a snapshot.
+        //
+        // Ordering matters for the message the caller sees. Resolving the target
+        // first meant a chord asked for without `--allow-hid` reported "no
+        // snapshot for this app" — a state problem the caller would then try to
+        // fix, when the real answer is that this server is not permitted to send
+        // that key at all and no amount of snapshotting will change it.
+        let ax_verb = ax_verb_for_key(key);
+        if ax_verb.is_none() && !hid_allowed() {
+            return Err(CoreError::HidRefused {
+                key: key.to_string(),
+            });
+        }
+
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, target)?;
         let before = self.window_fingerprint(info.pid);
@@ -792,7 +806,6 @@ impl Inner {
         // AX first, for the handful of keys that have a semantic verb. This path
         // keeps the guarantee: no cursor, no focus change, and it works on a
         // background window.
-        let ax_verb = ax_verb_for_key(key);
         if let Some(verb) = ax_verb {
             let available = el.actions();
             if available.iter().any(|a| a == verb) {
@@ -818,13 +831,9 @@ impl Inner {
             }
         }
 
-        // Everything else needs a real key event, which AX cannot express.
-        if !hid_allowed() {
-            return Err(CoreError::HidRefused {
-                key: key.to_string(),
-            });
-        }
-
+        // Reaching here means either the key has no AX verb and HID is permitted
+        // (checked at the top), or it had a verb the element would not accept and
+        // HID is permitted (checked in the branch above).
         let chord = cua_hid::parse_chord(key).map_err(|e| CoreError::Hid(e.to_string()))?;
         cua_hid::post_chord(chord).map_err(|e| CoreError::Hid(e.to_string()))?;
         let changed = self.changed_since(info.pid, before);

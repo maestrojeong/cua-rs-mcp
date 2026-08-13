@@ -172,8 +172,10 @@ not.
 ### Skeleton mode
 
 `max_nodes` bounds the walk; skeleton mode bounds the *rendering*, which is a
-different problem. A 12k-element Slack window truncated at 1500 nodes is still
-1500 lines of prompt, most of them message rows the agent did not ask for.
+different problem. A tree truncated at 1500 nodes is still 1500 lines of prompt,
+most of them rows the agent did not ask for. Measured: a Slack window is 367
+elements and a Chrome window 413, both comfortably under the node cap and both
+far more than an agent needs to see at once.
 
 So with `skeleton: true`, a subtree deeper than `skeleton_depth` (2) with more
 than `collapse_over` (8) descendants renders as one line naming its size and its
@@ -391,23 +393,30 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 - [ ] launched from a different host app → grants do not carry over
 
 **Coexistence — the point of the project**
+- [x] cursor does not move during any action (Chrome, verified byte-identical
+      `CGEvent(source: nil).location` before and after `AXPress`)
+- [x] frontmost app unchanged after `click` (Terminal stayed frontmost)
+- [x] tree is identical whether the target is frontmost or occluded — Chrome
+      413/413, Finder 4/4, Slack 367/373 (+6 = focus ring). See §5.
 - [ ] click in a background window while typing in the foreground: no dropped keystrokes
-- [ ] cursor does not move during any action
-- [ ] frontmost app is unchanged after `click`, `set_value`, `scroll`
 - [ ] active Space is unchanged
 - [ ] target window on another Space still captures
 
 **Tree**
-- [ ] native app (Notes, Finder): labeled, actionable elements present
-- [ ] Electron (Slack, VS Code): non-empty tree; **second** call has no 400 ms delay
+- [x] native app: Finder 4 elements, Chrome 413 — labeled, actionable elements present
+- [x] Electron: Slack 367 elements including an `AXWebArea`, **but not on the
+      first read** — see §5. The 400 ms settle is not enough for Slack.
 - [ ] relaunch that Electron app; if the pid is reused, the tree is still non-empty
 - [ ] 10k-row table: walk returns under `max_nodes` and does not hang
 - [ ] wedged / modal app: fails with a timeout, does not hang the server
+- [ ] settle time pinned down with a never-before-poked app (currently bounded
+      only: >3.2 s, <~1 min, n=2)
 
-**Snapshots**
-- [ ] `click` with a stale `snapshot_id` → `StaleSnapshot`, nothing pressed
-- [ ] index out of range → `BadIndex`
-- [ ] action before any `get_app_state` → `NoSnapshot`
+**Snapshots** — all three now covered by `crates/cua-mcp/tests/mcp_surface.rs`
+or verified live
+- [x] `click` with a stale `snapshot_id` → `StaleSnapshot`, nothing pressed
+- [x] index out of range → `BadIndex`
+- [x] action before any `get_app_state` → `NoSnapshot`
 
 **Resolution**
 - [ ] `Slack` resolves despite helper processes

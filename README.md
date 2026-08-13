@@ -302,7 +302,7 @@ an agent believe every dispatched action landed.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 50 tests, no permissions needed
+cargo test --workspace          # 65 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -310,6 +310,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 crates/cua-ax        safe AXUIElement wrapper, budgeted tree walker, AxNode
 crates/cua-capture   ScreenCaptureKit per-window PNG + permission preflight
 crates/cua-core      app resolution, worker thread, snapshot generations
+crates/cua-hid       opt-in HID synthesis — the only crate that moves the cursor
 crates/cua-mcp       rmcp server, binary `cua-rs`
 ```
 

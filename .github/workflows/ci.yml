@@ -27,19 +27,19 @@ jobs:
         run: cargo build --release --workspace
 
       # CI has neither the Accessibility nor the Screen Recording grant, so only
-      # the permission-free logic is exercised here: tree rendering, app-name
-      # resolution tiers, window matching, image clamping. Anything that touches
-      # a live UI is verified by hand against the checklist in DESIGN.md.
+      # the permission-free logic is exercised here. Unit tests cover tree
+      # rendering, app-name resolution tiers, window matching, image clamping and
+      # chord parsing; crates/cua-mcp/tests/mcp_surface.rs drives the real binary
+      # over stdio and pins the advertised tool surface plus the HID refusal,
+      # both of which are reachable without any grant. Anything that touches a
+      # live UI is verified by hand against the checklist in DESIGN.md.
       - name: Test
         run: cargo test --workspace
 
-      - name: Smoke test the MCP handshake
+      # The release binary is built above but `cargo test` exercises the debug
+      # one, so confirm the shipped artifact starts and answers at all. The
+      # surface itself is asserted properly by mcp_surface.rs.
+      - name: Release binary runs
         run: |
-          printf '%s\n' \
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | ./target/release/cua-rs > out.json
-          grep -q '"name":"get_app_state"' out.json
-          grep -q '"name":"check_permissions"' out.json
-          echo "handshake ok"
+          ./target/release/cua-rs --version
+          ./target/release/cua-rs permissions
