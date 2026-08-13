@@ -147,6 +147,19 @@ fn describe(apps: &[AppInfo]) -> String {
         .join(", ")
 }
 
+/// The pid the workspace currently considers frontmost.
+///
+/// `NSWorkspace.frontmostApplication` rather than scanning [`list_apps`] for
+/// `active`: `NSRunningApplication.isActive` was measured to lag behind an
+/// activation by more than a second, long enough for a poll to conclude the
+/// activation failed and refuse — while the app came forward anyway. This is
+/// the answer the window server actually acts on.
+pub fn frontmost_pid() -> Option<libc::pid_t> {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|a| a.processIdentifier())
+}
+
 /// Bring an app to the front, the way clicking its Dock icon would.
 ///
 /// This is `NSRunningApplication.activate`, not an event: no cursor moves and

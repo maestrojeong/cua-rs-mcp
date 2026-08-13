@@ -133,6 +133,21 @@ pub enum CoreError {
         found: String,
     },
 
+    /// A chord was asked for, but the named app could not be brought to the
+    /// front, so the keystroke would have gone somewhere else.
+    ///
+    /// Unlike a click, a synthetic key event carries no address: it goes to
+    /// whatever holds keyboard focus at the instant it is posted. Sending one
+    /// while the user's editor is frontmost types into the user's editor. There
+    /// is no coordinate to check the way a click has one, so the only available
+    /// precondition is "the app we were told to drive is the one listening".
+    #[error("refusing to send `{key}` to `{app}`: a real key event goes to whatever holds keyboard focus, and that is currently {frontmost}, not `{app}`. This server cannot bring `{app}` forward — macOS does not let a background process hand the foreground to another app. Focus `{app}` yourself and retry, or use a key with an accessibility verb (return/enter, escape, up, down), which is delivered to the element itself and needs no focus")]
+    KeyTargetNotFrontmost {
+        key: String,
+        app: String,
+        frontmost: String,
+    },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -1010,32 +1025,29 @@ impl Inner {
         // the window it is about to hit is strictly less surprising than
         // clicking whatever happens to be on top of it. Nothing above this
         // line raises, activates, or moves anything.
-        let mut restore_to: Option<libc::pid_t> = None;
         if self.assert_point_belongs_to(&info, x, y).is_err() {
+            // Raise the element's own window and look again. `AXRaise` is a
+            // real accessibility action and does restack a window within its
+            // app, which is enough when the obstruction is the app's own
+            // sibling window.
+            //
+            // What is *not* attempted is foregrounding the app. An earlier
+            // version called `NSRunningApplication.activate` here and polled
+            // for the result; measured, that call returns `true` and never
+            // changes the frontmost app — macOS does not let a background
+            // command-line process hand the foreground to someone else
+            // (`activate_probe 841 6`: "returned true … never became frontmost
+            // within 6s"). Keeping it would be a step that cannot work,
+            // followed by a restore of a foreground never taken.
             if let Some(window) = window_of(&el) {
                 let _ = window.perform(cua_ax::action::RAISE);
-            }
-            // Remember who had the foreground so it can be handed back. Taking
-            // the user's frontmost app and keeping it is the same class of
-            // rudeness as leaving their pointer parked on our target, and the
-            // pointer is already restored a few lines down. cua-driver's
-            // foreground rung does exactly this too.
-            restore_to = apps::list_apps()
-                .into_iter()
-                .find(|a| a.active && a.pid != info.pid)
-                .map(|a| a.pid);
-            apps::activate(info.pid);
-            // Both are asynchronous — they return once the app has been told,
-            // not once the window server has restacked — and a Space switch is
-            // animated. Poll for the condition that actually matters instead
-            // of guessing a sleep, so a fast app pays almost nothing and a
-            // slow one still works.
-            let deadline = Instant::now() + std::time::Duration::from_millis(1500);
-            while Instant::now() < deadline {
-                if self.assert_point_belongs_to(&info, x, y).is_ok() {
-                    break;
+                let deadline = Instant::now() + std::time::Duration::from_millis(750);
+                while Instant::now() < deadline {
+                    if self.assert_point_belongs_to(&info, x, y).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
             }
             self.assert_point_belongs_to(&info, x, y)?;
         }
@@ -1062,19 +1074,38 @@ impl Inner {
         }
 
         cua_hid::click_by_moving_pointer(x, y, count).map_err(|e| CoreError::Hid(e.to_string()))?;
-        // Observe first, hand the foreground back second. `changed_since`
-        // already waits for the app to settle, and restoring before the click
-        // has been processed is how a click gets cancelled by the window that
-        // took focus back.
         let changed = self.changed_since(info.pid, before);
-        if let Some(pid) = restore_to {
-            apps::activate(pid);
-        }
         Ok(ActionResult {
             verb: format!("HID {count}-click at ({x:.0}, {y:.0}) by moving the pointer"),
             target: desc,
             ui_changed: changed,
             delivery: Delivery::Hid,
+        })
+    }
+
+    /// Make the target app frontmost, and say who to hand the foreground back
+    /// to afterwards.
+    ///
+    /// `Ok(None)` means it was already frontmost and nothing was disturbed.
+    /// `Ok(Some(pid))` means the foreground was taken and that pid should get
+    /// it back. Polls for the state rather than trusting `activate`, which is
+    /// asynchronous and returns `true` for a request, not a result — the same
+    /// mistake `_SLPSSetFrontProcessWithOptions` was caught making.
+    fn require_frontmost(&self, info: &AppInfo, key: &str) -> Result<()> {
+        if apps::frontmost_pid() == Some(info.pid) {
+            return Ok(());
+        }
+        // No activation attempt. `NSRunningApplication.activate` from this
+        // process returns `true` and does nothing (`activate_probe`, 6 s, two
+        // different apps), so trying would only add latency before the same
+        // refusal — and the message would have to claim an attempt was made.
+        Err(CoreError::KeyTargetNotFrontmost {
+            key: key.to_string(),
+            app: info.name.clone(),
+            frontmost: apps::frontmost_pid()
+                .and_then(|pid| apps::list_apps().into_iter().find(|a| a.pid == pid))
+                .map(|a| format!("`{}`", a.name))
+                .unwrap_or_else(|| "no app".to_string()),
         })
     }
 
@@ -1214,6 +1245,17 @@ impl Inner {
         // (checked at the top), or it had a verb the element would not accept and
         // HID is permitted (checked in the branch above).
         let chord = cua_hid::parse_chord(key).map_err(|e| CoreError::Hid(e.to_string()))?;
+
+        // Parse before focusing. A malformed chord should fail without having
+        // yanked the user's foreground app away first.
+        //
+        // Then make the target listen. Until now this posted the chord blind:
+        // the result text admitted it went "to the focused app, not this
+        // element", which meant a `cmd+s` aimed at a background editor could
+        // land in whatever the user was typing in. The click path has a
+        // coordinate it can hit-test; a key event has no address at all, so
+        // being frontmost is the only precondition there is.
+        self.require_frontmost(&info, key)?;
         cua_hid::post_chord(chord).map_err(|e| CoreError::Hid(e.to_string()))?;
         let changed = self.changed_since(info.pid, before);
         Ok(ActionResult {
@@ -1221,7 +1263,10 @@ impl Inner {
             // The target is informational only here: a HID event goes to whatever
             // has focus, not to the element the caller named. Say so rather than
             // implying the element received it.
-            target: format!("{desc} — NOTE: delivered to the focused app, not this element"),
+            target: format!(
+                "{desc} — NOTE: delivered to `{}` as the focused app, not to this element",
+                info.name
+            ),
             ui_changed: changed,
             delivery: Delivery::Hid,
         })
@@ -1652,6 +1697,38 @@ mod tests {
     /// with our pid", which is the only thing the guard decides on.
     /// These strings go into every action response an agent reads, and
     /// `unknown` in particular has to stay distinguishable from `no`.
+    /// A chord has no address. If the named app is not the one listening, the
+    /// keystroke lands in whatever the human is typing in, so the refusal has
+    /// to name both apps or the caller cannot act on it.
+    #[test]
+    fn refusing_a_chord_names_the_app_that_would_have_received_it() {
+        let err = CoreError::KeyTargetNotFrontmost {
+            key: "cmd+s".into(),
+            app: "TextEdit".into(),
+            frontmost: "`터미널`".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cmd+s"), "got {msg}");
+        assert!(msg.contains("TextEdit"), "got {msg}");
+        assert!(msg.contains("터미널"), "got {msg}");
+        // The remedy has to be in the message: the keys that need no focus at
+        // all are the whole reason this is recoverable.
+        assert!(msg.contains("escape"), "got {msg}");
+    }
+
+    /// Every key this maps to a verb must be one `press_key` can deliver
+    /// without focusing anything, because the refusal above advertises them as
+    /// the way out.
+    #[test]
+    fn the_keys_offered_as_the_focus_free_alternative_really_are() {
+        for key in ["return", "enter", "escape", "esc", "up", "down"] {
+            assert!(
+                ax_verb_for_key(key).is_some(),
+                "{key} is advertised as needing no focus but has no AX verb"
+            );
+        }
+    }
+
     #[test]
     fn observed_labels_are_stable_and_three_valued() {
         assert_eq!(Observed::Changed.as_str(), "yes");

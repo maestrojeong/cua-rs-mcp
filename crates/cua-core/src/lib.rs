@@ -19,7 +19,7 @@ pub mod apps;
 pub mod session;
 pub mod snapshot;
 
-pub use apps::{list_apps, resolve_app, AppInfo, ResolveError};
+pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
     allow_hid, hid_allowed, ActionResult, AppState, CoreError, Cua, Delivery, FindResult,
     Observed, Permissions, Presence, Screenshot, ScrollDir, StateOptions, Target,
