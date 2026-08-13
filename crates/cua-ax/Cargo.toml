@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["macos", "accessibility", "automation", "objc2", "ax"]
+categories = ["os::macos-apis", "api-bindings", "accessibility"]
 
 [dependencies]
 thiserror.workspace = true
