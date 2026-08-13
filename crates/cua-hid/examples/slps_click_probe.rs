@@ -30,6 +30,10 @@
 //!   nsapp   become a real (accessory) application before posting
 //!   hidsrc  build the event from a HIDSystemState source rather than
 //!           CombinedSessionState
+//!   awr     activate-without-raise via SLPSPostEventRecordTo's 0xF8 record
+//!   sl      deliver with SkyLight's `SLEventPostToPid` instead of the public
+//!           `CGEventPostToPid`
+//!   winloc  also set the window-local point with `CGEventSetWindowLocation`
 //!   annot   post to the *annotated session* tap: the session's own event
 //!           queue, which does not drag the hardware cursor with it
 //!
@@ -99,6 +103,90 @@ const K_CPS_USER_GENERATED: u32 = 0x200;
 
 unsafe extern "C" {
     fn GetProcessForPID(pid: i32, psn: *mut ProcessSerialNumber) -> i32;
+}
+
+/// Focus a window's process without raising it, by posting the window
+/// server's own 248-byte event record.
+///
+/// This is the step `_SLPSSetFrontProcessWithOptions` was standing in for, and
+/// why that stand-in returned `CGError 0` and changed nothing. Structure per
+/// trycua/cua's `skylight.rs` (MIT, Copyright (c) 2025 Cua AI, Inc.), which
+/// documents the same record long used by open-source window managers: byte
+/// 0x04 = length, 0x08 = 0x0D, the target window id little-endian at
+/// 0x3C..0x40, and byte 0x8A carrying 0x02 to defocus the outgoing process
+/// then 0x01 to focus the incoming one.
+fn activate_without_raise(target_pid: i32, target_wid: u32) -> bool {
+    type PostRecord = unsafe extern "C" fn(*const c_void, *const u8) -> i32;
+    type GetFront = unsafe extern "C" fn(*mut c_void) -> i32;
+    unsafe {
+        let post = libc::dlsym(libc::RTLD_DEFAULT, c"SLPSPostEventRecordTo".as_ptr());
+        let front = libc::dlsym(libc::RTLD_DEFAULT, c"_SLPSGetFrontProcess".as_ptr());
+        if post.is_null() || front.is_null() {
+            println!("  SLPSPostEventRecordTo/_SLPSGetFrontProcess NOT FOUND");
+            return false;
+        }
+        let post: PostRecord = std::mem::transmute::<*mut c_void, PostRecord>(post);
+        let get_front: GetFront = std::mem::transmute::<*mut c_void, GetFront>(front);
+
+        let mut prev = [0u8; 8];
+        let front_rc = get_front(prev.as_mut_ptr() as *mut c_void);
+        let mut target = ProcessSerialNumber::default();
+        let psn_rc = GetProcessForPID(target_pid, &mut target);
+        println!("  _SLPSGetFrontProcess -> {front_rc}, GetProcessForPID -> {psn_rc}");
+        if front_rc != 0 || psn_rc != 0 {
+            return false;
+        }
+
+        let mut buf = [0u8; 0xF8];
+        buf[0x04] = 0xF8;
+        buf[0x08] = 0x0D;
+        buf[0x3C..0x40].copy_from_slice(&target_wid.to_le_bytes());
+
+        buf[0x8A] = 0x02;
+        let defocus = post(prev.as_ptr() as *const c_void, buf.as_ptr());
+        buf[0x8A] = 0x01;
+        let focus = post(&target as *const _ as *const c_void, buf.as_ptr());
+        println!("  activate_without_raise: defocus={defocus} focus={focus}");
+        defocus == 0 && focus == 0
+    }
+}
+
+/// SkyLight's own post, resolved by name.
+///
+/// Not the same call as the public `CGEventPostToPid`. Per the documented
+/// behaviour of trycua/cua's `skylight.rs` (MIT), `SLEventPostToPid` routes
+/// through `SLEventPostToPSN` → `CGSTickleActivityMonitor` →
+/// `SLSUpdateSystemActivityWithLocation` → `IOHIDPostEvent`, while the public
+/// call skips the activity-monitor tickle — so the receiving app never counts
+/// the event as live input. That is the single sentence that explains why
+/// forty-six variants of `CGEventPostToPid` here changed nothing, and it
+/// matches the captured trace: the events that work carry no source pid and
+/// `SourceStateID = 1`, which is what arriving via `IOHIDPostEvent` looks like.
+fn sl_event_post_to_pid(pid: i32, event: &CGEvent) -> bool {
+    type Fp = unsafe extern "C" fn(i32, *mut c_void);
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"SLEventPostToPid".as_ptr());
+        if sym.is_null() {
+            return false;
+        }
+        let f: Fp = std::mem::transmute::<*mut c_void, Fp>(sym);
+        f(pid, event as *const CGEvent as *mut c_void);
+        true
+    }
+}
+
+/// `CGEventSetWindowLocation`, also SkyLight-side and also not in any SDK.
+fn set_window_location(event: &CGEvent, x: f64, y: f64) -> bool {
+    type Fp = unsafe extern "C" fn(*mut c_void, f64, f64);
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"CGEventSetWindowLocation".as_ptr());
+        if sym.is_null() {
+            return false;
+        }
+        let f: Fp = std::mem::transmute::<*mut c_void, Fp>(sym);
+        f(event as *const CGEvent as *mut c_void, x, y);
+        true
+    }
 }
 
 /// `_SLPSSetFrontProcessWithOptions` lives in SkyLight and is not in any SDK,
@@ -210,6 +298,12 @@ fn main() {
         CGPoint::new(gx, gy)
     };
     println!("flags={flags:?} -> point ({:.0}, {:.0})", point.x, point.y);
+    println!("  cursor before: {:?}", cua_hid::cursor_position().ok());
+
+    if has("awr") {
+        activate_without_raise(pid, w.id);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
 
     if has("front") {
         // Report who holds the foreground before and after, because
@@ -282,7 +376,18 @@ fn main() {
                 packed as i64,
             );
         }
-        if has("annot") {
+        if has("winloc") {
+            let wx = gx - w.frame.origin.x;
+            let wy = gy - w.frame.origin.y;
+            if !set_window_location(&event, wx, wy) {
+                println!("  CGEventSetWindowLocation NOT FOUND");
+            }
+        }
+        if has("sl") {
+            if !sl_event_post_to_pid(pid, &event) {
+                println!("  SLEventPostToPid NOT FOUND");
+            }
+        } else if has("annot") {
             // The tap location is the whole answer. `HIDEventTap` is the
             // hardware stream — posting there moves the real pointer, which is
             // what every visible-cursor click in this project has been doing.
@@ -303,4 +408,7 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
     println!("  sent mouse down/up");
+    // The property under test is not only "did it land" but "did the human's
+    // pointer stay put". Print both ends so the answer is in the transcript.
+    println!("  cursor after : {:?}", cua_hid::cursor_position().ok());
 }
