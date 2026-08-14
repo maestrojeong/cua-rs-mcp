@@ -148,6 +148,18 @@ pub enum CoreError {
         frontmost: String,
     },
 
+    /// An `element_token` named a role the element at that index no longer has.
+    ///
+    /// The token carries the role precisely so this is catchable: an index
+    /// that used to be a table row and is now a button is drift the caller can
+    /// see and fix, where a bare index would have acted on the button.
+    #[error("element_token points at index {index}, which was a {expected} when the token was issued and is a {found} now. Call get_app_state again and take a fresh token")]
+    TokenRoleMismatch {
+        index: usize,
+        expected: String,
+        found: String,
+    },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -234,12 +246,22 @@ impl Default for StateOptions {
 }
 
 /// How the agent addressed an element.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy`: pinning a token to a role means carrying a `String`. The
+/// handful of call sites that passed it by value now clone, which costs one
+/// small allocation per action and buys a check that catches an index whose
+/// meaning has changed.
+#[derive(Debug, Clone)]
 pub enum Target {
-    /// By snapshot index, optionally pinned to the snapshot it came from.
+    /// By snapshot index, optionally pinned to the snapshot it came from and
+    /// to the role that index had when the snapshot was taken.
     Index {
         index: usize,
         snapshot_id: Option<u64>,
+        /// Checked against the recorded node's role when present. An index
+        /// that has come to mean a different *kind* of thing is the cheapest
+        /// detectable form of drift, and the one a caller can act on.
+        expected_role: Option<String>,
     },
     /// By screen point, in AX global points. Hit-tested to an element, then
     /// acted on through AX — never by moving the pointer.
@@ -883,10 +905,14 @@ impl Inner {
     }
 
     /// Turn a [`Target`] into a concrete element, validating snapshot identity.
-    fn resolve(&self, query: &str, target: Target) -> Result<(AppInfo, Element, String)> {
+    fn resolve(&self, query: &str, target: &Target) -> Result<(AppInfo, Element, String)> {
         let info = apps::resolve_app(query)?;
-        match target {
-            Target::Index { index, snapshot_id } => {
+        match *target {
+            Target::Index {
+                index,
+                snapshot_id,
+                ref expected_role,
+            } => {
                 let snap = self
                     .snapshots
                     .get(&info.pid)
@@ -912,6 +938,16 @@ impl Inner {
                     index,
                     count: snap.nodes.len(),
                 })?;
+                if let Some(expected) = expected_role {
+                    if &node.role != expected {
+                        return Err(CoreError::TokenRoleMismatch {
+                            index,
+                            expected: expected.clone(),
+                            found: node.role.clone(),
+                        });
+                    }
+                }
+
                 Ok((info, node.element.clone(), describe_node(node)))
             }
             Target::Point { x, y } => {
@@ -928,18 +964,18 @@ impl Inner {
 
     fn click(&mut self, query: &str, target: Target, count: u8) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
 
         // Remember what this element was showing when the snapshot recorded
         // it, for the recycling check further down. Read here rather than at
         // the point of use so it reflects the snapshot, not the state after
         // the app has been raised and activated.
-        let expected = match target {
-            Target::Index { index, .. } => self
+        let expected = match &target {
+            Target::Index { index, .. } => { let index = *index; self
                 .snapshots
                 .get(&info.pid)
-                .map(|snap| (index, snapshot_tokens(&snap.nodes, index))),
+                .map(|snap| (index, snapshot_tokens(&snap.nodes, index))) }
             Target::Point { .. } => None,
         };
 
@@ -1146,7 +1182,7 @@ impl Inner {
 
     fn set_value(&mut self, query: &str, target: Target, value: &str) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
         el.set_string(cua_ax::attr::VALUE, value)?;
         let changed = self.changed_since(info.pid, before);
@@ -1155,7 +1191,7 @@ impl Inner {
 
     fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
         let write = el.append_text(text)?;
         let changed = self.changed_since(info.pid, before);
@@ -1177,7 +1213,7 @@ impl Inner {
         suffix: Option<&str>,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (_, el, desc) = self.resolve(query, target)?;
+        let (_, el, desc) = self.resolve(query, &target)?;
         let range = el.select_text(text, prefix, suffix)?;
         // Selecting text changes no window state the fingerprint can see, and
         // claiming otherwise would be noise. The returned range is the evidence
@@ -1210,7 +1246,7 @@ impl Inner {
         }
 
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
 
         // AX first, for the handful of keys that have a semantic verb. This path
@@ -1279,7 +1315,7 @@ impl Inner {
         action: &str,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let available = el.actions();
         if !available.iter().any(|a| a == action) {
             // List what the element *does* support: an agent that guessed a verb
@@ -1379,7 +1415,7 @@ impl Inner {
         pages: u32,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (info, el, desc) = self.resolve(query, target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
         let verb = dir.verb();
         for _ in 0..pages.max(1) {
@@ -1727,6 +1763,21 @@ mod tests {
                 "{key} is advertised as needing no focus but has no AX verb"
             );
         }
+    }
+
+    /// The whole point of putting the role in the token is that a caller can
+    /// be told *what changed*, not just that something did.
+    #[test]
+    fn a_token_role_mismatch_names_both_roles() {
+        let err = CoreError::TokenRoleMismatch {
+            index: 233,
+            expected: "AXCell".into(),
+            found: "AXButton".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("233"), "got {msg}");
+        assert!(msg.contains("AXCell") && msg.contains("AXButton"), "got {msg}");
+        assert!(msg.contains("get_app_state"), "the remedy must be in the message: {msg}");
     }
 
     #[test]

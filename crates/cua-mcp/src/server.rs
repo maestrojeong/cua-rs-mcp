@@ -88,7 +88,14 @@ fn yes() -> bool {
 struct ActionArgs {
     /// App name, bundle identifier, or bundle path.
     app: String,
+    /// One opaque handle from `get_app_state`, e.g. `"7-12-AXButton"`. It
+    /// carries the snapshot, the index and the role together, so pinning an
+    /// action to the exact element it was chosen from costs nothing and cannot
+    /// be forgotten. Preferred over `element_index`.
+    #[serde(default)]
+    element_token: Option<String>,
     /// Index from the most recent `get_app_state` for this app, e.g. `"12"`.
+    /// Still accepted; `element_token` is stricter for free.
     #[serde(default)]
     element_index: Option<String>,
     /// Pass the `snapshot_id` from `get_app_state` to make the call fail loudly
@@ -106,6 +113,30 @@ struct ActionArgs {
 
 impl ActionArgs {
     fn target(&self) -> Result<Target, String> {
+        // Token first: it is the form that pins everything, so a caller that
+        // supplies both should get the stricter reading.
+        if let Some(raw) = &self.element_token {
+            let raw = raw.trim();
+            let mut parts = raw.splitn(3, '-');
+            let (Some(snap), Some(idx), Some(role)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                return Err(format!(
+                    "element_token should look like `7-12-AXButton` (snapshot-index-role), got {raw:?}"
+                ));
+            };
+            let snapshot_id: u64 = snap
+                .parse()
+                .map_err(|_| format!("element_token has a non-numeric snapshot id: {raw:?}"))?;
+            let index: usize = idx
+                .parse()
+                .map_err(|_| format!("element_token has a non-numeric index: {raw:?}"))?;
+            return Ok(Target::Index {
+                index,
+                snapshot_id: Some(snapshot_id),
+                expected_role: Some(role.to_string()),
+            });
+        }
         if let Some(raw) = &self.element_index {
             let index: usize = raw
                 .trim()
@@ -114,11 +145,14 @@ impl ActionArgs {
             return Ok(Target::Index {
                 index,
                 snapshot_id: self.snapshot_id,
+                expected_role: None,
             });
         }
         match (self.x, self.y) {
             (Some(x), Some(y)) => Ok(Target::Point { x, y }),
-            _ => Err("pass element_index (preferred) or both x and y".to_string()),
+            _ => Err(
+                "pass element_token (preferred), element_index, or both x and y".to_string(),
+            ),
         }
     }
 }
@@ -347,9 +381,10 @@ impl CuaServer {
         };
 
         let mut header = format!(
-            "{} (pid {})  snapshot_id={}\nwindow: {}\nelements: {} total, {} actionable\n",
+            "{} (pid {})  snapshot_id={}\nelement_token: join this snapshot_id, the [N] in a tree line, and that line's role with dashes — e.g. `{}-12-AXButton` — and pass it as element_token to pin the action to exactly this element\nwindow: {}\nelements: {} total, {} actionable\n",
             state.app.name,
             state.app.pid,
+            state.snapshot_id,
             state.snapshot_id,
             state.window_title.as_deref().unwrap_or("(untitled)"),
             state.node_count,
