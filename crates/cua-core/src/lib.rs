@@ -16,6 +16,7 @@
 //! error instead of a mis-click.
 
 pub mod apps;
+mod overlay;
 pub mod session;
 pub mod snapshot;
 

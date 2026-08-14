@@ -30,6 +30,7 @@ use cua_capture::WindowInfo;
 use objc2_core_foundation::CGRect;
 
 use crate::apps::{self, AppInfo};
+use crate::overlay::Overlay;
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -283,19 +284,50 @@ pub struct ActionResult {
     /// Present on every result, not just the interesting ones, so an agent never
     /// has to infer it from the absence of a field.
     pub delivery: Delivery,
+    /// Where the action landed, in screen points, best-effort — an
+    /// element's `AXActivationPoint` or frame centre, or the exact point a
+    /// caller passed for a `Target::Point`. `None` when nothing could be
+    /// resolved. Crate-private and not part of the tool contract: it exists
+    /// only to feed the drawn-cursor overlay (see `Cua::exec_action`), so a wrong or
+    /// missing value never surfaces as an error, and it never has to be kept
+    /// stable for callers outside this crate.
+    point: Option<(f64, f64)>,
 }
 
 impl ActionResult {
-    /// An action that went through the accessibility API, which is all of them
-    /// unless `--allow-hid` was passed.
-    fn ax(verb: impl Into<String>, target: String, ui_changed: Observed) -> Self {
+    /// An action that went through the accessibility API, which is all of
+    /// them unless `--allow-hid` was passed, plus the screen point the
+    /// overlay should point at (`None` when nothing could be resolved).
+    fn ax_at(
+        verb: impl Into<String>,
+        target: String,
+        ui_changed: Observed,
+        point: Option<(f64, f64)>,
+    ) -> Self {
         Self {
             verb: verb.into(),
             target,
             ui_changed,
             delivery: Delivery::Ax,
+            point,
         }
     }
+}
+
+/// An element's best on-screen point for a drawn cursor: its own
+/// `AXActivationPoint` when it has one — not always the geometric centre, for
+/// a wide list row or a control with a large transparent hit area — falling
+/// back to the frame centre. `None` when the element publishes neither.
+fn element_point(el: &Element) -> Option<(f64, f64)> {
+    if let Some(p) = el.activation_point() {
+        return Some((p.x as f64, p.y as f64));
+    }
+    el.frame().map(|f| {
+        (
+            f.origin.x + f.size.width / 2.0,
+            f.origin.y + f.size.height / 2.0,
+        )
+    })
 }
 
 /// What was observed after an action, in three values rather than two.
@@ -558,6 +590,12 @@ fn process_start_time(pid: libc::pid_t) -> Option<u64> {
 #[derive(Clone)]
 pub struct Cua {
     tx: mpsc::Sender<Job>,
+    /// The drawn cursor. A separate object rather than something `Inner`
+    /// owns: marking it happens from the async-facing wrapper methods below,
+    /// on whichever thread is running the `spawn_blocking` call, not on the
+    /// single-threaded AX worker — there is no reason to serialize a stdin
+    /// write behind tree walks and clicks.
+    overlay: std::sync::Arc<Overlay>,
 }
 
 impl Cua {
@@ -582,7 +620,10 @@ impl Cua {
                 }
             })
             .expect("spawn cua-native thread");
-        Self { tx }
+        Self {
+            tx,
+            overlay: std::sync::Arc::new(Overlay::new()),
+        }
     }
 
     /// Run `f` on the worker thread and wait for its result.
@@ -598,6 +639,26 @@ impl Cua {
             }))
             .map_err(|_| CoreError::WorkerGone)?;
         rx.recv().map_err(|_| CoreError::WorkerGone)
+    }
+
+    /// Run an action on the worker thread, then point the drawn cursor at
+    /// wherever it landed, if anywhere. Every public action wrapper below is
+    /// this plus its own arguments; centralizing it here means the overlay
+    /// stays a one-line concern instead of three repeated lines per action.
+    /// A no-op on the overlay side for actions that resolved no point (a HID
+    /// key event, a select with an unreadable range) — the drawn cursor
+    /// simply stays where it was.
+    fn exec_action<F>(&self, clicking: bool, f: F) -> Result<ActionResult>
+    where
+        F: FnOnce(&mut Inner) -> Result<ActionResult> + Send + 'static,
+    {
+        let result = self.exec(f)?;
+        if let Ok(r) = &result {
+            if let Some((x, y)) = r.point {
+                self.overlay.mark(x, y, clicking);
+            }
+        }
+        result
     }
 
     // ── operations ───────────────────────────────────────────────────────
@@ -631,14 +692,14 @@ impl Cua {
     /// express — see [`Inner::click`].
     pub fn click(&self, app: &str, target: Target, count: u8) -> Result<ActionResult> {
         let app = app.to_string();
-        self.exec(move |inner| inner.click(&app, target, count))?
+        self.exec_action(true, move |inner| inner.click(&app, target, count))
     }
 
     /// Replace a text element's contents.
     pub fn set_value(&self, app: &str, target: Target, value: &str) -> Result<ActionResult> {
         let app = app.to_string();
         let value = value.to_string();
-        self.exec(move |inner| inner.set_value(&app, target, &value))?
+        self.exec_action(false, move |inner| inner.set_value(&app, target, &value))
     }
 
     /// Scroll a scrollable element by whole pages.
@@ -650,14 +711,14 @@ impl Cua {
         pages: u32,
     ) -> Result<ActionResult> {
         let app = app.to_string();
-        self.exec(move |inner| inner.scroll(&app, target, dir, pages))?
+        self.exec_action(false, move |inner| inner.scroll(&app, target, dir, pages))
     }
 
     /// Append text to an element, preferring insertion over replacement.
     pub fn type_text(&self, app: &str, target: Target, text: &str) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
-        self.exec(move |inner| inner.type_text(&app, target, &text))?
+        self.exec_action(false, move |inner| inner.type_text(&app, target, &text))
     }
 
     /// Select a literal substring inside an element's text.
@@ -671,23 +732,25 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
-        self.exec(move |inner| {
+        self.exec_action(false, move |inner| {
             inner.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
-        })?
+        })
     }
 
     /// Press a key, through AX when the key has a verb and HID otherwise.
     pub fn press_key(&self, app: &str, target: Target, key: &str) -> Result<ActionResult> {
         let app = app.to_string();
         let key = key.to_string();
-        self.exec(move |inner| inner.press_key(&app, target, &key))?
+        self.exec_action(false, move |inner| inner.press_key(&app, target, &key))
     }
 
     /// Deliver an arbitrary AX action by name.
     pub fn perform_action(&self, app: &str, target: Target, action: &str) -> Result<ActionResult> {
         let app = app.to_string();
         let action = action.to_string();
-        self.exec(move |inner| inner.perform_action(&app, target, &action))?
+        self.exec_action(false, move |inner| {
+            inner.perform_action(&app, target, &action)
+        })
     }
 
     /// Elements whose label, value or role contains `needle`.
@@ -1014,7 +1077,7 @@ impl Inner {
             match el.activate() {
                 Ok(verb) => {
                     let changed = self.changed_since(info.pid, before);
-                    return Ok(ActionResult::ax(verb, desc, changed));
+                    return Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el)));
                 }
                 Err(e) => e,
             }
@@ -1132,6 +1195,7 @@ impl Inner {
             target: desc,
             ui_changed: changed,
             delivery: Delivery::Hid,
+            point: Some((x, y)),
         })
     }
 
@@ -1202,7 +1266,7 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.set_string(cua_ax::attr::VALUE, value)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax("AXValue=", desc, changed))
+        Ok(ActionResult::ax_at("AXValue=", desc, changed, element_point(&el)))
     }
 
     fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
@@ -1213,10 +1277,11 @@ impl Inner {
         let changed = self.changed_since(info.pid, before);
         // Name the mechanism, not just the intent. "typed" would imply
         // keystrokes were synthesized, which is exactly what did not happen.
-        Ok(ActionResult::ax(
+        Ok(ActionResult::ax_at(
             format!("AXSelectedText+ ({})", write.as_str()),
             desc,
             changed,
+            element_point(&el),
         ))
     }
 
@@ -1234,7 +1299,7 @@ impl Inner {
         // Selecting text changes no window state the fingerprint can see, and
         // claiming otherwise would be noise. The returned range is the evidence
         // that it worked.
-        Ok(ActionResult::ax(
+        Ok(ActionResult::ax_at(
             format!(
                 "AXSelectedTextRange={{offset:{},length:{}}}",
                 range.offset, range.length
@@ -1243,6 +1308,7 @@ impl Inner {
             // Selection changes no window state the fingerprint can see, so
             // there is nothing to observe here either way.
             Observed::Unknown,
+            element_point(&el),
         ))
     }
 
@@ -1273,10 +1339,11 @@ impl Inner {
             if available.iter().any(|a| a == verb) {
                 el.perform(verb)?;
                 let changed = self.changed_since(info.pid, before);
-                return Ok(ActionResult::ax(
+                return Ok(ActionResult::ax_at(
                     format!("{verb} (for {key})"),
                     desc,
                     changed,
+                    element_point(&el),
                 ));
             }
             // The key *does* have an AX verb; this element just does not accept
@@ -1321,6 +1388,9 @@ impl Inner {
             ),
             ui_changed: changed,
             delivery: Delivery::Hid,
+            // A HID key goes to whatever has focus, not to this element, so
+            // the element's location would be a misleading place to point.
+            point: None,
         })
     }
 
@@ -1344,7 +1414,7 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.perform(action)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax(action, desc, changed))
+        Ok(ActionResult::ax_at(action, desc, changed, element_point(&el)))
     }
 
     fn find(&mut self, query: &str, needle: &str, limit: usize) -> Result<FindResult> {
@@ -1438,7 +1508,7 @@ impl Inner {
             el.perform(verb)?;
         }
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax(verb, desc, changed))
+        Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el)))
     }
 
     /// A cheap proxy for "did the UI move".
