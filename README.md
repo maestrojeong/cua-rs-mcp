@@ -341,6 +341,14 @@ that draws an arrow wherever an action just landed and a click ring when it
 was a `click`. It never receives input itself, never takes focus, and never
 moves your real cursor — it is purely something to look at.
 
+<p align="center"><img src="assets/cursor-demo.png" width="720" alt="The drawn cursor: a mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
+
+The shape is Lucide's `mouse-pointer-2` (MIT), the same one Figma and Notion
+already use to show where someone else is pointing, mirrored so it leans the
+one way a real macOS pointer never does — a glance is enough to tell it apart
+from yours. It is a plain filled path, not an image, so there is no asset to
+ship or scale.
+
 `cua-rs` looks for `cua-overlay` next to its own executable and spawns it the
 first time an action resolves a point to show. If it is not there, nothing
 breaks: marking the overlay is best-effort by design, so a missing binary
