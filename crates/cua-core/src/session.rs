@@ -805,7 +805,7 @@ impl Inner {
             }
         };
 
-        let nodes = root.snapshot_tree(opts.limits);
+        let (nodes, complete) = root.snapshot_tree_reporting(opts.limits);
 
         // A small tree on the *first* read of an app is ambiguous, and the
         // ambiguity is worth stating rather than resolving badly.
@@ -837,6 +837,22 @@ impl Inner {
             warnings.push(format!(
                 "tree truncated at {} elements; pass a larger max_nodes or narrow the target",
                 opts.limits.max_nodes
+            ));
+        } else if !complete {
+            // Truncation by *time*, which looks nothing like truncation by
+            // count: the tree is short, so nothing suggests anything is
+            // missing. Measured on KakaoTalk with ten windows open, a walk that
+            // would have returned 2000 nodes took 171 s; the budget cuts that
+            // to 10 s and 429 nodes, and the conversation the caller wanted was
+            // in the part that never arrived. Without this line the caller
+            // concludes the element does not exist.
+            warnings.push(format!(
+                "tree is INCOMPLETE: the walk hit its {:.0}s time budget after {} elements, so \
+                 anything further down is missing rather than absent. This app is answering \
+                 accessibility calls slowly. Narrow the walk with scope_element_id, or use find \
+                 to search, before concluding an element is not there",
+                opts.limits.budget.as_secs_f64(),
+                nodes.len()
             ));
         }
 

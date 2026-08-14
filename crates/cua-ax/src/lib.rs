@@ -789,7 +789,20 @@ impl Element {
     /// unbounded (virtualized 100k-row tables) and is not guaranteed acyclic,
     /// so an uncapped walk is a hang, not a slow path.
     pub fn snapshot_tree(&self, limits: Limits) -> Vec<AxNode> {
+        self.snapshot_tree_reporting(limits).0
+    }
+
+    /// [`Element::snapshot_tree`], plus whether the walk finished.
+    ///
+    /// `false` means the walk stopped early and the tree is incomplete. That
+    /// has to be reportable: a caller that cannot tell truncation from absence
+    /// will conclude an element does not exist when it was simply never
+    /// reached, and go looking for a different way to do something it could
+    /// have done.
+    pub fn snapshot_tree_reporting(&self, limits: Limits) -> (Vec<AxNode>, bool) {
+        let deadline = std::time::Instant::now() + limits.budget;
         let mut nodes: Vec<AxNode> = Vec::new();
+        let mut complete = true;
         // (element, depth, parent index in `nodes`)
         let mut queue: std::collections::VecDeque<(Element, u32, Option<usize>)> =
             std::collections::VecDeque::new();
@@ -797,6 +810,17 @@ impl Element {
 
         while let Some((el, depth, parent)) = queue.pop_front() {
             if nodes.len() >= limits.max_nodes {
+                complete = false;
+                break;
+            }
+            // A node cap is not a time cap. Every node here is a synchronous
+            // IPC round-trip into another process, and a slow app makes each
+            // one cost far more than the usual fraction of a millisecond:
+            // KakaoTalk with ten windows open took 171 s to return 2000 nodes,
+            // which from the caller's side is indistinguishable from a hang.
+            // Stop on the clock and return what was reached.
+            if std::time::Instant::now() >= deadline {
+                complete = false;
                 break;
             }
 
@@ -811,7 +835,7 @@ impl Element {
                 }
             }
         }
-        nodes
+        (nodes, complete)
     }
 }
 
@@ -833,6 +857,12 @@ pub struct Limits {
     /// off-screen halves and collapsed drawers are the bulk of a naive tree and
     /// none of it is actionable.
     pub skip_offscreen: bool,
+    /// Wall-clock ceiling on one walk.
+    ///
+    /// The other caps bound how much is *returned*; this bounds how long the
+    /// caller waits. They are not the same limit, because the cost of a node is
+    /// set by the target app, not by us — see the note at the loop.
+    pub budget: std::time::Duration,
 }
 
 impl Default for Limits {
@@ -842,6 +872,10 @@ impl Default for Limits {
             max_depth: 40,
             max_children: 200,
             skip_offscreen: true,
+            // Long enough that an ordinary app finishes well inside it, short
+            // enough that a pathological one still returns something useful
+            // within one turn.
+            budget: std::time::Duration::from_secs(10),
         }
     }
 }
