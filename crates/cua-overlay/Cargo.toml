@@ -1,0 +1,37 @@
+[package]
+name = "cua-overlay"
+description = "The agent's drawn cursor: a transparent, click-through window that shows where cua-rs is acting. Purely visual — it never delivers input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cua-overlay"
+path = "src/main.rs"
+
+[dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSGeometry",
+    "NSString",
+    "NSThread",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSApplication",
+    "NSRunningApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSColor",
+    "NSScreen",
+    "NSGraphics",
+    "NSBezierPath",
+    "NSGraphicsContext",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFRunLoop", "CFBase"] }

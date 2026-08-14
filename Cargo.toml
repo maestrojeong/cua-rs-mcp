@@ -6,6 +6,7 @@ members = [
     "crates/cua-core",
     "crates/cua-hid",
     "crates/cua-mcp",
+    "crates/cua-overlay",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ cua-ax = { path = "crates/cua-ax" }
 cua-capture = { path = "crates/cua-capture" }
 cua-core = { path = "crates/cua-core" }
 cua-hid = { path = "crates/cua-hid" }
+cua-overlay = { path = "crates/cua-overlay" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "process", "signal", "fs"] }
 futures = "0.3"
