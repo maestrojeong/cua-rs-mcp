@@ -50,6 +50,7 @@ cua-rs delivers actions *directly to the target UI element* instead.
 | scroll | post wheel events at a point | `AXScrollDownByPage` |
 | screenshot | `CGWindowListCreateImage` (deprecated) | ScreenCaptureKit, per window |
 | your cursor | moves | **untouched on the AX path**; borrowed and restored by the `--allow-hid` click fallback |
+| where the agent is acting | your own moving cursor shows it | **a separate drawn arrow**, if `cua-overlay` is running — see [The drawn cursor](#the-drawn-cursor) |
 | your keyboard focus | changes | **unchanged on the AX path** |
 | your active Space | can switch | **never switches on the AX path** |
 | occluded / off-Space window | blank or stale capture | **captures correctly** |
@@ -331,11 +332,35 @@ different claim: KakaoTalk exposes zero `AXWindows` while backgrounded, so both
 ends of the before/after fingerprint come back empty and prove nothing.
 Collapsing that into `false` tells an agent an action failed when it did not.
 
+## The drawn cursor
+
+The AX path leaves nothing on screen — which is the point, but it also means a
+human watching has no way to tell an agent is doing anything. `cua-overlay` is
+a second, separate binary: a borderless transparent window, click-through,
+that draws an arrow wherever an action just landed and a click ring when it
+was a `click`. It never receives input itself, never takes focus, and never
+moves your real cursor — it is purely something to look at.
+
+`cua-rs` looks for `cua-overlay` next to its own executable and spawns it the
+first time an action resolves a point to show. If it is not there, nothing
+breaks: marking the overlay is best-effort by design, so a missing binary
+just means no arrow, never a failed tool call.
+
+**The prebuilt release does not include it yet.** `install.sh` and the
+GitHub Release both ship `cua-rs` alone, so installing that way gives you a
+fully working server with no drawn cursor. To get one today, build both
+binaries from source and keep them in the same directory:
+
+```bash
+cargo build --release --workspace
+ls target/release/cua-rs target/release/cua-overlay   # both present
+```
+
 ## Development
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 65 tests, no permissions needed
+cargo test --workspace          # 73 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -345,6 +370,7 @@ crates/cua-capture   ScreenCaptureKit per-window PNG + permission preflight
 crates/cua-core      app resolution, worker thread, snapshot generations
 crates/cua-hid       opt-in HID synthesis — the only crate that moves the cursor
 crates/cua-mcp       rmcp server, binary `cua-rs`
+crates/cua-overlay   the drawn cursor, binary `cua-overlay` — see above
 ```
 
 Two design constraints worth knowing before touching the code:
