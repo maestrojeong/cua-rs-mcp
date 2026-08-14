@@ -1,6 +1,6 @@
 # cua-rs
 
-**Your Mac, driven by an agent. Your cursor stays yours — until you say otherwise.**
+**Your Mac, driven by an agent. Your cursor stays yours.**
 
 [![ci](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/maestrojeong/cua-rs-mcp)](https://github.com/maestrojeong/cua-rs-mcp/releases)
@@ -14,19 +14,17 @@ switches your Space: an agent can work in a background window while you keep
 typing in another, on the same Mac at the same time. One Rust binary, no
 Node.js, no Python.
 
-Some controls cannot be reached that way at all — a chat app's conversation
-row that advertises no accessibility action and ignores every accessibility
-write. For those, and only when you start the server with `--allow-hid`, there
-is a fallback that borrows your pointer for a few frames and puts it back. It
-is off by default, it says so in every result, and it refuses to fire when the
-pixels it is aiming at do not belong to the app it was asked to click. See
-[The escape hatches](#the-escape-hatches).
+Some custom-drawn controls advertise no accessibility action. For those,
+cua-rs routes a stamped mouse event directly to the target process through
+macOS SkyLight. This `delivery: pid` path does not move the system cursor or
+raise the target window. There is no pointer-warp fallback.
 
 ```mermaid
 flowchart LR
-    A["Agent"] --> M["cua-rs MCP<br/>one Rust process"]
+    A["Agent"] --> M["cua-rs MCP<br/>persistent Rust process"]
     M -->|"AXUIElementPerformAction"| S["Slack<br/>(background)"]
-    M -->|"ScreenCaptureKit"| S
+    M -->|"window id"| C["one-shot macOS<br/>capture process"]
+    C -->|"window PNG"| S
     H["You"] -.->|"real cursor + keyboard"| T["Terminal<br/>(foreground)"]
     style H fill:#e8f5e9,stroke:#43a047
     style A fill:#e3f2fd,stroke:#1e88e5
@@ -45,21 +43,21 @@ cua-rs delivers actions *directly to the target UI element* instead.
 
 | | HID-synthesis tools | cua-rs |
 |---|:--|:--|
-| click | move cursor, post mouse down/up | `AXUIElementPerformAction(AXPress)`, falling back to a guarded real click only with `--allow-hid` |
+| click | move cursor, post mouse down/up | AX action, then pid-routed SkyLight event for custom controls |
 | type | post key events to whatever has focus | `AXUIElementSetAttributeValue(AXValue)` |
 | scroll | post wheel events at a point | `AXScrollDownByPage` |
-| screenshot | `CGWindowListCreateImage` (deprecated) | ScreenCaptureKit, per window |
-| your cursor | moves | **untouched on the AX path**; borrowed and restored by the `--allow-hid` click fallback |
+| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated macOS per-window capture |
+| your cursor | moves | **untouched** |
 | where the agent is acting | your own moving cursor shows it | **a separate drawn arrow**, if `cua-overlay` is running — see [The drawn cursor](#the-drawn-cursor) |
-| your keyboard focus | changes | **unchanged on the AX path** |
-| your active Space | can switch | **never switches on the AX path** |
+| your keyboard focus | changes | **unchanged** |
+| your active Space | can switch | **never switches** |
 | occluded / off-Space window | blank or stale capture | **captures correctly** |
 | window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
 | you working simultaneously | input fights the agent | **works** |
 
-Every line in this repository that can post an HID event lives in `cua-hid`,
-which is unreachable unless you start the server with `--allow-hid`. The
-dependency graph enforces that, not a comment:
+Every process-routed event implementation lives in `cua-hid`; shared cursor and
+keyboard synthesis are not wired into the server. The dependency graph keeps
+AX and capture independent from the private input implementation:
 
 ```console
 $ grep -rln 'CGEvent::post' crates/*/src/*.rs
@@ -69,10 +67,8 @@ $ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
 0
 ```
 
-The boundary is enforced by the dependency graph, not by discipline: the crates
-that do the actual driving cannot reach the one that can move your pointer. So
-the coexistence property is not a tuning choice — it is what the default build
-structurally *can* do. See [the one escape hatch](#the-one-escape-hatch).
+The coexistence property is not a runtime mode: cua-rs has no `--allow-hid`
+option and no product path that warps the pointer or posts keyboard events.
 
 ## Quick start
 
@@ -112,7 +108,7 @@ an unrelated path — it still holds both grants.
 | Grant | Needed for | Without it |
 |---|:--|:--|
 | Accessibility | reading UI structure, every action | nothing works |
-| Screen Recording | window screenshots | tree still works, no images |
+| Screen Recording | window screenshots; last-moment window validation for custom-control `delivery: pid` clicks | tree and AX actions still work; no images or pid-routed fallback |
 
 ```bash
 cua-rs permissions      # never prompts
@@ -241,7 +237,7 @@ dialect would cost recognition and buy nothing.
 | `scroll` | page a scroll area |
 | `type_text` | append text, preserving what is there |
 | `select_text` | select a substring, with prefix/suffix anchors |
-| `press_key` | Return / Escape / arrows via AX; chords need `--allow-hid` |
+| `press_key` | Return / Escape / arrows via AX; arbitrary chords are refused |
 | `perform_secondary_action` | any AX verb: `AXShowMenu`, `AXRaise`, `AXIncrement` |
 | `find` | search the snapshot by text |
 | `wait_for` | poll until text appears or disappears |
@@ -289,7 +285,7 @@ Honest ones, not a roadmap.
 | text fields, search fields, text areas | yes |
 | Electron apps (Slack, VS Code, Discord) | yes — but the tree builds lazily, so the first read can be nearly empty; call `get_app_state` again |
 | Return, Escape, stepper arrows | yes — `AXConfirm` / `AXCancel` / `AXIncrement` |
-| arbitrary chords (`⌘⇧P`, `f5`) | only with `--allow-hid`, which moves the cursor |
+| arbitrary chords (`⌘⇧P`, `f5`) | **no** — shared keyboard input is not synthesized |
 | canvas apps (Figma internals, games) | **no** — no AX elements to act on |
 | terminals | mostly no |
 | drag | **no** — macOS AX has no semantic drag |
@@ -297,33 +293,22 @@ Honest ones, not a roadmap.
 `set_value` **replaces** rather than appends; `type_text` appends. Apps that only
 react to real key events will ignore both.
 
-### The escape hatches
+### Process-routed click fallback
 
-Two of them, both behind `--allow-hid`, both loud about it.
+When an element has no `AXPress`, `AXPick`, or `AXConfirm`, `click` uses the
+cua-driver-derived `SLEventPostToPid` recipe. Results say `delivery: pid`. If
+SkyLight is unavailable or event construction fails, the action returns an
+error instead of moving the pointer.
 
-`press_key` sends a real key event for chords AX cannot express. `click` falls
-back to a real mouse click for an element that advertises no `AXPress`,
-`AXPick` or `AXConfirm` at all — measured against KakaoTalk's conversation
-list, where every accessibility route returns success and does nothing. That
-fallback moves the pointer onto the target, clicks, and puts the pointer and
-the previously frontmost app back:
-
-```text
-delivery: hid  (a real input event through the shared HID stream: the cursor
-                and keyboard focus were used, exactly as if the user acted)
-```
-
-Before it fires it hit-tests the target point system-wide and refuses unless
-those pixels currently belong to the target app — a window on another Space
-reports ordinary screen coordinates, and an earlier version of this clicked an
-innocent Terminal window because of it. It also re-reads the element's visible
-text and refuses if it no longer shows what the snapshot recorded, because list
-views recycle their cells.
-
-Every action result carries `delivery: ax` or `delivery: hid`, so an agent can
-never mistake one for the other. All HID code lives in one crate, `cua-hid`,
-which `cua-ax` and `cua-capture` do not depend on — `grep -rl cua_hid crates/`
-enumerates every site that can touch your pointer.
+The event carries the target pid, window id, and window-local coordinates, so
+an occluding window or another Space cannot redirect it to an unrelated app.
+Immediately before posting, cua-rs re-enumerates that exact window and requires
+the same `(CGWindowID, pid)`, then recomputes window-local coordinates from its
+live frame. A closed/recycled window or an AX point that drifted outside it
+fails closed and asks for a fresh snapshot. The route neither activates the
+target app nor duplicates the event through the public process-post API.
+Every action result carries `delivery: ax` or `delivery: pid`, so callers can
+distinguish semantic accessibility actions from process-routed input.
 
 `ui_changed` is reported honestly and has three values, not two: `yes`, `no`,
 and `unknown`. `no` does not mean failure — some controls change nothing
@@ -340,6 +325,11 @@ a second, separate binary: a borderless transparent window, click-through,
 that draws an arrow wherever an action just landed and a click ring when it
 was a `click`. It never receives input itself, never takes focus, and never
 moves your real cursor — it is purely something to look at.
+
+The overlay is ordered immediately above the exact target `CGWindowID`, not at
+a global always-on-top level. If another app covers the target window, it also
+covers the agent cursor. When a target window id cannot be resolved, the
+overlay hides instead of appearing above unrelated windows.
 
 <p align="center"><img src="assets/cursor-demo.png" width="720" alt="The drawn cursor: a mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
 
@@ -368,15 +358,15 @@ ls target/release/cua-rs target/release/cua-overlay   # both present
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 73 tests, no permissions needed
+cargo test --workspace          # 79 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ```text
 crates/cua-ax        safe AXUIElement wrapper, budgeted tree walker, AxNode
-crates/cua-capture   ScreenCaptureKit per-window PNG + permission preflight
+crates/cua-capture   SCK window discovery + crash-isolated per-window PNG
 crates/cua-core      app resolution, worker thread, snapshot generations
-crates/cua-hid       opt-in HID synthesis — the only crate that moves the cursor
+crates/cua-hid       pid-routed private input; no shared-cursor product path
 crates/cua-mcp       rmcp server, binary `cua-rs`
 crates/cua-overlay   the drawn cursor, binary `cua-overlay` — see above
 ```

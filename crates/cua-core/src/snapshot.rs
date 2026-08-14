@@ -308,13 +308,7 @@ mod tests {
             label: label.map(str::to_string),
             value: None,
             help: None,
-            frame: Some(CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize {
-                    width: 10.0,
-                    height: 10.0,
-                },
-            }),
+            frame: None,
             enabled: true,
             focused: false,
             selected: false,
@@ -329,6 +323,17 @@ mod tests {
         n
     }
 
+    fn framed(mut n: AxNode) -> AxNode {
+        n.frame = Some(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 10.0,
+                height: 10.0,
+            },
+        });
+        n
+    }
+
     #[test]
     fn only_actionable_nodes_get_a_handle() {
         let nodes = vec![
@@ -339,6 +344,26 @@ mod tests {
         assert!(out.contains("AXWindow \"Inbox\""));
         assert!(!out.contains("[0]"), "a window is context, not a target");
         assert!(out.contains("[1] AXButton \"Compose\""));
+    }
+
+    #[test]
+    fn an_actionless_framed_node_gets_a_pid_click_handle() {
+        let nodes = vec![
+            node(0, None, "AXWindow", Some("Chat")),
+            framed(node(1, Some(0), "AXButton", None)),
+        ];
+        let out = render_tree(&nodes, RenderOptions::default());
+        assert!(out.contains("[1] AXButton"), "got {out}");
+        assert!(nodes[1].actions.is_empty());
+        assert!(nodes[1].is_actionable());
+    }
+
+    #[test]
+    fn framed_layout_containers_do_not_get_click_handles() {
+        for role in ["AXWindow", "AXGroup", "AXToolbar", "AXTable"] {
+            let node = framed(node(0, None, role, None));
+            assert!(!node.is_actionable(), "{role} must remain context-only");
+        }
     }
 
     #[test]

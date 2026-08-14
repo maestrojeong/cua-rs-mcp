@@ -472,8 +472,8 @@ impl Element {
     /// directly instead of synthesizing keystrokes, so it does not depend on
     /// the app being frontmost or the field being focused. The trade-off is
     /// that it *replaces* rather than appends, and apps that only react to real
-    /// key events (canvas editors, terminals, games) will ignore it — which is
-    /// precisely the case a HID fallback exists for, one layer up.
+    /// key events (canvas editors, terminals, games) will ignore it. cua-rs
+    /// does not escalate those failures to shared keyboard input.
     pub fn set_string(&self, name: &str, value: &str) -> Result<()> {
         let key = CFString::from_str(name);
         let val = CFString::from_str(value);
@@ -971,8 +971,31 @@ impl AxNode {
 
     /// Whether this node can be acted on, i.e. whether it is worth showing to
     /// the agent as a target.
+    ///
+    /// A frame makes an otherwise actionless control addressable by index:
+    /// cua-core can bypass background-app AX hit-testing and route a SkyLight
+    /// click to this retained element's frame instead. Restrict that fallback
+    /// to control roles so framed layout containers do not flood the tree with
+    /// misleading handles.
     pub fn is_actionable(&self) -> bool {
-        self.enabled && !self.actions.is_empty()
+        const FRAME_CLICK_ROLES: &[&str] = &[
+            "AXButton",
+            "AXCheckBox",
+            "AXDisclosureTriangle",
+            "AXLink",
+            "AXMenuBarItem",
+            "AXMenuButton",
+            "AXMenuItem",
+            "AXPopUpButton",
+            "AXRadioButton",
+            "AXRow",
+            "AXCell",
+            "AXTab",
+        ];
+
+        self.enabled
+            && (!self.actions.is_empty()
+                || (self.frame.is_some() && FRAME_CLICK_ROLES.contains(&self.role.as_str())))
     }
 
     /// Whether the walk should continue into this node's children.

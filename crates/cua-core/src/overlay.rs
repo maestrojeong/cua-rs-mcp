@@ -25,11 +25,16 @@ impl Overlay {
 
     /// Move the drawn arrow to `(x, y)` in screen points (the same space
     /// `get_app_state` reports element frames in), flashing a click ring
-    /// when `clicking` is set. Spawns the overlay process on first call and
-    /// respawns it if it has died. Never blocks on anything but a pipe write.
-    pub(crate) fn mark(&self, x: f64, y: f64, clicking: bool) {
+    /// when `clicking` is set. `window_id` pins the overlay immediately above
+    /// that target window; without one the marker is hidden rather than shown
+    /// globally. Spawns the overlay process on first call and respawns it if it
+    /// has died. Never blocks on anything but a pipe write.
+    pub(crate) fn mark(&self, x: f64, y: f64, clicking: bool, window_id: Option<u32>) {
         let verb = if clicking { "click" } else { "move" };
-        self.send(&format!("{verb} {x} {y}\n"));
+        match window_id {
+            Some(window_id) => self.send(&format!("{verb} {x} {y} {window_id}\n")),
+            None => self.send("hide\n"),
+        }
     }
 
     fn send(&self, line: &str) {

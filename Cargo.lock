@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "cua-ax"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "libc",
  "objc2-application-services",
@@ -201,12 +201,11 @@ dependencies = [
 
 [[package]]
 name = "cua-capture"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "block2",
  "libc",
  "objc2",
- "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
@@ -217,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "cua-core"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "base64",
  "cua-ax",
@@ -235,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "cua-hid"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "cua-ax",
  "cua-capture",
@@ -251,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "cua-mcp"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -271,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "cua-overlay"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "objc2",
  "objc2-app-kit",

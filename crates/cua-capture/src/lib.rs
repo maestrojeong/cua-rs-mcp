@@ -1,4 +1,4 @@
-//! Per-window screen capture via ScreenCaptureKit.
+//! Crash-isolated per-window screen capture on macOS.
 //!
 //! # Why not `CGWindowListCreateImage`
 //!
@@ -8,10 +8,11 @@
 //! the window server has actually composited, so a window that is occluded,
 //! minimized, or on another Space comes back blank or stale.
 //!
-//! ScreenCaptureKit asks the *owning app* to render the window instead. A
-//! background window that the human has completely covered with something else
-//! still captures correctly, which is the entire premise of an agent that works
-//! alongside you rather than taking over your screen.
+//! ScreenCaptureKit is still used to enumerate stable window identities and
+//! frames. Pixel capture is delegated by window id to macOS's one-shot
+//! `/usr/sbin/screencapture` process. This preserves background/off-Space
+//! capture while putting a process boundary around WindowServer assertions:
+//! malformed transient window state can fail one screenshot, not the MCP server.
 //!
 //! # Why per-window and not full-screen
 //!
@@ -31,18 +32,21 @@
 //! produces clicks that land at half or double the intended offset, so the
 //! scale is captured per shot rather than assumed.
 
+use std::fs;
+use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
-use objc2::AnyThread;
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
-use objc2_core_foundation::{CFRetained, CGRect};
-use objc2_core_graphics::{CGImage, CGWindowID};
-use objc2_foundation::{NSDictionary, NSError};
-use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
-};
+use objc2_core_foundation::CGRect;
+use objc2_core_graphics::CGWindowID;
+use objc2_foundation::NSError;
+use objc2_screen_capture_kit::SCShareableContent;
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -64,6 +68,20 @@ pub enum CaptureError {
     #[error("screen capture failed: {0}")]
     Failed(String),
 
+    #[error("window {window_id} has an invalid transient frame ({x}, {y}, {width} x {height}); retry after the app finishes rebuilding its windows")]
+    InvalidFrame {
+        window_id: CGWindowID,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+
+    /// Window capture is deliberately delegated to a one-shot macOS process so
+    /// framework assertions cannot terminate the persistent MCP server.
+    #[error("isolated screen-capture worker failed: {0}")]
+    WorkerFailed(String),
+
     #[error("could not encode the captured image as PNG")]
     Encode,
 }
@@ -75,6 +93,9 @@ pub type Result<T> = std::result::Result<T, CaptureError>;
 /// Generous, because the first call in a process pays for SCK's one-time setup
 /// and the target app has to render a frame on demand.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const CAPTURE_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 // ── permission ───────────────────────────────────────────────────────────────
 
@@ -195,81 +216,174 @@ pub fn capture_window(window_id: CGWindowID, max_dim: u32) -> Result<WindowShot>
         return Err(CaptureError::NotPermitted);
     }
 
-    let content = shareable_content()?;
-    let windows = unsafe { content.windows() };
-    let target = windows
-        .iter()
-        .find(|w| unsafe { w.windowID() } == window_id)
-        .ok_or(CaptureError::WindowGone(window_id))?;
-
-    let frame = unsafe { target.frame() };
-    let shot = capture_sc_window(&target, frame, max_dim)?;
-    Ok(shot)
-}
-
-fn capture_sc_window(window: &SCWindow, frame: CGRect, max_dim: u32) -> Result<WindowShot> {
-    // `initWithDesktopIndependentWindow` is the filter that makes occluded and
-    // off-Space windows capture correctly: it asks for that window's content in
-    // isolation, rather than a crop out of the composited desktop.
-    let filter = unsafe {
-        SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), window)
-    };
-
-    let config = unsafe { SCStreamConfiguration::new() };
-
-    // Ask for the window at its backing-store resolution, then clamp. Requesting
-    // point dimensions would hand back a soft, half-resolution image on Retina
-    // and make small UI text unreadable to a vision model.
-    let scale = unsafe { SCShareableContent::infoForFilter(&filter) };
-    let point_scale = unsafe { scale.pointPixelScale() } as f64;
-    let native_w = (frame.size.width * point_scale).round().max(1.0);
-    let native_h = (frame.size.height * point_scale).round().max(1.0);
-
-    let (px_w, px_h) = clamp_dimensions(native_w, native_h, max_dim);
-    unsafe {
-        config.setWidth(px_w as usize);
-        config.setHeight(px_h as usize);
-        // The agent's cursor is not the human's cursor, and drawing one implies
-        // a pointer position that means nothing in an AX-driven session.
-        config.setShowsCursor(false);
-        // Shadows are transparent padding around the frame. Keeping them would
-        // offset every pixel coordinate relative to the AX frame.
-        config.setIgnoreShadowsSingleWindow(true);
+    // Re-enumerate immediately before capture. Besides providing the live
+    // frame, this rejects a closed/recycled window before invoking a tool.
+    let frame = list_windows()?
+        .into_iter()
+        .find(|window| window.id == window_id)
+        .ok_or(CaptureError::WindowGone(window_id))?
+        .frame;
+    if !valid_capture_frame(frame) {
+        return Err(CaptureError::InvalidFrame {
+            window_id,
+            x: frame.origin.x,
+            y: frame.origin.y,
+            width: frame.size.width,
+            height: frame.size.height,
+        });
     }
 
-    let image = capture_image_blocking(&filter, &config)?;
-    let png = encode_png(&image)?;
+    let temp = CaptureTempDir::new()?;
+    let png_path = temp.path.join("window.png");
+    let mut capture = Command::new("/usr/sbin/screencapture");
+    capture
+        .arg("-x")
+        .arg("-o")
+        .arg(format!("-l{window_id}"))
+        .arg(&png_path);
+    run_capture_process(capture, "screencapture")?;
+
+    let mut png = fs::read(&png_path)
+        .map_err(|e| CaptureError::Failed(format!("could not read captured PNG: {e}")))?;
+    let (mut width, mut height) = png_dimensions(&png)?;
+    if max_dim > 0 && width.max(height) > max_dim {
+        let mut resize = Command::new("/usr/bin/sips");
+        resize
+            .arg("--resampleHeightWidthMax")
+            .arg(max_dim.to_string())
+            .arg(&png_path);
+        run_capture_process(resize, "sips")?;
+        png = fs::read(&png_path)
+            .map_err(|e| CaptureError::Failed(format!("could not read resized PNG: {e}")))?;
+        (width, height) = png_dimensions(&png)?;
+    }
 
     Ok(WindowShot {
         png,
-        width: px_w,
-        height: px_h,
-        // Derived from what we actually got, not from what we asked for, so a
-        // clamp or an SCK adjustment cannot desynchronize the mapping.
-        scale: if frame.size.width > 0.0 {
-            px_w as f64 / frame.size.width
-        } else {
-            point_scale
-        },
+        width,
+        height,
+        scale: width as f64 / frame.size.width,
         frame,
     })
 }
 
-/// Fit `(w, h)` inside a `max_dim` box, preserving aspect ratio.
-fn clamp_dimensions(w: f64, h: f64, max_dim: u32) -> (u32, u32) {
-    if max_dim == 0 {
-        return (w.max(1.0) as u32, h.max(1.0) as u32);
+fn valid_capture_frame(frame: CGRect) -> bool {
+    [
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        && frame.size.width > 0.0
+        && frame.size.height > 0.0
+}
+
+struct CaptureTempDir {
+    path: PathBuf,
+}
+
+impl CaptureTempDir {
+    fn new() -> Result<Self> {
+        for _ in 0..16 {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("cua-rs-capture-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(CaptureError::Failed(format!(
+                        "could not create capture temp directory: {error}"
+                    )))
+                }
+            }
+        }
+        Err(CaptureError::Failed(
+            "could not allocate a unique capture temp directory".into(),
+        ))
     }
-    let max = max_dim as f64;
-    let longest = w.max(h);
-    if longest <= max {
-        return (w.max(1.0) as u32, h.max(1.0) as u32);
+}
+
+impl Drop for CaptureTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
-    let k = max / longest;
-    (
-        ((w * k).round().max(1.0)) as u32,
-        ((h * k).round().max(1.0)) as u32,
-    )
+}
+
+fn run_capture_process(mut command: Command, name: &str) -> Result<()> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CaptureError::WorkerFailed(format!("could not start {name}: {e}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CaptureError::WorkerFailed(format!("{name} stderr pipe missing")))?;
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < CAPTURE_PROCESS_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(CaptureError::Timeout(CAPTURE_PROCESS_TIMEOUT));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(CaptureError::WorkerFailed(format!(
+                    "could not observe {name}: {error}"
+                )));
+            }
+        }
+    };
+
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| CaptureError::WorkerFailed(format!("{name} stderr reader panicked")))?
+        .map_err(|e| CaptureError::WorkerFailed(format!("could not read {name} stderr: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    let detail = status.signal().map_or_else(
+        || format!("exited with status {}", status.code().unwrap_or(-1)),
+        |signal| format!("terminated by signal {signal}"),
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    let stderr = stderr.trim();
+    Err(CaptureError::WorkerFailed(if stderr.is_empty() {
+        format!("{name} {detail}")
+    } else {
+        format!("{name} {detail}: {stderr}")
+    }))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return Err(CaptureError::Encode);
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("four bytes"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("four bytes"));
+    if width == 0 || height == 0 {
+        return Err(CaptureError::Encode);
+    }
+    Ok((width, height))
 }
 
 // ── ObjC async bridging ──────────────────────────────────────────────────────
@@ -323,50 +437,6 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
     }
 }
 
-/// Run `SCScreenshotManager`'s async capture synchronously.
-fn capture_image_blocking(
-    filter: &SCContentFilter,
-    config: &SCStreamConfiguration,
-) -> Result<CFRetained<CGImage>> {
-    let (tx, rx) = mpsc::channel::<std::result::Result<usize, String>>();
-
-    // Same `usize` handoff as `shareable_content`, for the same reason: the
-    // callback lands on an SCK queue and `CFRetained` is not `Send`.
-    let block = block2::RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
-        let msg = if error.is_null() {
-            None
-        } else {
-            Some(unsafe { &*error }.localizedDescription().to_string())
-        };
-        let payload = match (std::ptr::NonNull::new(image), msg) {
-            (Some(nn), _) => {
-                let retained = unsafe { CFRetained::retain(nn) };
-                Ok(CFRetained::into_raw(retained).as_ptr() as usize)
-            }
-            (None, Some(m)) => Err(m),
-            (None, None) => Err("ScreenCaptureKit returned no image".to_string()),
-        };
-        let _ = tx.send(payload);
-    });
-
-    unsafe {
-        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            filter,
-            config,
-            Some(&block),
-        );
-    }
-
-    match rx.recv_timeout(CAPTURE_TIMEOUT) {
-        Ok(Ok(ptr)) => {
-            let nn = std::ptr::NonNull::new(ptr as *mut CGImage).ok_or(CaptureError::Encode)?;
-            Ok(unsafe { CFRetained::from_raw(nn) })
-        }
-        Ok(Err(msg)) => Err(classify(msg)),
-        Err(_) => Err(CaptureError::Timeout(CAPTURE_TIMEOUT)),
-    }
-}
-
 /// Map an SCK error string onto a typed error.
 ///
 /// SCK reports a missing Screen Recording grant as a generic
@@ -384,46 +454,48 @@ fn classify(msg: String) -> CaptureError {
     }
 }
 
-// ── encoding ─────────────────────────────────────────────────────────────────
-
-/// Encode a `CGImage` as PNG.
-///
-/// `NSBitmapImageRep` is used rather than `CGImageDestination` purely because it
-/// keeps this crate off a second image-IO binding; the output is the same
-/// PNG. PNG rather than JPEG because UI screenshots are large flat-color regions
-/// and crisp text, where PNG is both smaller and lossless — JPEG ringing around
-/// glyphs is exactly the artifact that makes a vision model misread a label.
-fn encode_png(image: &CGImage) -> Result<Vec<u8>> {
-    let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), image);
-    let props = NSDictionary::new();
-    let data =
-        unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }
-            .ok_or(CaptureError::Encode)?;
-    Ok(data.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn clamp_preserves_aspect_ratio_and_respects_the_box() {
-        // Landscape, over budget.
-        assert_eq!(clamp_dimensions(3000.0, 1500.0, 1500), (1500, 750));
-        // Portrait, over budget: the *longest* side is what gets clamped.
-        assert_eq!(clamp_dimensions(1000.0, 4000.0, 1000), (250, 1000));
-        // Already inside the box: left exactly alone, never upscaled.
-        assert_eq!(clamp_dimensions(800.0, 600.0, 1500), (800, 600));
-        // Disabled.
-        assert_eq!(clamp_dimensions(4000.0, 3000.0, 0), (4000, 3000));
+    fn invalid_transient_frames_are_rejected_before_capture() {
+        let frame = |x, y, width, height| CGRect {
+            origin: objc2_core_foundation::CGPoint { x, y },
+            size: objc2_core_foundation::CGSize { width, height },
+        };
+        assert!(valid_capture_frame(frame(-100.0, 20.0, 800.0, 600.0)));
+        assert!(!valid_capture_frame(frame(0.0, 0.0, 0.0, 600.0)));
+        assert!(!valid_capture_frame(frame(0.0, 0.0, 800.0, -1.0)));
+        assert!(!valid_capture_frame(frame(f64::NAN, 0.0, 800.0, 600.0)));
+        assert!(!valid_capture_frame(frame(
+            0.0,
+            f64::INFINITY,
+            800.0,
+            600.0
+        )));
     }
 
     #[test]
-    fn clamp_never_returns_a_zero_dimension() {
-        // A sliver window must not encode to a zero-width image, which would
-        // make PNG encoding fail rather than produce a useless-but-valid shot.
-        let (w, h) = clamp_dimensions(2000.0, 1.0, 100);
-        assert!(w >= 1 && h >= 1, "got {w}x{h}");
+    fn png_dimensions_read_ihdr_without_decoding_pixels() {
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&1200_u32.to_be_bytes());
+        png.extend_from_slice(&800_u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png).unwrap(), (1200, 800));
+        assert!(png_dimensions(b"not a png").is_err());
+    }
+
+    #[test]
+    fn a_crashing_capture_process_becomes_an_error() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("kill -ABRT $$");
+        let error = run_capture_process(command, "crash-probe").unwrap_err();
+        assert!(
+            error.to_string().contains("signal 6"),
+            "unexpected error: {error}"
+        );
+        // Reaching this assertion is the contract: the persistent Rust process
+        // survived an abort in its disposable capture boundary.
     }
 
     #[test]

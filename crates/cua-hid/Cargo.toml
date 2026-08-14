@@ -1,6 +1,6 @@
 [package]
 name = "cua-hid"
-description = "Opt-in HID event synthesis for cua-rs. The only crate here that can move the cursor."
+description = "Process-routed macOS input synthesis for cua-rs, plus diagnostic probes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

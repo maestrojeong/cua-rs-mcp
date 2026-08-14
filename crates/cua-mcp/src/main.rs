@@ -104,17 +104,8 @@ async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // `--allow-hid` is a start-time flag, never a per-call argument: the point is
-    // that a human decides once whether this server may ever touch the shared
-    // cursor. An agent must not be able to grant itself the capability.
-    let allow_hid = std::env::args().any(|a| a == "--allow-hid");
-
-    // Two separate questions, kept separate. `mode` is the first *recognized*
-    // argument, flag or not, so `--help` still prints help even though it starts
-    // with dashes; `bind` is the first argument that is not a flag at all, so
-    // `cua-rs --allow-hid 9331` binds a port rather than trying to serve on a
-    // host named "--allow-hid".
     let args: Vec<String> = std::env::args().skip(1).collect();
+
     let mode = args
         .iter()
         .find(|a| {
@@ -141,19 +132,9 @@ fn main() -> anyhow::Result<()> {
                        cua-rs                 serve MCP over stdio (default)\n  \
                        cua-rs <port|addr>     serve Streamable HTTP on loopback\n  \
                        cua-rs permissions     print grant status and exit\n\n\
-                     OPTIONS:\n  \
-                       --allow-hid            permit two real-input fallbacks that the\n                         \
-                                              accessibility API cannot express on its own:\n                         \
-                                              (1) key chords (cmd+shift+p, f5) via the shared\n                         \
-                                              HID stream -- THIS MOVES THE CURSOR and takes\n                         \
-                                              keyboard focus, reported as delivery: hid; and\n                         \
-                                              (2) a click on an element with no AXPress/\n                         \
-                                              AXPick/AXConfirm verb (custom-drawn rows), by\n                         \
-                                              warping the real pointer there and back -- THIS\n                         \
-                                              MOVES THE CURSOR too, also reported as\n                         \
-                                              delivery: hid, and refused when those screen\n                         \
-                                              coordinates do not currently belong to the\n                         \
-                                              target app. Both off by default.\n\n\
+                     CLICK DELIVERY:\n  \
+                       AXPress/AXPick/AXConfirm first; custom-drawn controls use\n                         \
+                       process-routed SkyLight events. Neither path moves the cursor.\n\n\
                      Requires Accessibility, and Screen Recording for screenshots.",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -170,31 +151,30 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        anyhow::bail!("unknown option `{flag}`; run cua-rs --help");
+    }
+
     tracing_subscriber::fmt()
         // Default to `info` rather than `off`: the startup permission warnings
         // are aimed at the human, and a silent server that cannot act because a
         // grant is missing is the single most confusing way this can fail.
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("cua_rs=info,cua_mcp=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // `cua_hid` belongs here too. It is the crate that reports when a
+                // synthesized click had to give up waiting for the target to
+                // agree it is frontmost — the one signal that distinguishes "the
+                // activation notices work and cost nothing" from "they do
+                // nothing and every click pays the full budget". Leaving it out
+                // of the default filter made that warning unreachable in a
+                // server nobody sets RUST_LOG on, which is every server.
+                tracing_subscriber::EnvFilter::new("cua_rs=info,cua_mcp=info,cua_hid=info")
+            }),
         )
         // stdout is the MCP transport on the stdio path; anything written there
         // that is not a JSON-RPC frame corrupts the session.
         .with_writer(std::io::stderr)
         .init();
-
-    cua_core::allow_hid(allow_hid);
-    if allow_hid {
-        // Loud, because it silently changes the server's central promise. Anyone
-        // reading logs to work out why their cursor jumped should find this.
-        tracing::warn!(
-            "--allow-hid is ON: press_key may synthesize real key events for chords the \
-             accessibility API cannot express (delivery: hid; MOVES THE CURSOR and takes \
-             keyboard focus), and click may fall back to warping the real pointer onto an \
-             unresponsive element, clicking, and warping it back (delivery: hid; MOVES THE \
-             CURSOR for a frame)."
-        );
-    }
 
     let cua = Arc::new(Cua::new());
     warn_about_permissions(&cua);

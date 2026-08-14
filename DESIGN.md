@@ -48,6 +48,14 @@ flag, it is the absence of that code. All 29 AX symbols they link are available
 in the public `objc2-application-services` crate, which is what made an
 independent implementation viable in the first place.
 
+This table documents Codex's *input* path: it posts events through public
+CoreGraphics/IOHID APIs and never raises a window. cua-rs keeps that public-API
+path as its reliable click tier, but it additionally ports one piece of private
+SPI for a *quieter* tier — the SkyLight `SLEventPostToPid` recipe, dlopened
+lazily and confined to `cua-hid` (see the end of §6). That is a deliberate,
+documented reversal of the "no private API" rule; if the framework cannot be
+loaded, the click fails explicitly rather than falling back to shared input.
+
 ### The cost, stated plainly
 
 AX cannot express everything:
@@ -74,24 +82,17 @@ Three options, none free:
 
 1. **`AXUIElementPostKeyboardEvent`** — app-scoped, in the crate, deprecated, no
    modifier-chord support. OpenAI does not link it. Rejected.
-2. **Ship no `press_key`** — what OpenAI effectively did. Leaves the most-asked-for
-   capability missing. Rejected.
-3. **AX where a verb exists, HID behind an explicit flag otherwise.** Chosen.
+2. **AX-only `press_key`** — background-safe semantic verbs remain; arbitrary
+   chords are refused. Chosen in 0.3.1.
+3. **AX where a verb exists, HID behind an explicit flag otherwise.** Removed
+   in 0.3.1 because the flag also enabled shared-pointer fallback.
 
 So `press_key` maps `return`/`enter` to `AXConfirm`, `escape` to `AXCancel`, and
 `up`/`down` to `AXIncrement`/`AXDecrement`. Those stay in the background. Anything
-else — every chord, every letter — requires starting the server with
-`--allow-hid`, and the result then says `delivery: hid`.
+else — every chord, every letter — is refused.
 
-Three properties make this safe rather than a loophole:
-
-- **The flag is start-time, not per-call.** If it were an argument, an agent
-  could grant itself the capability. A human decides once, at launch.
-- **The marker is on every result**, not just HID ones, so `delivery: ax` is a
-  positive assertion rather than an absence to be inferred.
-- **The code is in its own crate.** `cua-hid` is the only place `CGEventPost`
-  appears, and `cua-ax`/`cua-capture` do not depend on it. The boundary is
-  enforced by the dependency graph, not by a comment.
+Every successful key action therefore reports `delivery: ax`; there is no
+shared keyboard-input delivery mode.
 
 One subtlety worth recording, because it produced a self-contradicting error
 message before it was fixed: a key can *have* an AX verb that the *target element*
@@ -104,14 +105,19 @@ button).
 
 ---
 
-## 2. Why ScreenCaptureKit and not `CGWindowListCreateImage`
+## 2. Why isolated window capture and not `CGWindowListCreateImage`
 
 `CGWindowListCreateImage` returns what the window server composited. A window
 the user has covered comes back blank or stale — precisely the window an agent
 working in the background is driving.
 
-ScreenCaptureKit asks the *owning app* to render. Occluded and off-Space windows
-capture correctly.
+ScreenCaptureKit supplies the live window identity and frame. The PNG itself is
+requested by `CGWindowID` through macOS's `/usr/sbin/screencapture` in a
+one-shot process; measured visible and off-Space windows both capture correctly.
+The process boundary is mandatory because `SCContentFilter` can reach an
+unrecoverable SkyLight assertion when an app rebuilds a window and briefly
+publishes an invalid rect. A Rust `Result`, panic boundary, or preflight cannot
+catch that `SIGABRT` or close the validation/use race.
 
 Two secondary reasons:
 
@@ -119,12 +125,14 @@ Two secondary reasons:
   human's unrelated windows; downscaled to fit a vision model, the target app's
   text is illegible. It also means screenshots do not exfiltrate whatever else
   was on screen.
-- **One TCC prompt.** In-process SCK avoids the extra Screen Recording prompt
-  that shelling out to `screencapture` per capture would trip.
+- **Server survival.** The system capture process inherits the responsible
+  host's Screen Recording authorization. If WindowServer rejects a transient
+  window, only that disposable process fails and the MCP server returns a
+  screenshot warning while preserving the AX tree and connection.
 
-Captures are requested at backing-store resolution, then clamped
-(`max_image_dim`, default 1400). Asking for point dimensions instead yields a
-soft half-resolution image on Retina where small UI text becomes unreadable.
+Captures are requested at backing-store resolution, then clamped with macOS
+`sips` (`max_image_dim`, default 1400). Asking for point dimensions instead
+yields a soft half-resolution image on Retina where small UI text becomes unreadable.
 `WindowShot::scale` is derived from what came back rather than what was asked
 for, so a clamp cannot desynchronize point↔pixel mapping.
 
@@ -350,6 +358,52 @@ Trade-off, accepted deliberately: slightly fuzzier than the SPI, but it cannot
 break on a macOS update. Tolerant comparison is required because AX reports
 points while SCK's numbers can drift a pixel or two mid-animation.
 
+### Input synthesis and the SkyLight SPI
+
+The private-API rule above is about *identifying* a window. There is one
+deliberate exception, for a different job: *input synthesis*. The quiet click
+tier (after the AX tier) routes a click to a
+specific process without moving the cursor, by porting cua-driver's SkyLight
+`SLEventPostToPid` recipe — the only route that reaches custom-drawn and
+background controls that AX cannot express and that must not be clicked by
+warping the pointer over whatever is on top.
+
+The tradeoff is explicit and bounded:
+
+- **Confined to `cua-hid`.** `cua-ax` and `cua-capture` never touch it, so the
+  "does not steal focus / does not warp the cursor" claims of the AX and
+  capture paths stay exactly as strong as they were.
+- **Lazy and fail-closed.** The framework is `dlopen`ed at first use and every
+  symbol is `dlsym`ed. PID delivery is enabled only when posting, private field
+  stamping, and window-local positioning are all available; a partial recipe
+  returns an error rather than claiming an unpinned event succeeded. No
+  link-time dependency, no hard crash surface.
+- **No shared-input fallback.** Its results are tagged `delivery: pid`, distinct
+  from `ax`. If the SPI is unavailable, the action fails; it never warps the
+  pointer or posts to the shared keyboard stream.
+- **Synthesized activation, never real activation.** `NSRunningApplication.activate`
+  is still never called: it can divert a physical keystroke even without a window
+  raise, and if the target's windows live on another Space macOS switches Spaces
+  under the user. What *is* sent is an `NSEventTypeAppKitDefined` event with
+  subtype `ApplicationActivated`, posted into the target's own event queue and
+  balanced by `ApplicationDeactivated` after the click. The window server's key
+  focus never changes, so the user's typing keeps going where it was going; only
+  the target's private idea of "am I active" moves, for the duration of the
+  click. This reverses an earlier "no focus assist at all" stance, which was
+  measured to be the reason clicks on views that gate on `NSApp.isActive` — a
+  chat app's conversation rows being the case that forced the issue — silently
+  did nothing. The residual risk is second-order and app-specific: an app whose
+  own activation handler calls `activateIgnoringOtherApps:` could turn the notice
+  into a real raise. No such app has been observed, and the alternative was a
+  click path that provably did not work.
+- **No duplicate post.** Each stamped event is sent exactly once through
+  `SLEventPostToPid`; the public process-post route is retained only as a probe.
+- **Last-moment window validation.** Before posting, the captured window id must
+  still belong to the same pid and contain the live AX activation point. Its
+  current frame, not the snapshot frame, determines window-local coordinates.
+- **Not window identity.** It does not weaken the §6 conclusion: this crate
+  still never calls `_AXUIElementGetWindow`.
+
 ---
 
 ## 7. TCC and distribution — the actual hard problem
@@ -429,13 +483,11 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 - [ ] launched from a different host app → grants do not carry over
 
 **Coexistence — the point of the project**
-- [x] cursor does not move during any action **on the AX path** (Chrome,
+- [x] cursor does not move during any action on the AX path (Chrome,
       verified byte-identical `CGEvent(source: nil).location` before and after
       `AXPress`)
-- [x] the `--allow-hid` click fallback *does* move the cursor, and restores it —
-      this is the one place the coexistence property is traded away on purpose,
-      for elements no accessibility action can reach (KakaoTalk conversation
-      rows, measured)
+- [ ] pid-routed click leaves cursor byte-identical before and after on custom
+      controls (0.3.1 live verification pending)
 - [x] frontmost app unchanged after `click` (Terminal stayed frontmost)
 - [x] tree is identical whether the target is frontmost or occluded — Chrome
       413/413, Finder 4/4, Slack 367/373 (+6 = focus ring). See §5.
@@ -470,6 +522,61 @@ or verified live
 
 ---
 
+## 8b. Calibration against a shipping implementation
+
+macOS ships a working, signed instance of exactly this problem: OpenAI's
+`SkyComputerUseService` (`com.openai.sky.CUAService`), the native helper behind
+Codex's Computer Use. Its `AccessibilitySupport` and `ComputerUse` Swift modules
+were read symbol-by-symbol from a full decompilation and used as ground truth for
+the input path. What follows is what differed, and what was changed here as a
+result.
+
+| | reference (`SkyComputerUseService`) | cua-rs before | now |
+|---|:--|:--|:--|
+| mouse event construction | `-[NSEvent mouseEventWithType:…eventNumber:clickCount:pressure:]` → `-[NSEvent CGEvent]` | `CGEventCreateMouseEvent`, private fields patched on afterwards | matches reference |
+| event number | monotonic `SynthesizedEvent.nextEventNumber`, one per down/up pair | never set, so always 0 | monotonic counter in `cua-hid::nsevent` |
+| click count | `clickCount:` argument, counting up across a gesture | `kCGMouseEventClickState` stamped after the fact | carried by the `NSEvent` header |
+| window identity | `windowNumber:` argument | field 51 stamped after the fact | carried by the `NSEvent` header |
+| timestamp | `setTimestamp(DispatchTime.now().uptimeNanoseconds)` immediately before each post | never set | `CLOCK_UPTIME_RAW`, read immediately before each post |
+| activation | `SyntheticAppFocusEnforcer.enforceActiveState(for:)` + synthesized `notifyAppActivated` / `notifyAppDeactivated` | none, by policy | synthesized `ApplicationActivated`/`Deactivated` notices; real activation still refused |
+| waiting for activation to land | `waitUntilAppBelievesItIsFrontmost(2.0)`, polled | fixed 12 ms sleep | polls the target's `AXFrontmost` to the same 2 s ceiling |
+| keeping a background menu open | `clickEventTap: EventTap?` + `startSuppressingMenuDismissalEvents(menuPID:)` / `stopSuppressingMenuDismissalEvents()` | none | not built — see §10 |
+| post route | public `CGEventPostToPid` | private `SLEventPostToPid` | unchanged — see below |
+| keyboard | `CGEventCreateKeyboardEvent` + `keyboardSetUnicodeString`, posted per-pid | global HID tap only; arbitrary keys refused outright | per-pid path written, gated (see §10) |
+| cursor feedback | `ComputerUseCursor`, a spring-animated overlay window; the visible "mouse" is drawn, not the system pointer | none | not built |
+
+Three of these deserve more than a table row.
+
+**The construction order was backwards, and that was the bug.** A `CGEvent`
+synthesized from scratch has no AppKit identity: `-[NSEvent eventNumber]` reads
+back 0, the window number is 0, `-[NSEvent window]` is nil. Custom-drawn
+`NSView`s that hit-test and count clicks themselves read those and conclude the
+event is not a real click. Stamping the private fields afterwards does not help,
+because AppKit rebuilds its `NSEvent` from the event record's own header rather
+than from fields a caller patched in. Building the `NSEvent` first inverts the
+dependency: AppKit fills in the header it will later validate. The measured
+symptom this explains is a chat app's conversation-list row accepting a click
+from the reference implementation and ignoring an otherwise identical one from
+here.
+
+**The public post route works.** The reference uses `CGEventPostToPid`, the very
+call §1 and `post_click_to_pid` record as non-functional. Both observations can
+be true at once: the earlier measurement posted an event that was missing the
+AppKit header, the fresh timestamp, and the activation notice, so it is not
+evidence about the route. `SLEventPostToPid` is kept for now because it is what
+the current recipe was verified against, but the private-SPI dependency is no
+longer *justified* by the public route failing, and dropping it is a live option.
+
+**The visible cursor is a lie, in both implementations.** The reference's
+`createVirtualCursorIfNeeded` builds a `ComputerUseCursor` — an overlay window
+with its own spring-physics parameters (`springResponseScaler`,
+`scootStretchResponse`, `springDampingFraction`). What a user watching the screen
+sees glide across and click is that overlay, not the system pointer, which never
+moves. This matters for calibration: "OpenAI's version moves the real mouse and
+that is why it works" is false, and the actual difference was the event header.
+
+---
+
 ## 9. Deliberately not built
 
 | | Why |
@@ -501,3 +608,33 @@ the obvious next safety feature.
 
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.
+
+**Menu-opening controls are still unsolved, and the reason is now known.**
+A chat app's header menu button ignored a pid-routed click that the *same
+coordinates* accepted from the reference implementation — measured against
+KakaoTalk's chat-room hamburger at screen (810, 103), which the reference clicked
+successfully with the target app in the background, so neither the coordinate nor
+real activation is the missing ingredient. Two things separate the two paths. The
+first is now fixed: nothing waited for the synthesized activation notice to be
+drained by the target's run loop, so the mouse-down raced the app's own
+`NSApp.isActive` flip. The second is not: a menu opened in a background app is
+dismissed almost immediately, and the reference keeps it alive with a
+`CGEventTap` (`startSuppressingMenuDismissalEvents(menuPID:)`) that swallows the
+events which would close it. Building that means installing a tap on the user's
+real input stream, which is the boundary §9 draws deliberately — so it is a
+design decision, not a task. Until it is taken, treat menus as observable but not
+operable, and note that `AXShowMenu` via `perform_secondary_action` reaches some
+of the same controls without any of this machinery.
+
+**The per-pid keyboard path is written but unproven.**
+`press_chord_background_pid` and `type_text_background_pid` exist in `cua-hid`
+and nothing calls them. They follow the reference implementation's construction
+(`CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
+`CGEventKeyboardSetUnicodeString` for characters with no keycode, posted per-pid),
+which invalidates this crate's founding assumption that keyboard input must go
+through the global tap and steal focus. They stay gated because a keystroke that
+lands in the wrong process is far worse than a click that does not land: it types
+into whatever the user is editing. Verifying them needs the same
+control-and-measure treatment the click path got, against a target where a miss
+is unambiguous. Until then `press_key` remains AX-only and `post_chord` remains
+the honest, focus-stealing fallback.

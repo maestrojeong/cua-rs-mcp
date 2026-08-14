@@ -11,7 +11,7 @@
 //!   `#[tool]` macros from types. A renamed field or a tool that stops being
 //!   registered is invisible until an agent calls it and fails, and no unit test
 //!   covers the wiring between the arg structs and the router.
-//! - **The HID refusal.** `press_key` rejecting a chord without `--allow-hid` is
+//! - **The HID refusal.** `press_key` permanently rejecting a chord is
 //!   the project's central safety property. It is enforced before any AX call, so
 //!   it is reachable and assertable with no permissions at all.
 
@@ -174,7 +174,7 @@ fn every_action_tool_accepts_a_snapshot_id() {
 }
 
 #[test]
-fn a_chord_is_refused_without_allow_hid() {
+fn a_chord_is_refused_without_a_shared_hid_escape_hatch() {
     // Reachable with no grants: the refusal happens before any AX call.
     let responses = talk(
         &[],
@@ -190,9 +190,20 @@ fn a_chord_is_refused_without_allow_hid() {
     );
     let text = call_text(&responses, 3);
     assert!(
-        text.contains("--allow-hid"),
-        "the refusal must name the flag that would permit it: {text}"
+        text.contains("does not synthesize shared HID"),
+        "the refusal must make the no-HID contract explicit: {text}"
     );
+}
+
+#[test]
+fn removed_allow_hid_option_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cua-rs"))
+        .arg("--allow-hid")
+        .output()
+        .expect("start cua-rs");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown option `--allow-hid`"), "{stderr}");
 }
 
 #[test]

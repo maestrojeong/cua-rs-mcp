@@ -165,10 +165,8 @@ pub fn frontmost_pid() -> Option<libc::pid_t> {
 /// This is `NSRunningApplication.activate`, not an event: no cursor moves and
 /// nothing is typed. It still changes what the human is looking at — and if
 /// the app's windows live on another Space, macOS switches Spaces — so it is
-/// never called on the AX path. Its one caller is the pointer-warp click
-/// fallback, which is already about to move the real pointer and therefore
-/// cannot avoid disturbing the user anyway; there, foregrounding is what makes
-/// the click land on the intended window instead of whatever is on top of it.
+/// never called by the MCP action paths. It remains available for the explicit
+/// `activate_probe` diagnostic.
 ///
 /// Returns whether AppKit accepted the request. Activation is asynchronous
 /// either way, so callers must poll for the state they actually need rather

@@ -62,91 +62,44 @@ pub enum CoreError {
     #[error("no snapshot for `{app}` yet. Call get_app_state first")]
     NoSnapshot { app: String },
 
+    #[error("the process behind `{app}` changed since this snapshot was taken. Call get_app_state again; cached native element handles cannot cross an app relaunch")]
+    ProcessReplaced { app: String },
+
     #[error("element_index {index} is out of range (the snapshot has {count} elements)")]
     BadIndex { index: usize, count: usize },
 
-    #[error("`{app}` has no window that can be captured or driven right now")]
+    #[error("`{app}` has no accessibility window that cua-rs can drive right now. Verify Accessibility is granted to the process that launched cua-rs, then retry after the app has finished opening. Some apps, including KakaoTalk, temporarily expose no AXWindows while backgrounded; opening a conversation once and retrying can make its tree available. Call check_permissions and list_apps to distinguish a permission or process-discovery problem")]
     NoWindow { app: String },
 
-    /// A key was requested that only a real key event can deliver, but the
-    /// server was not started with `--allow-hid`.
-    ///
-    /// Deliberately not a silent fallback: synthesizing the event would move the
-    /// user's cursor and steal their focus, which is the one thing this server
-    /// promises not to do. The operator, not the agent, decides to allow it.
-    #[error("`{key}` has no accessibility equivalent, so it can only be sent as a real key event. That moves the cursor and steals keyboard focus, so it requires starting the server with --allow-hid. Alternatives that stay in the background: return/enter and escape on an element that accepts AXConfirm/AXCancel, perform_secondary_action with AXShowMenu for a context menu, or clicking the menu item directly")]
-    HidRefused { key: String },
+    /// The requested key has no element-addressed accessibility equivalent.
+    #[error("`{key}` has no accessibility equivalent. cua-rs does not synthesize shared HID keyboard input because it would steal keyboard focus. Background-safe alternatives: return/enter and escape on an element that accepts AXConfirm/AXCancel, perform_secondary_action with AXShowMenu for a context menu, or clicking the menu item directly")]
+    KeyNoAccessibilityEquivalent { key: String },
 
     /// The key has an AX verb, but this particular element does not accept it.
     ///
-    /// Kept distinct from [`CoreError::HidRefused`] so the message cannot
+    /// Kept distinct from [`CoreError::KeyNoAccessibilityEquivalent`] so the message cannot
     /// contradict itself by naming the very key it just refused as one that
     /// works.
-    #[error("`{key}` maps to the accessibility verb {verb}, but this element does not accept it (it supports {available}). {verb} usually lives on the window or the dialog's default button, not on an inner control — target that instead, or start the server with --allow-hid to send a real key event")]
+    #[error("`{key}` maps to the accessibility verb {verb}, but this element does not accept it (it supports {available}). {verb} usually lives on the window or the dialog's default button, not on an inner control — target that instead")]
     KeyVerbUnsupported {
         key: String,
         verb: &'static str,
         available: String,
     },
 
-    #[error("{0}")]
-    Hid(String),
-
-    /// `activate()` found no AX verb this element accepts, and the server was
-    /// not started with `--allow-hid`, so the coordinate-click fallback is
-    /// unavailable.
-    ///
-    /// Kept distinct from [`CoreError::HidRefused`] because the two name
-    /// different remedies: that one is about a key with no AX verb at all,
-    /// this one is about an element (typically a custom-drawn list row) that
-    /// advertises no activation verb and can only be reached by a synthetic
-    /// mouse click delivered straight to its process.
-    #[error("{original}. This element advertises no AXPress/AXPick/AXConfirm at all — common for custom-drawn rows in apps like Slack or KakaoTalk. Restarting the server with --allow-hid lets click() fall back to briefly moving the real pointer onto the element, clicking, and moving it back (delivery: hid), which requires the window to be visible on the current Space. Otherwise perform_secondary_action with AXShowMenu may reach the same control another way")]
-    ClickUnsupportedWithoutHid { original: cua_ax::AxError },
-
-    /// The pointer-warp click was refused because the target's own screen
-    /// coordinates are currently occupied by something else.
-    ///
-    /// Almost always means the window is on another Space: AX reports its
-    /// frame in ordinary screen coordinates whether or not that desktop is the
-    /// one on screen, and a global click would then hit whatever *is* there.
-    #[error("refusing to click ({x:.0}, {y:.0}) for `{app}`: those screen coordinates currently belong to {occupant}. The window is most likely on another Space or behind another window — AX reports its frame either way, so the click would land on the wrong app. Switch to the Space showing `{app}` and bring its window to the front, then retry")]
-    ClickPointNotOnTarget {
-        app: String,
-        x: f64,
-        y: f64,
-        occupant: String,
+    #[error("{original}. This element advertises no AXPress/AXPick/AXConfirm, and the quiet SkyLight pid-routed click is unavailable: {reason}. cua-rs will not fall back to moving the real pointer. perform_secondary_action with AXShowMenu may reach the same control another way")]
+    PidClickUnavailable {
+        original: cua_ax::AxError,
+        reason: String,
     },
 
-    /// The element still exists, but it is no longer showing what the snapshot
-    /// said it was showing.
-    ///
-    /// Table and list views recycle their cells: the `AXUIElement` for row 3
-    /// survives a scroll or a re-sort and quietly starts representing a
-    /// different item. Nothing about the handle goes stale, so neither
-    /// [`CoreError::StaleSnapshot`] nor an AX error fires — the click simply
-    /// lands on the wrong conversation. Checked only on the pointer-warp path,
-    /// where the cost of being wrong is a real click on real content.
-    #[error("element_index {index} no longer shows what it did when the snapshot was taken (it read {expected}, it now reads {found}). List and table cells are recycled as the view scrolls or re-sorts, so the same element can come to stand for a different item. Call get_app_state again and re-pick")]
+    /// The live element no longer contains the identifying text captured in
+    /// the snapshot. List views can recycle one AX handle for another row.
+    #[error("element_index {index} no longer shows what it did when the snapshot was taken (it read {expected}, it now reads {found}). Call get_app_state again and re-pick")]
     TargetChanged {
         index: usize,
         expected: String,
         found: String,
-    },
-
-    /// A chord was asked for, but the named app could not be brought to the
-    /// front, so the keystroke would have gone somewhere else.
-    ///
-    /// Unlike a click, a synthetic key event carries no address: it goes to
-    /// whatever holds keyboard focus at the instant it is posted. Sending one
-    /// while the user's editor is frontmost types into the user's editor. There
-    /// is no coordinate to check the way a click has one, so the only available
-    /// precondition is "the app we were told to drive is the one listening".
-    #[error("refusing to send `{key}` to `{app}`: a real key event goes to whatever holds keyboard focus, and that is currently {frontmost}, not `{app}`. This server cannot bring `{app}` forward — macOS does not let a background process hand the foreground to another app. Focus `{app}` yourself and retry, or use a key with an accessibility verb (return/enter, escape, up, down), which is delivered to the element itself and needs no focus")]
-    KeyTargetNotFrontmost {
-        key: String,
-        app: String,
-        frontmost: String,
     },
 
     /// An `element_token` named a role the element at that index no longer has.
@@ -164,6 +117,11 @@ pub enum CoreError {
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
+
+    /// The worker remains alive after this error. A bad native call must not
+    /// look like a terminated MCP connection to the client.
+    #[error("a native macOS operation panicked while handling this request; the cua-rs server is still running, so retry the call once. If it repeats, restart cua-rs and include the server stderr log")]
+    NativePanic,
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
@@ -183,6 +141,10 @@ pub struct Snapshot {
     pub nodes: Vec<AxNode>,
     pub window: Option<WindowInfo>,
     pub taken_at: Instant,
+    /// Process incarnation that produced every native handle in `nodes`.
+    /// PIDs are recycled, so pid equality alone cannot make those handles safe
+    /// after an app exits and relaunches.
+    process_key: ProcessKey,
 }
 
 /// What the agent gets back from `get_app_state`.
@@ -292,12 +254,14 @@ pub struct ActionResult {
     /// missing value never surfaces as an error, and it never has to be kept
     /// stable for callers outside this crate.
     point: Option<(f64, f64)>,
+    /// CGWindowID used only to pin the drawn cursor immediately above the
+    /// target window instead of above unrelated foreground windows.
+    overlay_window_id: Option<u32>,
 }
 
 impl ActionResult {
-    /// An action that went through the accessibility API, which is all of
-    /// them unless `--allow-hid` was passed, plus the screen point the
-    /// overlay should point at (`None` when nothing could be resolved).
+    /// An action that went through the accessibility API, plus the screen point
+    /// the overlay should point at (`None` when nothing could be resolved).
     fn ax_at(
         verb: impl Into<String>,
         target: String,
@@ -310,8 +274,62 @@ impl ActionResult {
             ui_changed,
             delivery: Delivery::Ax,
             point,
+            overlay_window_id: None,
         }
     }
+
+    fn with_overlay_window(mut self, window_id: Option<u32>) -> Self {
+        self.overlay_window_id = window_id;
+        self
+    }
+}
+
+/// Work out whether this app's front window can safely be clicked in order to
+/// make it key, and where.
+///
+/// The reference implementation pairs its `ApplicationActivated` notice with a
+/// click on the window's own `AXActivationPoint`, which is what actually makes
+/// AppKit treat the window as key rather than merely telling the application it
+/// is active. Reproducing that means synthesizing a real click at a point the app
+/// chose, so it is gated on two checks:
+///
+/// 1. the window publishes an activation point at all — a guessed title-bar point
+///    would be exactly the kind of coordinate that lands on a close button;
+/// 2. a live system-wide hit test at that point resolves to *this* pid and to a
+///    window rather than a control. Measured on KakaoTalk, the published point
+///    sits about six pixels from the close button, so "the app said so" is not on
+///    its own enough of a reason to click there.
+///
+/// `None` means skip the assist and send the bare notice, which is strictly what
+/// cua-rs did before and therefore cannot regress anything.
+fn window_focus_assist(
+    pid: libc::pid_t,
+    window_origin: &objc2_core_foundation::CGPoint,
+) -> Option<cua_hid::ActivationAssist> {
+    let app_el = Element::for_pid(pid);
+    let window_el = app_el
+        .element(cua_ax::attr::FOCUSED_WINDOW)
+        .or_else(|| app_el.element(cua_ax::attr::MAIN_WINDOW))
+        .or_else(|| app_el.elements(cua_ax::attr::WINDOWS).into_iter().next())?;
+
+    let point = window_el.activation_point()?;
+
+    // Ask the window server who owns that pixel right now, not who owned it when
+    // the snapshot was taken.
+    let owner = Element::system_wide()
+        .element_at(point.x as f32, point.y as f32)
+        .ok()?;
+    if owner.pid().ok()? != pid {
+        return None;
+    }
+    if owner.role().as_deref() != Some("AXWindow") {
+        return None;
+    }
+
+    Some(cua_hid::ActivationAssist {
+        window_origin: (window_origin.x, window_origin.y),
+        activation_point: (point.x, point.y),
+    })
 }
 
 /// An element's best on-screen point for a drawn cursor: its own
@@ -367,47 +385,21 @@ pub enum Delivery {
     /// Addressed to a specific UI element. Did not move the cursor, change
     /// focus, or activate the app.
     Ax,
-    /// Written to the session's shared HID event stream. Behaves exactly as if
-    /// the user pressed the keys: it goes to whatever has focus, and it competes
-    /// with the human at the keyboard.
-    Hid,
+    /// Routed to one process's window via the private SkyLight
+    /// `SLEventPostToPid` SPI. The cursor never moves and nothing is raised or
+    /// activated. This is the only synthesized-input delivery mode.
+    Pid,
 }
 
 impl Delivery {
     pub fn as_str(self) -> &'static str {
         match self {
             Delivery::Ax => "ax",
-            Delivery::Hid => "hid",
+            Delivery::Pid => "pid",
         }
     }
 }
 
-/// The window an element lives in, for the one caller that needs to raise it.
-///
-/// `AXWindow` first because most elements publish it directly; the parent walk
-/// is the fallback for the ones that do not, and it is bounded because an AX
-/// tree is not guaranteed acyclic.
-fn window_of(el: &Element) -> Option<Element> {
-    if let Some(w) = el.element(cua_ax::attr::WINDOW) {
-        return Some(w);
-    }
-    let mut cur = el.clone();
-    for _ in 0..32 {
-        let parent = cur.element(cua_ax::attr::PARENT)?;
-        if parent.role().as_deref() == Some("AXWindow") {
-            return Some(parent);
-        }
-        cur = parent;
-    }
-    None
-}
-
-/// The distinctive text an element is currently showing, as a token set.
-///
-/// Used to notice cell recycling, so it reads *contents*: `AXUIElement`
-/// equality survives exactly the change this needs to catch. Depth-limited and
-/// capped because it runs on the click path and an AX subtree can be
-/// arbitrarily large.
 fn live_tokens(el: &Element) -> HashSet<String> {
     fn walk(el: &Element, depth: usize, out: &mut HashSet<String>) {
         if depth == 0 || out.len() >= 16 {
@@ -420,6 +412,7 @@ fn live_tokens(el: &Element) -> HashSet<String> {
             walk(&child, depth - 1, out);
         }
     }
+
     let mut out = HashSet::new();
     push_token(el.string(cua_ax::attr::TITLE), &mut out);
     push_token(el.string(cua_ax::attr::VALUE), &mut out);
@@ -427,11 +420,6 @@ fn live_tokens(el: &Element) -> HashSet<String> {
     out
 }
 
-/// The same token set, recovered from a snapshot's flat node list.
-///
-/// The two sets are gathered from different sources — live AX reads versus
-/// what the tree walk chose to record — so they are compared by containment,
-/// never for equality. See [`tokens_still_present`].
 fn snapshot_tokens(nodes: &[AxNode], index: usize) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut frontier: HashSet<usize> = HashSet::from([index]);
@@ -456,12 +444,6 @@ fn snapshot_tokens(nodes: &[AxNode], index: usize) -> HashSet<String> {
     out
 }
 
-/// Keep only text worth identifying an element by.
-///
-/// `_NS:87` and friends are AppKit's internal identifiers, which leak into the
-/// tree for unlabeled views. They are stable enough to look like evidence and
-/// mean nothing, so including them makes the comparison below fail on rows
-/// that did not change.
 fn push_token(text: Option<String>, out: &mut HashSet<String>) {
     if let Some(t) = text {
         let t = t.trim();
@@ -471,39 +453,14 @@ fn push_token(text: Option<String>, out: &mut HashSet<String>) {
     }
 }
 
-/// Whether everything the snapshot saw is still there.
-///
-/// Containment rather than equality, in one direction only: the live read
-/// legitimately picks up text the snapshot did not record (a message preview
-/// the walk skipped, a timestamp that has since ticked over). What must not
-/// happen is for the name the caller *chose the row by* to vanish.
 fn tokens_still_present(expected: &HashSet<String>, found: &HashSet<String>) -> bool {
     expected.iter().all(|t| found.contains(t))
 }
 
-/// Stable ordering for an error message. A `HashSet` prints in a different
-/// order every run, which makes two failures impossible to compare.
 fn sorted(set: &HashSet<String>) -> Vec<&String> {
-    let mut v: Vec<&String> = set.iter().collect();
-    v.sort();
-    v
-}
-
-/// Whether this process may synthesize HID input.
-///
-/// A process-global switch set once from the command line, rather than a
-/// per-call argument. If it were per-call, an agent could grant itself the
-/// capability by passing a flag — the point is that a *human* decides, at launch,
-/// whether this server is ever allowed to touch the shared cursor.
-static ALLOW_HID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Enable the HID fallback. Call once, from argument parsing, before serving.
-pub fn allow_hid(allow: bool) {
-    ALLOW_HID.store(allow, Ordering::Relaxed);
-}
-
-pub fn hid_allowed() -> bool {
-    ALLOW_HID.load(Ordering::Relaxed)
+    let mut values: Vec<&String> = set.iter().collect();
+    values.sort();
+    values
 }
 
 // ── worker ───────────────────────────────────────────────────────────────────
@@ -635,10 +592,15 @@ impl Cua {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Box::new(move |inner| {
-                let _ = tx.send(f(inner));
+                // AX objects originate in foreign code. Turn an unexpected
+                // panic into this request's error response, keeping the worker
+                // available for later MCP calls.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(inner)))
+                    .map_err(|_| CoreError::NativePanic);
+                let _ = tx.send(outcome);
             }))
             .map_err(|_| CoreError::WorkerGone)?;
-        rx.recv().map_err(|_| CoreError::WorkerGone)
+        rx.recv().map_err(|_| CoreError::WorkerGone)?
     }
 
     /// Run an action on the worker thread, then point the drawn cursor at
@@ -655,7 +617,7 @@ impl Cua {
         let result = self.exec(f)?;
         if let Ok(r) = &result {
             if let Some((x, y)) = r.point {
-                self.overlay.mark(x, y, clicking);
+                self.overlay.mark(x, y, clicking, r.overlay_window_id);
             }
         }
         result
@@ -860,6 +822,11 @@ impl Inner {
                     .ok_or_else(|| CoreError::NoSnapshot {
                         app: info.name.clone(),
                     })?;
+                if snap.process_key != key {
+                    return Err(CoreError::ProcessReplaced {
+                        app: info.name.clone(),
+                    });
+                }
                 let node = snap.nodes.get(index).ok_or(CoreError::BadIndex {
                     index,
                     count: snap.nodes.len(),
@@ -921,8 +888,10 @@ impl Inner {
 
         // Match the AX window to a ScreenCaptureKit window by pid + frame.
         // The direct route would be `_AXUIElementGetWindow`, which is a private
-        // symbol; matching on public API keeps this crate free of SPI and thus
-        // free of the "breaks on the next macOS release" risk.
+        // symbol; matching on public API keeps *window identity* off SPI and
+        // thus off the "breaks on the next macOS release" risk. (Input
+        // synthesis's quiet tier does use SkyLight SPI, but that lives in
+        // cua-hid, not in this matching path.)
         let ax_frame = window_el.frame();
         let window = match cua_capture::list_windows() {
             Ok(list) => best_window_match(&list, info.pid, ax_frame),
@@ -967,6 +936,7 @@ impl Inner {
                 nodes,
                 window: window.clone(),
                 taken_at: Instant::now(),
+                process_key: key,
             },
         );
 
@@ -998,6 +968,12 @@ impl Inner {
                     .ok_or_else(|| CoreError::NoSnapshot {
                         app: info.name.clone(),
                     })?;
+
+                if snap.process_key != ProcessKey::for_pid(info.pid) {
+                    return Err(CoreError::ProcessReplaced {
+                        app: info.name.clone(),
+                    });
+                }
 
                 // Only checked when the caller supplied an id. Requiring it
                 // would break the simple "read then act in one turn" flow that
@@ -1045,18 +1021,11 @@ impl Inner {
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
-
-        // Remember what this element was showing when the snapshot recorded
-        // it, for the recycling check further down. Read here rather than at
-        // the point of use so it reflects the snapshot, not the state after
-        // the app has been raised and activated.
         let expected = match &target {
-            Target::Index { index, .. } => {
-                let index = *index;
-                self.snapshots
-                    .get(&info.pid)
-                    .map(|snap| (index, snapshot_tokens(&snap.nodes, index)))
-            }
+            Target::Index { index, .. } => self
+                .snapshots
+                .get(&info.pid)
+                .map(|snapshot| (*index, snapshot_tokens(&snapshot.nodes, *index))),
             Target::Point { .. } => None,
         };
 
@@ -1066,7 +1035,7 @@ impl Inner {
         // not the same event: an app that opens on double-click and selects on
         // single-click (KakaoTalk's conversation list, measured) would see two
         // selections. So a `count` above 1 is a statement that only a real
-        // mouse event will do, and it goes straight to the HID path.
+        // mouse event will do, and it goes straight to pid-routed delivery.
         let ax_err = if count > 1 {
             // Checked *before* activating, not after: `el.activate()` is not a
             // query, and performing a press only to discard it would deliver
@@ -1079,41 +1048,31 @@ impl Inner {
             match el.activate() {
                 Ok(verb) => {
                     let changed = self.changed_since(info.pid, before);
-                    return Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el)));
+                    return Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
+                        .with_overlay_window(self.overlay_window_id(info.pid)));
                 }
                 Err(e) => e,
             }
         };
 
-        if !matches!(ax_err, cua_ax::AxError::Unsupported { .. }) || !hid_allowed() {
-            return Err(CoreError::ClickUnsupportedWithoutHid { original: ax_err });
+        if !matches!(ax_err, cua_ax::AxError::Unsupported { .. }) {
+            return Err(CoreError::Ax(ax_err));
         }
 
-        // No AX verb landed and HID is permitted. Exactly one fallback is
-        // left: warp the real pointer to the element, click, warp back.
-        //
-        // There used to be a quieter step before it — `CGEventPostToPid`,
-        // addressed to the element's own process so nothing on screen moves.
-        // It was removed because it does not work. Isolated control test
-        // (TextEdit checkbox, a control that AX *can* drive, so a failure is
-        // unambiguous): pid-targeted post left it 0→0, the same coordinates
-        // through the global HID tap flipped it 0→1, and supplying the real
-        // window id in `kCGMouseEventWindowUnderMousePointer` did not help.
-        // `CGEventPost*` is fire-and-forget, so the dead step still cost a
-        // full fingerprint diff on every fallback click and always "succeeded".
-        // Where to aim. `AXActivationPoint` first: it is the app's own answer
+        // No AX verb landed. Route a click to the target process without ever
+        // touching the shared cursor. `AXActivationPoint` is the app's answer
         // to "where is this element clicked", and it is not always the middle
-        // — a wide list row, a disclosure triangle or a control with a large
-        // transparent hit area all have live pixels somewhere other than the
-        // geometric centre. Codex's Sky links this attribute for the same
-        // reason (it parks its drawn cursor there). Fall back to the frame
-        // centre for the majority of elements that publish no such point.
+        // of its frame, so prefer it when available.
         let (x, y) = match el.activation_point() {
             Some(p) => (p.x, p.y),
             None => {
-                let frame = el
-                    .frame()
-                    .ok_or(CoreError::ClickUnsupportedWithoutHid { original: ax_err })?;
+                let Some(frame) = el.frame() else {
+                    return Err(CoreError::PidClickUnavailable {
+                        original: ax_err,
+                        reason: "the element publishes neither AXActivationPoint nor AXFrame"
+                            .into(),
+                    });
+                };
                 (
                     frame.origin.x + frame.size.width / 2.0,
                     frame.origin.y + frame.size.height / 2.0,
@@ -1121,64 +1080,50 @@ impl Inner {
             }
         };
 
-        // A global click lands on whatever is topmost at that point *on the
-        // current Space*, and AX frames are Space-agnostic: a window on
-        // another desktop reports perfectly ordinary screen coordinates that
-        // now belong to some innocent bystander. This has already happened —
-        // a click aimed at KakaoTalk landed in Terminal. So hit-test the point
-        // system-wide first and refuse unless the pixels really do belong to
-        // the app we were asked to click. Same check catches an occluding
-        // window and a stale frame from a window that has since moved.
-        //
-        // If the point is not ours, bring the target forward and look again,
-        // rather than giving up on what is usually just occlusion. Two steps,
-        // because they fix different things: `AXRaise` restacks this window
-        // within its app, and activation puts the app itself in front (and
-        // switches to the Space its windows are on, which is the case that
-        // made an earlier version of this click land in Terminal).
-        //
-        // Foregrounding is defensible *only* here. The caller has already
-        // opted into a click that moves the shared pointer, so showing them
-        // the window it is about to hit is strictly less surprising than
-        // clicking whatever happens to be on top of it. Nothing above this
-        // line raises, activates, or moves anything.
-        if self.assert_point_belongs_to(&info, x, y).is_err() {
-            // Raise the element's own window and look again. `AXRaise` is a
-            // real accessibility action and does restack a window within its
-            // app, which is enough when the obstruction is the app's own
-            // sibling window.
-            //
-            // What is *not* attempted is foregrounding the app. An earlier
-            // version called `NSRunningApplication.activate` here and polled
-            // for the result; measured, that call returns `true` and never
-            // changes the frontmost app — macOS does not let a background
-            // command-line process hand the foreground to someone else
-            // (`activate_probe 841 6`: "returned true … never became frontmost
-            // within 6s"). Keeping it would be a step that cannot work,
-            // followed by a restore of a foreground never taken.
-            if let Some(window) = window_of(&el) {
-                let _ = window.perform(cua_ax::action::RAISE);
-                let deadline = Instant::now() + std::time::Duration::from_millis(750);
-                while Instant::now() < deadline {
-                    if self.assert_point_belongs_to(&info, x, y).is_ok() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-            }
-            self.assert_point_belongs_to(&info, x, y)?;
+        if !cua_hid::skylight_available() {
+            return Err(CoreError::PidClickUnavailable {
+                original: ax_err,
+                reason: "SLEventPostToPid is not available on this macOS version".into(),
+            });
         }
 
-        // Last check before a real click lands on real content: is this
-        // element still showing what the snapshot said? Raising and activating
-        // the app can re-sort a conversation list, and list views recycle
-        // their cells, so the handle stays valid while its meaning changes.
-        // Measured: a click aimed at one KakaoTalk conversation opened a
-        // different one this way.
-        if let Some((index, ref expected)) = expected {
+        // Re-enumerate the exact window immediately before posting. The
+        // snapshot's frame can be stale if the user moved/resized the window,
+        // and CGWindowIDs can be recycled after a close. A pid-addressed event
+        // with a stale stamped window id is not safe enough to send.
+        let snapshot_window = self
+            .snapshots
+            .get(&info.pid)
+            .and_then(|snap| snap.window.as_ref())
+            .cloned()
+            .ok_or_else(|| CoreError::PidClickUnavailable {
+                original: ax_err.clone(),
+                reason: "the snapshot has no verified ScreenCaptureKit window id; enable Screen Recording and take a fresh snapshot".into(),
+            })?;
+        let live_windows =
+            cua_capture::list_windows().map_err(|e| CoreError::PidClickUnavailable {
+                original: ax_err.clone(),
+                reason: format!(
+                    "could not revalidate the target window immediately before input: {e}"
+                ),
+            })?;
+        let live_window =
+            current_window_for_pid_click(&live_windows, &snapshot_window, info.pid, x, y).map_err(
+                |reason| CoreError::PidClickUnavailable {
+                    original: ax_err.clone(),
+                    reason,
+                },
+            )?;
+        let wid = live_window.id;
+        let window_local = (
+            x - live_window.frame.origin.x,
+            y - live_window.frame.origin.y,
+        );
+
+        if let Some((index, expected)) = expected {
             if !expected.is_empty() {
                 let found = live_tokens(&el);
-                if !tokens_still_present(expected, &found) {
+                if !tokens_still_present(&expected, &found) {
                     let mut gone: Vec<&String> = expected.difference(&found).collect();
                     gone.sort();
                     return Err(CoreError::TargetChanged {
@@ -1190,75 +1135,40 @@ impl Inner {
             }
         }
 
-        cua_hid::click_by_moving_pointer(x, y, count).map_err(|e| CoreError::Hid(e.to_string()))?;
+        // The synthesized activation notice inside `click_background_pid` only
+        // takes effect once the target's own run loop drains it, so the click has
+        // to wait for the target to agree. `AXFrontmost` on the application
+        // element is that agreement: it reflects what the *app* thinks, not what
+        // `NSWorkspace` thinks, which is exactly the distinction the notice
+        // exploits. Read fresh each poll — a cached answer would defeat the point.
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        let assist = window_focus_assist(info.pid, &live_window.frame.origin);
+        cua_hid::click_background_pid(
+            cua_hid::PidClick {
+                pid: info.pid,
+                point: (x, y),
+                window_local,
+                wid,
+                count,
+            },
+            assist,
+            &believes_frontmost,
+        )
+        .map_err(|e| CoreError::PidClickUnavailable {
+            original: ax_err,
+            reason: e.to_string(),
+        })?;
         let changed = self.changed_since(info.pid, before);
         Ok(ActionResult {
-            verb: format!("HID {count}-click at ({x:.0}, {y:.0}) by moving the pointer"),
+            verb: format!("SkyLight pid-routed {count}-click at ({x:.0}, {y:.0})"),
             target: desc,
             ui_changed: changed,
-            delivery: Delivery::Hid,
+            delivery: Delivery::Pid,
             point: Some((x, y)),
-        })
-    }
-
-    /// Make the target app frontmost, and say who to hand the foreground back
-    /// to afterwards.
-    ///
-    /// `Ok(None)` means it was already frontmost and nothing was disturbed.
-    /// `Ok(Some(pid))` means the foreground was taken and that pid should get
-    /// it back. Polls for the state rather than trusting `activate`, which is
-    /// asynchronous and returns `true` for a request, not a result — the same
-    /// mistake `_SLPSSetFrontProcessWithOptions` was caught making.
-    fn require_frontmost(&self, info: &AppInfo, key: &str) -> Result<()> {
-        if apps::frontmost_pid() == Some(info.pid) {
-            return Ok(());
-        }
-        // No activation attempt. `NSRunningApplication.activate` from this
-        // process returns `true` and does nothing (`activate_probe`, 6 s, two
-        // different apps), so trying would only add latency before the same
-        // refusal — and the message would have to claim an attempt was made.
-        Err(CoreError::KeyTargetNotFrontmost {
-            key: key.to_string(),
-            app: info.name.clone(),
-            frontmost: apps::frontmost_pid()
-                .and_then(|pid| apps::list_apps().into_iter().find(|a| a.pid == pid))
-                .map(|a| format!("`{}`", a.name))
-                .unwrap_or_else(|| "no app".to_string()),
-        })
-    }
-
-    /// Refuse a pointer-warp click whose screen point is not actually owned by
-    /// the target app right now.
-    ///
-    /// See also [`window_of`], used to find something worth raising when it is.
-    ///
-    /// The hit test goes through the *system-wide* AX element, not the app
-    /// element: `AXUIElementCopyElementAtPosition` on an application only ever
-    /// answers with that application's own elements, so asking it "who is at
-    /// this point" would always say "me" and prove nothing. The system-wide
-    /// element answers with whatever the window server would actually deliver
-    /// the click to.
-    fn assert_point_belongs_to(&self, info: &AppInfo, x: f64, y: f64) -> Result<()> {
-        let hit = cua_ax::Element::system_wide().element_at(x as f32, y as f32);
-        let owner = match hit {
-            Ok(el) => el.pid().ok(),
-            // No element at that point at all: nothing on this Space is there,
-            // which is itself proof the target window is not visible here.
-            Err(_) => None,
-        };
-        if owner == Some(info.pid) {
-            return Ok(());
-        }
-        let occupant = owner
-            .and_then(|pid| apps::list_apps().into_iter().find(|a| a.pid == pid))
-            .map(|a| format!("`{}` (pid {})", a.name, a.pid))
-            .or_else(|| owner.map(|pid| format!("pid {pid}")))
-            .unwrap_or_else(|| "nothing".to_string());
-        Err(CoreError::ClickPointNotOnTarget {
-            app: info.name.clone(),
-            x,
-            y,
-            occupant,
+            overlay_window_id: Some(wid),
         })
     }
 
@@ -1268,12 +1178,10 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.set_string(cua_ax::attr::VALUE, value)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at(
-            "AXValue=",
-            desc,
-            changed,
-            element_point(&el),
-        ))
+        Ok(
+            ActionResult::ax_at("AXValue=", desc, changed, element_point(&el))
+                .with_overlay_window(self.overlay_window_id(info.pid)),
+        )
     }
 
     fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
@@ -1289,7 +1197,8 @@ impl Inner {
             desc,
             changed,
             element_point(&el),
-        ))
+        )
+        .with_overlay_window(self.overlay_window_id(info.pid)))
     }
 
     fn select_text(
@@ -1301,7 +1210,7 @@ impl Inner {
         suffix: Option<&str>,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
-        let (_, el, desc) = self.resolve(query, &target)?;
+        let (info, el, desc) = self.resolve(query, &target)?;
         let range = el.select_text(text, prefix, suffix)?;
         // Selecting text changes no window state the fingerprint can see, and
         // claiming otherwise would be noise. The returned range is the evidence
@@ -1316,89 +1225,41 @@ impl Inner {
             // there is nothing to observe here either way.
             Observed::Unknown,
             element_point(&el),
-        ))
+        )
+        .with_overlay_window(self.overlay_window_id(info.pid)))
     }
 
     fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {
-        // Capability first, before anything that touches AX or needs a snapshot.
-        //
-        // Ordering matters for the message the caller sees. Resolving the target
-        // first meant a chord asked for without `--allow-hid` reported "no
-        // snapshot for this app" — a state problem the caller would then try to
-        // fix, when the real answer is that this server is not permitted to send
-        // that key at all and no amount of snapshotting will change it.
-        let ax_verb = ax_verb_for_key(key);
-        if ax_verb.is_none() && !hid_allowed() {
-            return Err(CoreError::HidRefused {
+        // Capability first so an unsupported chord reports the permanent API
+        // constraint instead of a misleading missing-snapshot error.
+        let Some(ax_verb) = ax_verb_for_key(key) else {
+            return Err(CoreError::KeyNoAccessibilityEquivalent {
                 key: key.to_string(),
             });
-        }
+        };
 
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
 
-        // AX first, for the handful of keys that have a semantic verb. This path
-        // keeps the guarantee: no cursor, no focus change, and it works on a
-        // background window.
-        if let Some(verb) = ax_verb {
-            let available = el.actions();
-            if available.iter().any(|a| a == verb) {
-                el.perform(verb)?;
-                let changed = self.changed_since(info.pid, before);
-                return Ok(ActionResult::ax_at(
-                    format!("{verb} (for {key})"),
-                    desc,
-                    changed,
-                    element_point(&el),
-                ));
-            }
-            // The key *does* have an AX verb; this element just does not accept
-            // it. Reporting the generic "no accessibility verb" message here
-            // would contradict itself, since that message names `escape` as
-            // something that works without HID. Say what actually went wrong,
-            // and where the verb usually lives.
-            if !hid_allowed() {
-                return Err(CoreError::KeyVerbUnsupported {
-                    key: key.to_string(),
-                    verb,
-                    available: format!("{available:?}"),
-                });
-            }
+        let available = el.actions();
+        if !available.iter().any(|a| a == ax_verb) {
+            return Err(CoreError::KeyVerbUnsupported {
+                key: key.to_string(),
+                verb: ax_verb,
+                available: format!("{available:?}"),
+            });
         }
 
-        // Reaching here means either the key has no AX verb and HID is permitted
-        // (checked at the top), or it had a verb the element would not accept and
-        // HID is permitted (checked in the branch above).
-        let chord = cua_hid::parse_chord(key).map_err(|e| CoreError::Hid(e.to_string()))?;
-
-        // Parse before focusing. A malformed chord should fail without having
-        // yanked the user's foreground app away first.
-        //
-        // Then make the target listen. Until now this posted the chord blind:
-        // the result text admitted it went "to the focused app, not this
-        // element", which meant a `cmd+s` aimed at a background editor could
-        // land in whatever the user was typing in. The click path has a
-        // coordinate it can hit-test; a key event has no address at all, so
-        // being frontmost is the only precondition there is.
-        self.require_frontmost(&info, key)?;
-        cua_hid::post_chord(chord).map_err(|e| CoreError::Hid(e.to_string()))?;
+        el.perform(ax_verb)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult {
-            verb: format!("HID key {key}"),
-            // The target is informational only here: a HID event goes to whatever
-            // has focus, not to the element the caller named. Say so rather than
-            // implying the element received it.
-            target: format!(
-                "{desc} — NOTE: delivered to `{}` as the focused app, not to this element",
-                info.name
-            ),
-            ui_changed: changed,
-            delivery: Delivery::Hid,
-            // A HID key goes to whatever has focus, not to this element, so
-            // the element's location would be a misleading place to point.
-            point: None,
-        })
+        Ok(ActionResult::ax_at(
+            format!("{ax_verb} (for {key})"),
+            desc,
+            changed,
+            element_point(&el),
+        )
+        .with_overlay_window(self.overlay_window_id(info.pid)))
     }
 
     fn perform_action(
@@ -1421,12 +1282,10 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.perform(action)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at(
-            action,
-            desc,
-            changed,
-            element_point(&el),
-        ))
+        Ok(
+            ActionResult::ax_at(action, desc, changed, element_point(&el))
+                .with_overlay_window(self.overlay_window_id(info.pid)),
+        )
     }
 
     fn find(&mut self, query: &str, needle: &str, limit: usize) -> Result<FindResult> {
@@ -1520,7 +1379,15 @@ impl Inner {
             el.perform(verb)?;
         }
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el)))
+        Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
+            .with_overlay_window(self.overlay_window_id(info.pid)))
+    }
+
+    fn overlay_window_id(&self, pid: libc::pid_t) -> Option<u32> {
+        self.snapshots
+            .get(&pid)
+            .and_then(|snapshot| snapshot.window.as_ref())
+            .map(|window| window.id)
     }
 
     /// A cheap proxy for "did the UI move".
@@ -1729,7 +1596,13 @@ fn best_window_match(
             candidates.sort_by(|a, b| {
                 let da = frame_distance(&a.frame, &f);
                 let db = frame_distance(&b.frame, &f);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                da.partial_cmp(&db)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    // Terminal tabs and similar app-managed windows can share
+                    // an identical frame. Prefer the one the window server says
+                    // is actually on screen instead of an inactive sibling
+                    // that a window-id capture cannot render.
+                    .then_with(|| b.on_screen.cmp(&a.on_screen))
             });
             candidates.first().map(|w| (*w).clone())
         }
@@ -1750,6 +1623,51 @@ fn frame_distance(a: &CGRect, b: &CGRect) -> f64 {
         + (a.origin.y - b.origin.y).abs()
         + (a.size.width - b.size.width).abs()
         + (a.size.height - b.size.height).abs()
+}
+
+/// Revalidate the snapshot window at the last possible point before private
+/// input delivery.
+///
+/// Matching by id *and* pid rejects both a closed window and a recycled
+/// CGWindowID. Returning the live frame fixes window-local coordinates after a
+/// move or resize. Finally, the target point must still be inside that window;
+/// otherwise an AX handle and a captured window have drifted apart and the only
+/// safe recovery is a fresh snapshot.
+fn current_window_for_pid_click(
+    windows: &[WindowInfo],
+    snapshot: &WindowInfo,
+    pid: libc::pid_t,
+    x: f64,
+    y: f64,
+) -> std::result::Result<WindowInfo, String> {
+    let live = windows
+        .iter()
+        .find(|w| w.id == snapshot.id && w.pid == pid && w.is_plausible_target())
+        .ok_or_else(|| {
+            format!(
+                "window {} no longer belongs to pid {pid}; it was closed, replaced, or its id was recycled. Call get_app_state again",
+                snapshot.id
+            )
+        })?;
+
+    let f = live.frame;
+    const EDGE_TOLERANCE: f64 = 1.0;
+    let inside = x >= f.origin.x - EDGE_TOLERANCE
+        && y >= f.origin.y - EDGE_TOLERANCE
+        && x <= f.origin.x + f.size.width + EDGE_TOLERANCE
+        && y <= f.origin.y + f.size.height + EDGE_TOLERANCE;
+    if !inside {
+        return Err(format!(
+            "target point ({x:.0}, {y:.0}) is outside the current frame of window {} ({:.0},{:.0} {:.0}x{:.0}); the AX element and window snapshot drifted apart. Call get_app_state again",
+            live.id,
+            f.origin.x,
+            f.origin.y,
+            f.size.width,
+            f.size.height
+        ));
+    }
+
+    Ok(live.clone())
 }
 
 fn describe_node(node: &AxNode) -> String {
@@ -1825,34 +1743,40 @@ mod tests {
         }
     }
 
-    /// The off-Space guard must fail closed. A point no window can occupy
-    /// stands in for the real case (a window on another Space), which cannot
-    /// be staged in a unit test — both reduce to "the hit test does not answer
-    /// with our pid", which is the only thing the guard decides on.
-    /// These strings go into every action response an agent reads, and
-    /// `unknown` in particular has to stay distinguishable from `no`.
-    /// A chord has no address. If the named app is not the one listening, the
-    /// keystroke lands in whatever the human is typing in, so the refusal has
-    /// to name both apps or the caller cannot act on it.
     #[test]
-    fn refusing_a_chord_names_the_app_that_would_have_received_it() {
-        let err = CoreError::KeyTargetNotFrontmost {
-            key: "cmd+s".into(),
-            app: "TextEdit".into(),
-            frontmost: "`터미널`".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("cmd+s"), "got {msg}");
-        assert!(msg.contains("TextEdit"), "got {msg}");
-        assert!(msg.contains("터미널"), "got {msg}");
-        // The remedy has to be in the message: the keys that need no focus at
-        // all are the whole reason this is recoverable.
-        assert!(msg.contains("escape"), "got {msg}");
+    fn pid_click_revalidation_uses_the_live_moved_window_frame() {
+        let snapshot = win(7, 42, 100.0, 100.0, 800.0, 600.0);
+        let moved = win(7, 42, -400.0, 50.0, 800.0, 600.0);
+        let live = current_window_for_pid_click(&[moved], &snapshot, 42, -200.0, 200.0)
+            .expect("same id and pid should survive a move");
+        assert_eq!(live.frame.origin.x, -400.0);
+        assert_eq!(
+            (-200.0 - live.frame.origin.x, 200.0 - live.frame.origin.y),
+            (200.0, 150.0),
+            "window-local input must use the live frame, not the snapshot frame"
+        );
+    }
+
+    #[test]
+    fn pid_click_revalidation_rejects_a_recycled_window_id() {
+        let snapshot = win(7, 42, 0.0, 0.0, 800.0, 600.0);
+        let recycled = win(7, 99, 0.0, 0.0, 800.0, 600.0);
+        let err = current_window_for_pid_click(&[recycled], &snapshot, 42, 100.0, 100.0)
+            .expect_err("same window id owned by another pid must fail closed");
+        assert!(err.contains("no longer belongs to pid 42"), "got {err}");
+    }
+
+    #[test]
+    fn pid_click_revalidation_rejects_ax_window_drift() {
+        let snapshot = win(7, 42, 0.0, 0.0, 800.0, 600.0);
+        let live = snapshot.clone();
+        let err = current_window_for_pid_click(&[live], &snapshot, 42, 900.0, 100.0)
+            .expect_err("a point outside the validated window must not be posted");
+        assert!(err.contains("outside the current frame"), "got {err}");
     }
 
     /// Every key this maps to a verb must be one `press_key` can deliver
-    /// without focusing anything, because the refusal above advertises them as
-    /// the way out.
+    /// without focusing anything.
     #[test]
     fn the_keys_offered_as_the_focus_free_alternative_really_are() {
         for key in ["return", "enter", "escape", "esc", "up", "down"] {
@@ -1892,62 +1816,27 @@ mod tests {
     }
 
     #[test]
-    fn a_recycled_row_is_caught_but_a_changed_preview_is_not() {
-        let mut expected = HashSet::new();
-        for t in ["프로필", "박고훈", "오후 9:54"] {
-            push_token(Some(t.to_string()), &mut expected);
-        }
+    fn recycled_rows_fail_the_exact_target_check() {
+        let expected = HashSet::from(["Alice".to_string(), "Profile".to_string()]);
+        let same_row = HashSet::from([
+            "Alice".to_string(),
+            "Profile".to_string(),
+            "New preview".to_string(),
+        ]);
+        let other_row = HashSet::from(["Bob".to_string(), "Profile".to_string()]);
 
-        // The row is the same one, showing a newer message and a timestamp the
-        // walk did not record. Extra live text must never fail the check.
-        let mut same_row = HashSet::new();
-        for t in ["프로필", "박고훈", "오후 9:54", "저두ㅋㅋ조심히 들가용!"] {
-            push_token(Some(t.to_string()), &mut same_row);
-        }
         assert!(tokens_still_present(&expected, &same_row));
-
-        // The cell was recycled onto a different conversation. The name the
-        // caller picked the row by is gone, which is the whole signal.
-        let mut other_row = HashSet::new();
-        for t in ["프로필", "클코단", "오후 9:58"] {
-            push_token(Some(t.to_string()), &mut other_row);
-        }
         assert!(!tokens_still_present(&expected, &other_row));
     }
 
-    /// AppKit's internal identifiers leak into the tree for unlabeled views.
-    /// They look stable and mean nothing, so they must not become evidence.
     #[test]
     fn appkit_placeholder_identifiers_are_not_identity() {
         let mut out = HashSet::new();
         push_token(Some("_NS:87".to_string()), &mut out);
         push_token(Some("   ".to_string()), &mut out);
         push_token(None, &mut out);
-        push_token(Some("박고훈".to_string()), &mut out);
-        assert_eq!(sorted(&out), vec!["박고훈"]);
-    }
-
-    #[test]
-    fn the_warp_guard_refuses_a_point_no_window_owns() {
-        let inner = Inner::default();
-        let me = AppInfo {
-            name: "test".into(),
-            bundle_id: None,
-            pid: std::process::id() as libc::pid_t,
-            active: false,
-            regular: true,
-        };
-        let err = inner
-            .assert_point_belongs_to(&me, -50_000.0, -50_000.0)
-            .expect_err("a point off every display must never be clicked");
-        assert!(
-            matches!(err, CoreError::ClickPointNotOnTarget { .. }),
-            "got {err:?}"
-        );
-        // The message has to name the app and the coordinates, because the
-        // caller's only fix is to go find that window.
-        let msg = err.to_string();
-        assert!(msg.contains("test") && msg.contains("-50000"), "got {msg}");
+        push_token(Some("Alice".to_string()), &mut out);
+        assert_eq!(sorted(&out), vec!["Alice"]);
     }
 
     #[test]
@@ -2005,42 +1894,46 @@ mod tests {
         assert_eq!(ax_verb_for_key(" ESC "), Some("AXCancel"));
         assert_eq!(ax_verb_for_key("up"), Some("AXIncrement"));
         assert_eq!(ax_verb_for_key("down"), Some("AXDecrement"));
-        // The whole reason cua-hid exists: AX cannot express these.
+        // cua-rs deliberately refuses keys AX cannot address to an element.
         assert_eq!(ax_verb_for_key("cmd+shift+p"), None);
         assert_eq!(ax_verb_for_key("a"), None);
         assert_eq!(ax_verb_for_key("f5"), None);
     }
 
     #[test]
-    fn hid_is_off_until_a_human_turns_it_on() {
-        // The default matters: a server started without the flag must refuse.
-        assert!(!hid_allowed(), "HID must be opt-in, never the default");
-        allow_hid(true);
-        assert!(hid_allowed());
-        allow_hid(false);
-        assert!(!hid_allowed());
-    }
-
-    #[test]
     fn delivery_labels_are_stable() {
         assert_eq!(Delivery::Ax.as_str(), "ax");
-        assert_eq!(Delivery::Hid.as_str(), "hid");
+        assert_eq!(Delivery::Pid.as_str(), "pid");
     }
 
     #[test]
-    fn click_unsupported_without_hid_names_the_flag_and_the_ax_original() {
-        let msg = CoreError::ClickUnsupportedWithoutHid {
+    fn a_panicking_native_job_returns_an_error_without_killing_the_worker() {
+        let cua = Cua::new();
+        let err = cua
+            .exec::<(), _>(|_| panic!("synthetic native failure"))
+            .expect_err("panic must be returned to the caller");
+        assert!(matches!(err, CoreError::NativePanic));
+
+        // A follow-up request must still be serviceable; otherwise MCP sees a
+        // connection close instead of the original tool error.
+        assert_eq!(cua.exec(|_| 7usize).unwrap(), 7);
+    }
+
+    #[test]
+    fn pid_click_failure_promises_no_pointer_fallback() {
+        let msg = CoreError::PidClickUnavailable {
             original: cua_ax::AxError::Unsupported {
                 what: "action",
                 name: "any of [\"AXPress\", \"AXPick\", \"AXConfirm\"]".into(),
             },
+            reason: "SLEventPostToPid unavailable".into(),
         }
         .to_string();
-        assert!(msg.contains("--allow-hid"), "must name the flag: {msg}");
         assert!(
             msg.contains("AXPress"),
             "must keep the original AX error visible: {msg}"
         );
+        assert!(msg.contains("will not fall back to moving"), "got {msg}");
         assert!(
             msg.contains("AXShowMenu"),
             "must point at a background-safe alternative too: {msg}"
@@ -2070,12 +1963,12 @@ mod tests {
     }
 
     #[test]
-    fn refusing_hid_explains_the_ax_alternatives() {
-        let msg = CoreError::HidRefused {
+    fn refusing_a_chord_explains_the_ax_alternatives() {
+        let msg = CoreError::KeyNoAccessibilityEquivalent {
             key: "cmd+shift+p".into(),
         }
         .to_string();
-        assert!(msg.contains("--allow-hid"), "must name the flag: {msg}");
+        assert!(msg.contains("does not synthesize shared HID"), "got {msg}");
         assert!(
             msg.contains("AXShowMenu") && msg.contains("return/enter"),
             "must point at background-safe alternatives: {msg}"
@@ -2108,6 +2001,20 @@ mod tests {
         assert!(
             best_window_match(&windows, 500, Some(rect(0.0, 0.0, 800.0, 600.0))).is_none(),
             "an identical frame in another app is never the right window"
+        );
+    }
+
+    #[test]
+    fn identical_frames_prefer_the_window_that_is_on_screen() {
+        let mut hidden_tab = win(1, 500, 0.0, 0.0, 800.0, 600.0);
+        hidden_tab.on_screen = false;
+        let visible_tab = win(2, 500, 0.0, 0.0, 800.0, 600.0);
+        let windows = vec![hidden_tab, visible_tab];
+        assert_eq!(
+            best_window_match(&windows, 500, Some(rect(0.0, 0.0, 800.0, 600.0)))
+                .unwrap()
+                .id,
+            2
         );
     }
 

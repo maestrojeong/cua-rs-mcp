@@ -161,8 +161,8 @@ struct ClickArgs {
     /// Click count. `2` for a double-click, for targets that open on
     /// double-click and merely select on single-click — chat and file lists,
     /// typically. Anything above 1 skips the accessibility path entirely
-    /// (`AXPress` has no notion of click count) and therefore requires
-    /// --allow-hid.
+    /// (`AXPress` has no notion of click count) and therefore uses pid-routed
+    /// SkyLight delivery.
     #[serde(default)]
     count: Option<u8>,
 }
@@ -213,8 +213,7 @@ struct SelectTextArgs {
 struct PressKeyArgs {
     #[serde(flatten)]
     target: ActionArgs,
-    /// Key or chord: `return`, `escape`, `up`, `down`, or with --allow-hid any
-    /// chord such as `cmd+shift+p`, `f5`, `ctrl+alt+delete`.
+    /// Background-safe semantic key: `return`, `escape`, `up`, or `down`.
     key: String,
 }
 
@@ -304,7 +303,7 @@ impl CuaServer {
                 }
                 if !p.screen_recording {
                     lines.push(
-                        "\nGrant Screen Recording in System Settings > Privacy & Security > Screen Recording, same host process. The accessibility tree still works without it; only screenshots are unavailable."
+                        "\nGrant Screen Recording in System Settings > Privacy & Security > Screen Recording, same host process. The accessibility tree and AX actions still work without it; screenshots and the custom-control pid-routed click fallback are unavailable because their target window cannot be revalidated."
                             .into(),
                     );
                 }
@@ -406,7 +405,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Activate an element: the equivalent of clicking it. Delivered as an accessibility action (AXPress, falling back to AXPick or AXConfirm depending on what the element supports), so the pointer never moves and the app is never brought to the front. Prefer `element_index` from the latest get_app_state; x/y is a fallback that is still hit-tested to an element rather than posting a mouse event. If the element advertises none of those verbs (common for custom-drawn list rows, e.g. chat apps' conversation lists) and the server was started with --allow-hid, this falls back to briefly warping the real pointer onto the element, clicking, and restoring it; the result's `delivery` field says `hid` when that happened. That fallback is refused unless the target's own screen coordinates currently belong to the target app, so a window on another Space cannot make it click an innocent bystander. Pass count=2 for a target that only opens on a double-click (chat and file lists): accessibility cannot express a click count, so that always takes the real-mouse path."
+        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. There is no real-pointer fallback."
     )]
     async fn click(
         &self,
@@ -521,7 +520,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press a key on an element. `return`/`enter` and `escape` map to the accessibility verbs AXConfirm and AXCancel, and `up`/`down` to AXIncrement/AXDecrement on steppers and sliders — those work in the background without touching the cursor. Any other key or chord (cmd+shift+p, f5, ctrl+alt+delete) has NO accessibility equivalent and can only be sent as a real key event, which moves the cursor and steals focus; that is refused unless the server was started with --allow-hid. Every result reports `delivery: ax` or `delivery: hid` so you always know which happened."
+        description = "Press a background-safe semantic key on an element. `return`/`enter` and `escape` map to AXConfirm and AXCancel, and `up`/`down` map to AXIncrement/AXDecrement on steppers and sliders. Arbitrary keys and chords are refused because they require shared HID input and would steal keyboard focus. Successful results always report `delivery: ax`."
     )]
     async fn press_key(
         &self,
@@ -658,8 +657,8 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         r.target,
         r.delivery.as_str(),
         match r.delivery {
-            cua_core::Delivery::Hid => {
-                "  (a real input event through the shared HID stream: the cursor and keyboard focus were used, exactly as if the user acted)"
+            cua_core::Delivery::Pid => {
+                "  (input synthesized and routed to the target process via the private SkyLight SPI: cursor, keyboard focus and frontmost app untouched)"
             }
             cua_core::Delivery::Ax => {
                 "  (accessibility action: cursor, focus and frontmost app untouched)"
@@ -710,10 +709,12 @@ impl rmcp::ServerHandler for CuaServer {
         info.instructions = Some(
             "Drives native macOS apps through the Accessibility API. Call get_app_state(app) \
              first: it returns the window's element tree plus a screenshot and assigns the \
-             [N] indices that click / set_value / scroll take as element_index. Actions are \
-             delivered as accessibility actions, so the cursor never moves, focus never \
-             changes, and the app is never brought to the front — you can drive a background \
-             window while the user keeps working in another one. Indices are only valid until \
+             [N] indices that click / set_value / scroll take as element_index. Actions use \
+             element-addressed accessibility verbs when available; custom controls can use a \
+             window-pinned event routed directly to the target process (delivery: pid). Neither \
+             path moves the cursor, changes keyboard focus, raises the app, or switches Space — \
+             you can drive a background window while the user keeps working in another one. \
+             Indices are only valid until \
              the next get_app_state for that app; pass snapshot_id to make staleness an error \
              instead of a mis-click."
                 .to_string(),

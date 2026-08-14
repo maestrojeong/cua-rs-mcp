@@ -22,10 +22,10 @@
 //! it by hand:
 //!
 //! ```text
-//! move <x> <y>    put the arrow at a screen point
-//! click <x> <y>   put it there and flash a click marker
-//! hide            keep running, draw nothing
-//! quit            exit
+//! move <x> <y> <window-id>    put the arrow above that target window
+//! click <x> <y> <window-id>   put it there and flash a click marker
+//! hide                        keep running, draw nothing
+//! quit                        exit
 //! ```
 //!
 //! Coordinates are screen points with a top-left origin — the same space
@@ -38,7 +38,8 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DeclaredClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -51,6 +52,12 @@ struct Marker {
     visible: bool,
     /// Draw the click ring as well as the arrow.
     clicking: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct OverlayCommand {
+    marker: Marker,
+    window_id: Option<u32>,
 }
 
 struct CursorViewState {
@@ -179,11 +186,10 @@ fn main() {
         // The whole point: input passes through to whatever is underneath, so
         // this window can never intercept a click meant for an app.
         window.setIgnoresMouseEvents(true);
-        // Above ordinary windows, and present on every Space so the arrow does
-        // not vanish when the user switches desktops.
-        // Just under the screen-saver level: above every ordinary window,
-        // below the things the system reserves for itself.
-        window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel - 1);
+        // Keep the overlay at the ordinary window level. Each command orders
+        // it immediately above the exact target CGWindowID, so unrelated
+        // foreground windows naturally occlude both the target and its cursor.
+        window.setLevel(0);
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::Stationary
@@ -193,10 +199,6 @@ fn main() {
 
     let view = CursorView::new(mtm, frame);
     window.setContentView(Some(&view));
-    // `orderFrontRegardless`, not `makeKeyAndOrderFront`: showing the arrow
-    // must not steal key focus from the app the agent is driving.
-    window.orderFrontRegardless();
-
     eprintln!(
         "cua-overlay ready on {:.0}x{:.0}",
         frame.size.width, frame.size.height
@@ -204,7 +206,7 @@ fn main() {
 
     // Commands arrive on a reader thread; drawing has to happen on the main
     // thread, so the reader hands work back through the run loop.
-    let (tx, rx) = std::sync::mpsc::channel::<Marker>();
+    let (tx, rx) = std::sync::mpsc::channel::<OverlayCommand>();
     std::thread::spawn(move || {
         let mut line = String::new();
         loop {
@@ -214,23 +216,27 @@ fn main() {
                 std::process::exit(0);
             }
             let mut it = line.split_whitespace();
-            let m = match it.next() {
+            let command = match it.next() {
                 Some("move") | Some("click") => {
                     let clicking = line.starts_with("click");
                     let x: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     let y: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                    Marker {
-                        x,
-                        y,
-                        visible: true,
-                        clicking,
+                    let window_id = it.next().and_then(|v| v.parse().ok());
+                    OverlayCommand {
+                        marker: Marker {
+                            x,
+                            y,
+                            visible: window_id.is_some(),
+                            clicking,
+                        },
+                        window_id,
                     }
                 }
-                Some("hide") => Marker::default(),
+                Some("hide") => OverlayCommand::default(),
                 Some("quit") => std::process::exit(0),
                 _ => continue,
             };
-            if tx.send(m).is_err() {
+            if tx.send(command).is_err() {
                 return;
             }
         }
@@ -240,8 +246,11 @@ fn main() {
     // Simpler than a custom run-loop source, and 20 ms is far below the
     // threshold where a moving arrow looks stepped.
     loop {
-        while let Ok(m) = rx.try_recv() {
-            view.set_marker(m);
+        while let Ok(command) = rx.try_recv() {
+            if let Some(window_id) = command.window_id {
+                window.orderWindow_relativeTo(NSWindowOrderingMode::Above, window_id as isize);
+            }
+            view.set_marker(command.marker);
         }
         unsafe {
             objc2_core_foundation::CFRunLoop::run_in_mode(
