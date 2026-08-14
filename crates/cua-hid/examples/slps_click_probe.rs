@@ -274,15 +274,38 @@ fn main() {
     let flags: Vec<&str> = args[4..].iter().map(|s| s.as_str()).collect();
     let has = |f: &str| flags.contains(&f);
 
+    // Pick the window that actually contains the target point, not the app's
+    // biggest one. Choosing by area sent two KakaoTalk runs at an open chat
+    // window instead of the conversation list, so the window id stamped on the
+    // event and the window-local coordinates were both for the wrong window —
+    // which reads as "the recipe failed" when nothing was ever aimed correctly.
+    // Falls back to largest only when no window contains the point.
     let windows = cua_capture::list_windows().expect("list_windows");
-    let w = windows
+    let mine: Vec<_> = windows
         .iter()
         .filter(|w| w.pid == pid && w.layer == 0 && w.frame.size.width > 100.0)
-        .max_by(|a, b| {
-            (a.frame.size.width * a.frame.size.height)
-                .total_cmp(&(b.frame.size.width * b.frame.size.height))
+        .collect();
+    let contains = |w: &&cua_capture::WindowInfo| {
+        let f = w.frame;
+        gx >= f.origin.x
+            && gx < f.origin.x + f.size.width
+            && gy >= f.origin.y
+            && gy < f.origin.y + f.size.height
+    };
+    let w = mine
+        .iter()
+        .copied()
+        .find(contains)
+        .or_else(|| {
+            mine.iter().copied().max_by(|a, b| {
+                (a.frame.size.width * a.frame.size.height)
+                    .total_cmp(&(b.frame.size.width * b.frame.size.height))
+            })
         })
         .expect("no ordinary window for that pid");
+    if !contains(&w) {
+        println!("  WARNING: no window of this pid contains the point; using the largest");
+    }
     println!("window id={} title={:?} frame={:?}", w.id, w.title, w.frame);
 
     let mut psn = ProcessSerialNumber::default();
