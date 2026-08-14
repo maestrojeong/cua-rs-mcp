@@ -74,28 +74,44 @@ define_class!(
             let (x, y) = (m.x, m.y);
 
             if m.clicking {
-                // A ring at the click point. Drawn first so the arrow sits on
-                // top of it rather than being swallowed by it.
-                let r = 18.0;
+                // A small, quiet ring at the click point: a faint glow plus a
+                // crisp thin outline, not a big flat disc — the old radius-18
+                // filled circle read as an alert, not a cursor. Drawn first so
+                // the arrow sits on top of it rather than being swallowed by
+                // it.
+                let r = 8.0;
                 let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
                     NSPoint::new(x - r, y - r),
                     NSSize::new(r * 2.0, r * 2.0),
                 ));
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.60, 1.0, 0.35).setFill();
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.18).setFill();
                 ring.fill();
+                ring.setLineWidth(1.2);
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.75).setStroke();
+                ring.stroke();
             }
 
-            // A plain arrow, drawn as a filled path rather than an image so
-            // there is no asset to ship or scale.
+            // The "presence cursor" silhouette used by Figma, Notion and
+            // similar multiplayer tools for showing where someone else is
+            // pointing — ported from Lucide's `mouse-pointer-2` icon
+            // (MIT-licensed, https://lucide.dev), corner rounding dropped
+            // since it disappears at this size anyway, then mirrored so it
+            // leans up-right instead of up-left. Nothing forces that
+            // particular handedness; picking the one the real pointer never
+            // uses means a glance is enough to tell this arrow apart from
+            // yours, which a human never needs from their own cursor but an
+            // agent's drawn one benefits from. Still a filled path rather
+            // than an image, so there is no asset to ship or scale.
             let path = NSBezierPath::bezierPath();
             let pts = [
                 (0.0, 0.0),
-                (0.0, 20.0),
-                (5.4, 15.2),
-                (8.8, 22.4),
-                (12.4, 20.7),
-                (9.0, 13.6),
-                (16.0, 13.2),
+                (-0.488, -0.488),
+                (-12.488, 4.387),
+                (-12.441, 5.097),
+                (-7.848, 6.282),
+                (-6.770, 7.358),
+                (-5.585, 11.953),
+                (-4.875, 12.000),
             ];
             path.moveToPoint(NSPoint::new(x + pts[0].0, y + pts[0].1));
             for (dx, dy) in &pts[1..] {
@@ -103,10 +119,14 @@ define_class!(
             }
             path.closePath();
 
-            NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.85).setStroke();
-            path.setLineWidth(3.0);
+            // A thin white outline instead of black keeps the silhouette
+            // crisp over both light and dark content; the fill is a deep
+            // indigo rather than a stock blue, for a quieter, less
+            // "system alert" feel.
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.9).setStroke();
+            path.setLineWidth(1.2);
             path.stroke();
-            NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.60, 1.0, 1.0).setFill();
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.25, 0.32, 0.88, 1.0).setFill();
             path.fill();
         }
 
