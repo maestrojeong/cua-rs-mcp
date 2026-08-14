@@ -63,7 +63,9 @@ fn appkit_event(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: pid_click_probe <pid> <global-x> <global-y> [winlocal flip winid evnum focus]");
+        eprintln!(
+            "usage: pid_click_probe <pid> <global-x> <global-y> [winlocal flip winid evnum focus]"
+        );
         std::process::exit(2);
     }
     // Posting events at all requires this process to be trusted for

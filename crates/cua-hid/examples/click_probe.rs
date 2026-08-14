@@ -19,7 +19,10 @@ fn main() {
 
     let window_id: Option<i64> = if mode == "windowed" {
         let windows = cua_capture::list_windows().expect("list_windows");
-        let w = windows.iter().find(|w| w.pid == pid).expect("window for pid");
+        let w = windows
+            .iter()
+            .find(|w| w.pid == pid)
+            .expect("window for pid");
         eprintln!("using window id {} ({:?})", w.id, w.title);
         Some(w.id as i64)
     } else {

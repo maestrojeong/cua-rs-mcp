@@ -118,8 +118,7 @@ impl ActionArgs {
         if let Some(raw) = &self.element_token {
             let raw = raw.trim();
             let mut parts = raw.splitn(3, '-');
-            let (Some(snap), Some(idx), Some(role)) =
-                (parts.next(), parts.next(), parts.next())
+            let (Some(snap), Some(idx), Some(role)) = (parts.next(), parts.next(), parts.next())
             else {
                 return Err(format!(
                     "element_token should look like `7-12-AXButton` (snapshot-index-role), got {raw:?}"
@@ -150,9 +149,7 @@ impl ActionArgs {
         }
         match (self.x, self.y) {
             (Some(x), Some(y)) => Ok(Target::Point { x, y }),
-            _ => Err(
-                "pass element_token (preferred), element_index, or both x and y".to_string(),
-            ),
+            _ => Err("pass element_token (preferred), element_index, or both x and y".to_string()),
         }
     }
 }

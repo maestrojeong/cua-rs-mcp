@@ -320,7 +320,7 @@ impl ActionResult {
 /// back to the frame centre. `None` when the element publishes neither.
 fn element_point(el: &Element) -> Option<(f64, f64)> {
     if let Some(p) = el.activation_point() {
-        return Some((p.x as f64, p.y as f64));
+        return Some((p.x, p.y));
     }
     el.frame().map(|f| {
         (
@@ -1051,10 +1051,12 @@ impl Inner {
         // the point of use so it reflects the snapshot, not the state after
         // the app has been raised and activated.
         let expected = match &target {
-            Target::Index { index, .. } => { let index = *index; self
-                .snapshots
-                .get(&info.pid)
-                .map(|snap| (index, snapshot_tokens(&snap.nodes, index))) }
+            Target::Index { index, .. } => {
+                let index = *index;
+                self.snapshots
+                    .get(&info.pid)
+                    .map(|snap| (index, snapshot_tokens(&snap.nodes, index)))
+            }
             Target::Point { .. } => None,
         };
 
@@ -1266,7 +1268,12 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.set_string(cua_ax::attr::VALUE, value)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at("AXValue=", desc, changed, element_point(&el)))
+        Ok(ActionResult::ax_at(
+            "AXValue=",
+            desc,
+            changed,
+            element_point(&el),
+        ))
     }
 
     fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
@@ -1414,7 +1421,12 @@ impl Inner {
         let before = self.window_fingerprint(info.pid);
         el.perform(action)?;
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at(action, desc, changed, element_point(&el)))
+        Ok(ActionResult::ax_at(
+            action,
+            desc,
+            changed,
+            element_point(&el),
+        ))
     }
 
     fn find(&mut self, query: &str, needle: &str, limit: usize) -> Result<FindResult> {
@@ -1862,8 +1874,14 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("233"), "got {msg}");
-        assert!(msg.contains("AXCell") && msg.contains("AXButton"), "got {msg}");
-        assert!(msg.contains("get_app_state"), "the remedy must be in the message: {msg}");
+        assert!(
+            msg.contains("AXCell") && msg.contains("AXButton"),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains("get_app_state"),
+            "the remedy must be in the message: {msg}"
+        );
     }
 
     #[test]

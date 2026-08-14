@@ -347,7 +347,10 @@ fn main() {
         for (subtype, label) in [
             (K_CPS_NOTIFY_NEW_FRONT, "kCPSNotifyNewFront"),
             (K_CPS_NOTIFY_KEY_FOCUS_TAKEN, "kCPSNotifyKeyFocusTaken"),
-            (K_CPS_NOTIFY_KEY_FOCUS_RETURNED, "kCPSNotifyKeyFocusReturned"),
+            (
+                K_CPS_NOTIFY_KEY_FOCUS_RETURNED,
+                "kCPSNotifyKeyFocusReturned",
+            ),
         ] {
             match cps_event(subtype, w.id) {
                 Some(ev) => {

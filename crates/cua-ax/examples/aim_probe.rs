@@ -36,7 +36,11 @@ fn main() {
         .element(attr::FOCUSED_WINDOW)
         .or_else(|| app.elements(attr::WINDOWS).into_iter().next())
         .expect("no window");
-    println!("window: {:?} frame={:?}", window.string(attr::TITLE), window.frame());
+    println!(
+        "window: {:?} frame={:?}",
+        window.string(attr::TITLE),
+        window.frame()
+    );
 
     let nodes = window.snapshot_tree(Limits::default());
     println!("{} nodes", nodes.len());
@@ -64,7 +68,10 @@ fn main() {
             let cx = f.origin.x + f.size.width / 2.0;
             let cy = f.origin.y + f.size.height / 2.0;
             println!("  frame        = {f:?}");
-            println!("  centre       = ({cx:.0}, {cy:.0}) -> owner {}", owner_of(cx, cy));
+            println!(
+                "  centre       = ({cx:.0}, {cy:.0}) -> owner {}",
+                owner_of(cx, cy)
+            );
         }
         match el.activation_point() {
             Some(p) => println!(

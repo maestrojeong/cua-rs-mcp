@@ -22,9 +22,8 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
-    allow_hid, hid_allowed, ActionResult, AppState, CoreError, Cua, Delivery, FindResult,
-    Observed, Permissions, Presence, Screenshot, ScrollDir, StateOptions, Target,
-    WaitOutcome,
+    allow_hid, hid_allowed, ActionResult, AppState, CoreError, Cua, Delivery, FindResult, Observed,
+    Permissions, Presence, Screenshot, ScrollDir, StateOptions, Target, WaitOutcome,
 };
 pub use snapshot::{render_tree, RenderOptions};
 

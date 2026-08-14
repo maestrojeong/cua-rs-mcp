@@ -197,7 +197,10 @@ fn main() {
     // must not steal key focus from the app the agent is driving.
     window.orderFrontRegardless();
 
-    eprintln!("cua-overlay ready on {:.0}x{:.0}", frame.size.width, frame.size.height);
+    eprintln!(
+        "cua-overlay ready on {:.0}x{:.0}",
+        frame.size.width, frame.size.height
+    );
 
     // Commands arrive on a reader thread; drawing has to happen on the main
     // thread, so the reader hands work back through the run loop.
@@ -216,7 +219,12 @@ fn main() {
                     let clicking = line.starts_with("click");
                     let x: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     let y: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                    Marker { x, y, visible: true, clicking }
+                    Marker {
+                        x,
+                        y,
+                        visible: true,
+                        clicking,
+                    }
                 }
                 Some("hide") => Marker::default(),
                 Some("quit") => std::process::exit(0),

@@ -24,8 +24,8 @@ use std::ffi::c_void;
 
 use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventMask, CGEventTapLocation, CGEventTapOptions,
-    CGEventTapPlacement, CGEventType,
+    CGEvent, CGEventField, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType,
 };
 
 /// Fields worth printing for a mouse event, by raw number so the ones the Rust
@@ -53,10 +53,7 @@ unsafe extern "C-unwind" fn callback(
 ) -> *mut CGEvent {
     let ev = unsafe { event.as_ref() };
     let loc = CGEvent::location(Some(ev));
-    println!(
-        "\n{:?} at ({:.0}, {:.0})",
-        etype, loc.x, loc.y
-    );
+    println!("\n{:?} at ({:.0}, {:.0})", etype, loc.x, loc.y);
     for (field, name) in FIELDS {
         let v = CGEvent::integer_value_field(Some(ev), CGEventField(*field));
         if v != 0 {
