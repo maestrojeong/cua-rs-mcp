@@ -540,7 +540,9 @@ result.
 | timestamp | `setTimestamp(DispatchTime.now().uptimeNanoseconds)` immediately before each post | never set | `CLOCK_UPTIME_RAW`, read immediately before each post |
 | activation | `SyntheticAppFocusEnforcer.enforceActiveState(for:)` + synthesized `notifyAppActivated` / `notifyAppDeactivated` | none, by policy | synthesized `ApplicationActivated`/`Deactivated` notices; real activation still refused |
 | waiting for activation to land | `waitUntilAppBelievesItIsFrontmost(2.0)`, polled | fixed 12 ms sleep | polls the target's `AXFrontmost` to the same 2 s ceiling |
-| keeping a background menu open | `clickEventTap: EventTap?` + `startSuppressingMenuDismissalEvents(menuPID:)` / `stopSuppressingMenuDismissalEvents()` | none | not built — see §10 |
+| keeping a background menu open | `SystemFocusStealPreventer` process taps whose callback returns NULL, registered per target pid *and* menu pid | none | not built — see §10 |
+| holding focus during a session | `clickEventTap`, listen-only, re-activating the target with `NSRunningApplication.activate` when something else takes focus | none, by policy | not built — see §10 |
+| menu lifecycle | `ComputerUseAppController` tracks `_currentlyOpenedMenu` / `_currentlyFocusedMenuBarItem` and feeds the menu's pid to suppression | none — only `sendClick` was reproduced | not built |
 | post route | public `CGEventPostToPid` | private `SLEventPostToPid` | unchanged — see below |
 | deactivation | `deactivateFocusEnforcer()`, a lifecycle step | `ApplicationDeactivated` after *every* click | not sent per click — see below |
 | keyboard | `CGEventCreateKeyboardEvent` + `keyboardSetUnicodeString`, posted per-pid | global HID tap only; arbitrary keys refused outright | per-pid path written, gated (see §10) |
@@ -627,22 +629,52 @@ the obvious next safety feature.
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.
 
-**Menu-opening controls are still unsolved, and the reason is now known.**
-A chat app's header menu button ignored a pid-routed click that the *same
-coordinates* accepted from the reference implementation — measured against
-KakaoTalk's chat-room hamburger at screen (810, 103), which the reference clicked
-successfully with the target app in the background, so neither the coordinate nor
-real activation is the missing ingredient. Two things separate the two paths. The
-first is now fixed: nothing waited for the synthesized activation notice to be
-drained by the target's run loop, so the mouse-down raced the app's own
-`NSApp.isActive` flip. The second is not: a menu opened in a background app is
-dismissed almost immediately, and the reference keeps it alive with a
-`CGEventTap` (`startSuppressingMenuDismissalEvents(menuPID:)`) that swallows the
-events which would close it. Building that means installing a tap on the user's
-real input stream, which is the boundary §9 draws deliberately — so it is a
-design decision, not a task. Until it is taken, treat menus as observable but not
-operable, and note that `AXShowMenu` via `perform_secondary_action` reaches some
-of the same controls without any of this machinery.
+**The reference does use real activation, just not where we looked.** An earlier
+reading of the symbol table concluded it never calls
+`NSRunningApplication.activate`, and §1 still repeats that its undefined-symbol
+table contains no event-posting calls. Both statements were too strong. Its
+`clickEventTap` is `kCGAnnotatedSessionEventTap` with `kCGEventTapOptionListenOnly`
+— the raw options word at `0x100e8a730` is `{placement: 0, options: 1}` — and its
+callback passes every event through unchanged (`sky_decomp.c:1670393-1670405`).
+What that callback *does* is watch for another process taking focus and answer by
+calling `activateWithOptions(0)` on the target (`sky_decomp.c:1670407-1670547`).
+
+So the model is not "never disturb focus". It is "hold the target frontmost for
+the duration of a session, and put it back if something takes it away". That
+reframes the one measurement where the reference appeared to drive a background
+app: the observer could not confirm real frontmost state at the time, and this
+tap would have re-activated the target within a frame of the test raising another
+window. Treat "the reference works in the background" as unproven.
+
+**Menu-opening controls are still unsolved.** KakaoTalk's chat-room hamburger is
+the standing case: it advertises no AX actions, so a synthesized click is the
+only route, and it opens for the reference implementation at coordinates cua-rs
+also computes correctly. What has been ruled out, each by measurement rather than
+argument: the coordinate; the AppKit event header; the timestamp; the ordering of
+the focus notices; whether the target believes it is frontmost (`AXFrontmost`
+does flip, in about 150 ms); the private versus public per-pid post route (both
+behave the same); and — the most informative one — moving the real pointer onto
+the control and clicking it there, which also does nothing. A real HID click
+failing is what rules out "menu tracking needs the cursor over the control" and
+says the missing piece is around the click rather than in it.
+
+Two candidates remain, both from the reference and neither built here:
+
+- **Menu-dismissal suppression.** Not the `clickEventTap` — that one is
+  listen-only and passes events through. It is `SystemFocusStealPreventer`,
+  which installs *process* taps on the target pid and, separately, on the menu's
+  own pid, whose callback returns NULL for the events that would close the menu
+  (`sky_decomp.c:1675580-1675665`). This is a real filter on input, which is the
+  boundary §9 draws deliberately, so it is a decision rather than a task.
+- **Menu lifecycle tracking.** `ComputerUseAppController` keeps
+  `_currentlyOpenedMenu` and `_currentlyFocusedMenuBarItem`, and the menu pid it
+  hands to suppression comes from there. Only `sendClick` was reproduced here;
+  the controller layer above it was not, and a menu pid cannot be supplied
+  without it.
+
+Until one of those is taken on, treat menus as observable but not operable, and
+note that `AXShowMenu` via `perform_secondary_action` reaches some controls with
+none of this machinery — though not this one, which exposes no actions at all.
 
 **The per-pid keyboard path is written but unproven.**
 `press_chord_background_pid` and `type_text_background_pid` exist in `cua-hid`
