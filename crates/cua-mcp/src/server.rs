@@ -749,13 +749,8 @@ fn render_post_action_state(state: &cua_core::PostActionState) -> String {
     );
 
     let Some(diff) = &state.diff else {
-        match &state.tree {
-            Some(tree) => {
-                s.push_str("\n  no earlier snapshot to compare against, so the whole tree:\n");
-                s.push_str(tree);
-            }
-            None => s.push_str("\n  (unavailable)"),
-        }
+        s.push_str("\n  ");
+        s.push_str(state.note.as_deref().unwrap_or("no diff available"));
         return s;
     };
 

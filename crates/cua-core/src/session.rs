@@ -145,6 +145,12 @@ pub struct Snapshot {
     /// PIDs are recycled, so pid equality alone cannot make those handles safe
     /// after an app exits and relaunches.
     process_key: ProcessKey,
+    /// Whether this walk started from an element rather than from the window.
+    ///
+    /// A scoped snapshot describes a subtree, so diffing a later whole-window
+    /// walk against it reports the entire window as new. Recorded so the
+    /// post-action diff can decline instead of emitting that noise.
+    scoped: bool,
 }
 
 /// What the agent gets back from `get_app_state`.
@@ -289,11 +295,15 @@ pub struct PostActionState {
     /// `tree` belong to *this* snapshot, and it is the one to quote back.
     pub snapshot_id: u64,
     /// Lines that appeared or vanished versus the pre-action tree. `None` when
-    /// there was no comparable snapshot to diff against, in which case `tree`
-    /// carries the whole outline instead.
+    /// there was nothing fair to compare against; `note` then says why.
     pub diff: Option<crate::snapshot::TreeDiff>,
-    /// The full outline, sent only when a diff was not possible.
-    pub tree: Option<String>,
+    /// Why no diff is present, when there is none.
+    ///
+    /// The whole outline is deliberately *not* sent instead. Falling back to it
+    /// would spend exactly the tokens this feature exists to save, at the moment
+    /// the caller least expects it; the fresh `snapshot_id` and this line are
+    /// enough for the caller to decide whether reading the tree is worth it.
+    pub note: Option<String>,
     pub node_count: usize,
 }
 
@@ -1025,6 +1035,7 @@ impl Inner {
                 window: window.clone(),
                 taken_at: Instant::now(),
                 process_key: key,
+                scoped: opts.scope.is_some(),
             },
         );
 
@@ -1135,35 +1146,58 @@ impl Inner {
         Ok(result)
     }
 
-    /// The outline of the snapshot this app already has, rendered the same way
-    /// the post-action read will be so the two are comparable.
-    fn rendered_current_tree(&self, query: &str) -> Option<String> {
+    /// The outline of the snapshot this app already has, plus the window it
+    /// described, rendered the same way the post-action read will be.
+    ///
+    /// `None` when the existing snapshot is not a fair basis for a diff. A
+    /// scoped walk covers one subtree, so a later whole-window walk would show
+    /// the entire window as new — 298 added lines for a click, measured — which
+    /// is worse than no diff at all because it buries the few lines that matter.
+    fn rendered_current_tree(&self, query: &str) -> Option<(String, Option<u32>)> {
         let info = apps::resolve_app(query).ok()?;
         let snap = self.snapshots.get(&info.pid)?;
-        Some(crate::snapshot::render_tree(
-            &snap.nodes,
-            post_action_render(),
+        if snap.scoped {
+            return None;
+        }
+        Some((
+            crate::snapshot::render_tree(&snap.nodes, post_action_render()),
+            snap.window.as_ref().map(|w| w.id),
         ))
     }
 
     /// Re-walk the window after an action and diff it against `before`.
-    fn read_state_after(&mut self, query: &str, before: Option<String>) -> Option<PostActionState> {
+    fn read_state_after(
+        &mut self,
+        query: &str,
+        before: Option<(String, Option<u32>)>,
+    ) -> Option<PostActionState> {
         let opts = StateOptions {
             include_screenshot: false,
             render: post_action_render(),
             ..StateOptions::default()
         };
         let state = self.get_app_state(query, opts).ok()?;
+
+        // Only subtract trees that describe the same window. An action that
+        // opens or switches windows — a chat row that opens a conversation —
+        // leaves nothing meaningful to subtract, and presenting a whole new tree
+        // as a change set would bury the answer instead of giving it.
+        let after_window = apps::resolve_app(query)
+            .ok()
+            .and_then(|info| self.snapshots.get(&info.pid))
+            .and_then(|s| s.window.as_ref().map(|w| w.id));
+        let comparable = before.filter(|(_, before_window)| *before_window == after_window);
+
         Some(PostActionState {
             snapshot_id: state.snapshot_id,
-            diff: before
-                .as_deref()
-                .map(|b| crate::snapshot::diff_trees(b, &state.tree)),
-            tree: if before.is_some() {
-                None
-            } else {
-                Some(state.tree)
-            },
+            diff: comparable
+                .as_ref()
+                .map(|(b, _)| crate::snapshot::diff_trees(b, &state.tree)),
+            note: comparable.is_none().then(|| {
+                "the window this app is showing is not the one the previous snapshot described, \
+                 so there is nothing to diff against. Call get_app_state to read the new window"
+                    .to_string()
+            }),
             node_count: state.node_count,
         })
     }
