@@ -96,6 +96,37 @@ fn settle() {
     std::thread::sleep(std::time::Duration::from_millis(600));
 }
 
+/// The pid the window server currently considers frontmost — the real one, not
+/// the target's own `AXFrontmost` belief, which the synthesized notices move.
+fn real_frontmost() -> Option<libc::pid_t> {
+    objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|a| a.processIdentifier())
+}
+
+/// Make `pid` genuinely frontmost and wait for the window server to agree.
+///
+/// This is `NSRunningApplication.activate`, the thing the rest of cua-rs refuses
+/// to call. The reference implementation does call it — its focus tap answers a
+/// focus steal with `activateWithOptions(0)` — so this arm measures whether real
+/// activation is what the menu has been waiting for.
+fn really_activate(pid: libc::pid_t) -> bool {
+    let Some(app) =
+        objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+    else {
+        return false;
+    };
+    app.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::ActivateAllWindows);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        if real_frontmost() == Some(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    false
+}
+
 fn dismiss(app: &Element) {
     // Escape through the app element, then give tracking time to unwind. Leaving
     // a menu open would poison the next arm of the experiment.
@@ -107,7 +138,7 @@ fn main() {
     require_trusted().expect("Accessibility is not granted to this process");
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: menu_probe <pid> <screen-x> <screen-y> [quiet|warp|both]");
+        eprintln!("usage: menu_probe <pid> <screen-x> <screen-y> [quiet|activate|warp|both]");
         std::process::exit(2);
     }
     let pid: libc::pid_t = args[1].parse().expect("pid");
@@ -184,6 +215,59 @@ fn main() {
             println!("   {line}");
         }
         dismiss(&app);
+    }
+
+    if mode == "activate" || mode == "both" {
+        dismiss(&app);
+        let previous = real_frontmost();
+        let became = really_activate(pid);
+        println!(
+            "[activ] previous frontmost={previous:?} target now frontmost={became} (real={:?})",
+            real_frontmost()
+        );
+        // No activation assist here, deliberately. Its whole job is to make a
+        // window key without real activation, which this arm has already done
+        // for real — and it was measured to drag the window: the target moved
+        // from (1140, 48) to (397, 95) across one run, which is a synthesized
+        // title-bar press being read as the start of a drag.
+        //
+        // Re-reading the frame matters for the same reason: a stale origin makes
+        // the window-local conversion wrong, and a wrong window-local point is
+        // exactly what turns a click into a drag.
+        let live = cua_capture::list_windows()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| w.id == win.id)
+            .unwrap_or_else(|| win.clone());
+        let r = cua_hid::click_background_pid(
+            cua_hid::PidClick {
+                pid,
+                point: (x, y),
+                window_local: (x - live.frame.origin.x, y - live.frame.origin.y),
+                wid: live.id,
+                count: 1,
+            },
+            None,
+            &|| Element::for_pid(pid).bool("AXFrontmost").unwrap_or(false),
+        );
+        settle();
+        println!(
+            "[activ] click={r:?} (window at ({}, {}))",
+            live.frame.origin.x, live.frame.origin.y
+        );
+        for line in app_children(&app) {
+            println!("   {line}");
+        }
+        println!("   -- windows --");
+        for line in pid_windows(pid) {
+            println!("   {line}");
+        }
+        dismiss(&app);
+        // Put the human's app back, which is the whole cost of this arm.
+        if let Some(prev) = previous.filter(|p| *p != pid) {
+            really_activate(prev);
+            println!("[activ] restored frontmost={:?}", real_frontmost());
+        }
     }
 
     if mode == "warp" || mode == "both" {

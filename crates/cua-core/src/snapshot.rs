@@ -292,6 +292,74 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// What changed between two rendered trees.
+///
+/// Line-level and deliberately not positional. A structural diff over `AxNode`
+/// would need stable identity across snapshots, and there is none: `index` is a
+/// position in a walk that can reorder, and the retained handles are new objects
+/// each time. Comparing the rendered outline sidesteps the problem, and the
+/// outline is what the agent reads anyway — a change it cannot see in the text
+/// is a change it cannot act on.
+///
+/// Indentation is kept in the reported lines, so a caller can still tell roughly
+/// where in the tree something appeared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl TreeDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Compare two rendered trees, reporting only lines that appeared or vanished.
+///
+/// Multiset semantics, so a line that occurs three times before and once after
+/// is reported as two removals rather than as unchanged. Order within each list
+/// follows the tree it came from.
+///
+/// The point is size: an app whose outline runs to hundreds of nodes produces a
+/// handful of diff lines for a click, and re-sending the whole outline after
+/// every action is the difference between an affordable verification step and
+/// one an agent learns to skip.
+pub fn diff_trees(before: &str, after: &str) -> TreeDiff {
+    use std::collections::HashMap;
+
+    let mut before_counts: HashMap<&str, i64> = HashMap::new();
+    for line in before.lines() {
+        *before_counts.entry(line).or_default() += 1;
+    }
+    let mut after_counts: HashMap<&str, i64> = HashMap::new();
+    for line in after.lines() {
+        *after_counts.entry(line).or_default() += 1;
+    }
+
+    let mut added = Vec::new();
+    let mut seen: HashMap<&str, i64> = HashMap::new();
+    for line in after.lines() {
+        let n = seen.entry(line).or_default();
+        *n += 1;
+        if *n > before_counts.get(line).copied().unwrap_or(0) {
+            added.push(line.to_string());
+        }
+    }
+
+    let mut removed = Vec::new();
+    let mut seen: HashMap<&str, i64> = HashMap::new();
+    for line in before.lines() {
+        let n = seen.entry(line).or_default();
+        *n += 1;
+        if *n > after_counts.get(line).copied().unwrap_or(0) {
+            removed.push(line.to_string());
+        }
+    }
+
+    TreeDiff { added, removed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +640,49 @@ mod tests {
         let out = render_tree(&[n], RenderOptions::default());
         assert_eq!(out.trim().lines().count(), 1, "got {out:?}");
         assert!(out.contains("\\n"));
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn identical_trees_have_no_diff() {
+        let t = "[0] AXWindow\n  [1] AXButton\n";
+        assert!(diff_trees(t, t).is_empty());
+    }
+
+    #[test]
+    fn reports_appearing_and_vanishing_lines() {
+        let before = "[0] AXWindow\n  [1] AXButton \"Save\"\n";
+        let after = "[0] AXWindow\n  [1] AXButton \"Save\"\n  [2] AXMenu \"Options\"\n";
+        let d = diff_trees(before, after);
+        assert_eq!(d.added, vec!["  [2] AXMenu \"Options\"".to_string()]);
+        assert!(d.removed.is_empty());
+
+        let back = diff_trees(after, before);
+        assert_eq!(back.removed, vec!["  [2] AXMenu \"Options\"".to_string()]);
+        assert!(back.added.is_empty());
+    }
+
+    #[test]
+    fn repeated_lines_are_counted_not_deduplicated() {
+        // Three identical rows collapsing to one is a real change and must not
+        // read as "nothing happened" just because the text still occurs.
+        let before = "  row\n  row\n  row\n";
+        let after = "  row\n";
+        let d = diff_trees(before, after);
+        assert_eq!(d.removed.len(), 2);
+        assert!(d.added.is_empty());
+    }
+
+    #[test]
+    fn a_changed_value_shows_as_one_removal_and_one_addition() {
+        let before = "  [3] AXTextArea = \"draft\"\n";
+        let after = "  [3] AXTextArea = \"sent\"\n";
+        let d = diff_trees(before, after);
+        assert_eq!(d.removed.len(), 1);
+        assert_eq!(d.added.len(), 1);
     }
 }

@@ -22,10 +22,10 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
-    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, Observed, Permissions, Presence,
-    Screenshot, ScrollDir, StateOptions, Target, WaitOutcome,
+    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, Observed, Permissions,
+    PostActionState, Presence, Screenshot, ScrollDir, StateOptions, Target, WaitOutcome,
 };
-pub use snapshot::{render_tree, RenderOptions};
+pub use snapshot::{diff_trees, render_tree, RenderOptions, TreeDiff};
 
 /// Re-exported so callers can tune tree limits without depending on `cua-ax`
 /// directly.

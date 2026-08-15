@@ -109,9 +109,24 @@ struct ActionArgs {
     /// Screen y, in points.
     #[serde(default)]
     y: Option<f32>,
+    /// Re-read the window after the action and report what changed, as a diff
+    /// against the tree before it.
+    ///
+    /// Worth setting whenever the next step depends on the result. `ui_changed`
+    /// is a heuristic — it compares the focused element and the window title —
+    /// and it reports `no` for real changes it cannot see, a menu opening in its
+    /// own window being the measured case. The diff is usually a few lines even
+    /// for a large window, and it carries a fresh `snapshot_id` to act against,
+    /// which saves the `get_app_state` round trip that would otherwise follow.
+    #[serde(default)]
+    return_state: Option<bool>,
 }
 
 impl ActionArgs {
+    fn return_state(&self) -> bool {
+        self.return_state.unwrap_or(false)
+    }
+
     fn target(&self) -> Result<Target, String> {
         // Token first: it is the form that pins everything, so a caller that
         // supplies both should get the stricter reading.
@@ -416,8 +431,12 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let count = a.count.unwrap_or(1).clamp(1, 3);
-        match self.native(move |c| c.click(&app, target, count)).await {
+        match self
+            .native(move |c| c.click(&app, target, count, want_state))
+            .await
+        {
             Ok(r) => Ok(ok(render_action(&r))),
             Err(e) => Ok(fail(e.to_string())),
         }
@@ -435,9 +454,10 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let value = a.value.clone();
         match self
-            .native(move |c| c.set_value(&app, target, &value))
+            .native(move |c| c.set_value(&app, target, &value, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -468,9 +488,10 @@ impl CuaServer {
             }
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let pages = a.pages.unwrap_or(1).clamp(1, 50);
         match self
-            .native(move |c| c.scroll(&app, target, dir, pages))
+            .native(move |c| c.scroll(&app, target, dir, pages, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -490,8 +511,12 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let text = a.text.clone();
-        match self.native(move |c| c.type_text(&app, target, &text)).await {
+        match self
+            .native(move |c| c.type_text(&app, target, &text, want_state))
+            .await
+        {
             Ok(r) => Ok(ok(render_action(&r))),
             Err(e) => Ok(fail(e.to_string())),
         }
@@ -509,9 +534,10 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let (text, prefix, suffix) = (a.text.clone(), a.prefix.clone(), a.suffix.clone());
         match self
-            .native(move |c| c.select_text(&app, target, &text, prefix, suffix))
+            .native(move |c| c.select_text(&app, target, &text, prefix, suffix, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -531,8 +557,12 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let key = a.key.clone();
-        match self.native(move |c| c.press_key(&app, target, &key)).await {
+        match self
+            .native(move |c| c.press_key(&app, target, &key, want_state))
+            .await
+        {
             Ok(r) => Ok(ok(render_action(&r))),
             Err(e) => Ok(fail(e.to_string())),
         }
@@ -550,9 +580,10 @@ impl CuaServer {
             Err(e) => return Ok(fail(e)),
         };
         let app = a.target.app.clone();
+        let want_state = a.target.return_state();
         let action = a.action.clone();
         match self
-            .native(move |c| c.perform_action(&app, target, &action))
+            .native(move |c| c.perform_action(&app, target, &action, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -675,6 +706,62 @@ fn render_action(r: &cua_core::ActionResult) -> String {
             "  (nothing to compare: this app published no window state before or after, so this is NOT evidence the action failed. Verify with get_app_state)"
         }
     });
+    if let Some(state) = &r.state {
+        s.push_str(&render_post_action_state(state));
+    }
+    s
+}
+
+/// Append what the window looked like after the action.
+///
+/// A diff of zero lines is reported explicitly rather than omitted. "The tree is
+/// identical" and "nobody looked" are different findings, and only the first one
+/// is evidence that a control did nothing — leaving the section out would let a
+/// caller read a silence as either.
+fn render_post_action_state(state: &cua_core::PostActionState) -> String {
+    // Enough to see what happened, small enough that turning this on is never
+    // the reason a response blows the context window. A change this large is
+    // better handled by re-reading the tree deliberately.
+    const MAX_LINES: usize = 40;
+
+    let mut s = format!(
+        "\n\nstate after (snapshot_id={}, {} elements):",
+        state.snapshot_id, state.node_count
+    );
+
+    let Some(diff) = &state.diff else {
+        match &state.tree {
+            Some(tree) => {
+                s.push_str("\n  no earlier snapshot to compare against, so the whole tree:\n");
+                s.push_str(tree);
+            }
+            None => s.push_str("\n  (unavailable)"),
+        }
+        return s;
+    };
+
+    if diff.is_empty() {
+        s.push_str("\n  no change in the accessibility tree");
+        return s;
+    }
+
+    let mut push = |label: &str, lines: &[String], mark: char| {
+        if lines.is_empty() {
+            return;
+        }
+        s.push_str(&format!("\n  {label} ({}):", lines.len()));
+        for line in lines.iter().take(MAX_LINES) {
+            s.push_str(&format!("\n  {mark} {}", line.trim_end()));
+        }
+        if lines.len() > MAX_LINES {
+            s.push_str(&format!(
+                "\n  … {} more (call get_app_state for the full tree)",
+                lines.len() - MAX_LINES
+            ));
+        }
+    };
+    push("appeared", &diff.added, '+');
+    push("vanished", &diff.removed, '-');
     s
 }
 

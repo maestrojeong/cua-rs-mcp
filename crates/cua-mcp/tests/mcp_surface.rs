@@ -170,6 +170,14 @@ fn every_action_tool_accepts_a_snapshot_id() {
             !tool["inputSchema"]["properties"]["element_index"].is_null(),
             "{name} must accept element_index"
         );
+        // Same reasoning as the staleness guard: verification-after-action is
+        // only reachable if every action offers it. A tool that quietly lost the
+        // field would send the caller back to `ui_changed` alone, which is the
+        // heuristic this exists to work around.
+        assert!(
+            !tool["inputSchema"]["properties"]["return_state"].is_null(),
+            "{name} must accept return_state"
+        );
     }
 }
 

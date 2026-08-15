@@ -196,6 +196,19 @@ pub struct StateOptions {
     pub scope: Option<usize>,
 }
 
+/// How a post-action re-read is rendered.
+///
+/// Omission notes are turned off because they are prose about the render, not
+/// about the app: "12 structural elements omitted" is identical before and
+/// after, so it would either be diffed away as noise or, worse, flip when the
+/// count changes and read as a real UI change.
+fn post_action_render() -> crate::snapshot::RenderOptions {
+    crate::snapshot::RenderOptions {
+        note_omissions: false,
+        ..crate::snapshot::RenderOptions::default()
+    }
+}
+
 impl Default for StateOptions {
     fn default() -> Self {
         Self {
@@ -257,6 +270,31 @@ pub struct ActionResult {
     /// CGWindowID used only to pin the drawn cursor immediately above the
     /// target window instead of above unrelated foreground windows.
     overlay_window_id: Option<u32>,
+    /// What the window looked like after the action, when the caller asked.
+    pub state: Option<PostActionState>,
+}
+
+/// The target's state immediately after an action, when `return_state` was set.
+///
+/// This exists because `ui_changed` is a heuristic and a false negative is
+/// expensive: it reads as "the control did nothing", which is exactly the wrong
+/// conclusion to hand an agent. A menu that opens as its own window, for
+/// instance, changes neither the focused element nor the window title, so the
+/// heuristic reports `Unchanged` while the app has plainly done something. The
+/// only way to be sure is to look — so this makes looking part of the action
+/// rather than a second round trip the agent has to remember to make.
+#[derive(Debug, Clone)]
+pub struct PostActionState {
+    /// Id of the snapshot taken after the action. Element indices in `diff` or
+    /// `tree` belong to *this* snapshot, and it is the one to quote back.
+    pub snapshot_id: u64,
+    /// Lines that appeared or vanished versus the pre-action tree. `None` when
+    /// there was no comparable snapshot to diff against, in which case `tree`
+    /// carries the whole outline instead.
+    pub diff: Option<crate::snapshot::TreeDiff>,
+    /// The full outline, sent only when a diff was not possible.
+    pub tree: Option<String>,
+    pub node_count: usize,
 }
 
 impl ActionResult {
@@ -275,6 +313,7 @@ impl ActionResult {
             delivery: Delivery::Ax,
             point,
             overlay_window_id: None,
+            state: None,
         }
     }
 
@@ -652,16 +691,35 @@ impl Cua {
     /// `count` is the click count. `2` means the caller knows this target only
     /// responds to a real double-click, which no accessibility verb can
     /// express — see [`Inner::click`].
-    pub fn click(&self, app: &str, target: Target, count: u8) -> Result<ActionResult> {
+    ///
+    /// `return_state` re-reads the window afterwards and attaches the result;
+    /// see [`PostActionState`] for why that is worth a round trip.
+    pub fn click(
+        &self,
+        app: &str,
+        target: Target,
+        count: u8,
+        return_state: bool,
+    ) -> Result<ActionResult> {
         let app = app.to_string();
-        self.exec_action(true, move |inner| inner.click(&app, target, count))
+        self.exec_action(true, move |inner| {
+            inner.acting(&app, return_state, |i| i.click(&app, target, count))
+        })
     }
 
     /// Replace a text element's contents.
-    pub fn set_value(&self, app: &str, target: Target, value: &str) -> Result<ActionResult> {
+    pub fn set_value(
+        &self,
+        app: &str,
+        target: Target,
+        value: &str,
+        return_state: bool,
+    ) -> Result<ActionResult> {
         let app = app.to_string();
         let value = value.to_string();
-        self.exec_action(false, move |inner| inner.set_value(&app, target, &value))
+        self.exec_action(false, move |inner| {
+            inner.acting(&app, return_state, |i| i.set_value(&app, target, &value))
+        })
     }
 
     /// Scroll a scrollable element by whole pages.
@@ -671,16 +729,27 @@ impl Cua {
         target: Target,
         dir: ScrollDir,
         pages: u32,
+        return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
-        self.exec_action(false, move |inner| inner.scroll(&app, target, dir, pages))
+        self.exec_action(false, move |inner| {
+            inner.acting(&app, return_state, |i| i.scroll(&app, target, dir, pages))
+        })
     }
 
     /// Append text to an element, preferring insertion over replacement.
-    pub fn type_text(&self, app: &str, target: Target, text: &str) -> Result<ActionResult> {
+    pub fn type_text(
+        &self,
+        app: &str,
+        target: Target,
+        text: &str,
+        return_state: bool,
+    ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
-        self.exec_action(false, move |inner| inner.type_text(&app, target, &text))
+        self.exec_action(false, move |inner| {
+            inner.acting(&app, return_state, |i| i.type_text(&app, target, &text))
+        })
     }
 
     /// Select a literal substring inside an element's text.
@@ -691,27 +760,46 @@ impl Cua {
         text: &str,
         prefix: Option<String>,
         suffix: Option<String>,
+        return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
         self.exec_action(false, move |inner| {
-            inner.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
+            inner.acting(&app, return_state, |i| {
+                i.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
+            })
         })
     }
 
     /// Press a key, through AX when the key has a verb and HID otherwise.
-    pub fn press_key(&self, app: &str, target: Target, key: &str) -> Result<ActionResult> {
+    pub fn press_key(
+        &self,
+        app: &str,
+        target: Target,
+        key: &str,
+        return_state: bool,
+    ) -> Result<ActionResult> {
         let app = app.to_string();
         let key = key.to_string();
-        self.exec_action(false, move |inner| inner.press_key(&app, target, &key))
+        self.exec_action(false, move |inner| {
+            inner.acting(&app, return_state, |i| i.press_key(&app, target, &key))
+        })
     }
 
     /// Deliver an arbitrary AX action by name.
-    pub fn perform_action(&self, app: &str, target: Target, action: &str) -> Result<ActionResult> {
+    pub fn perform_action(
+        &self,
+        app: &str,
+        target: Target,
+        action: &str,
+        return_state: bool,
+    ) -> Result<ActionResult> {
         let app = app.to_string();
         let action = action.to_string();
         self.exec_action(false, move |inner| {
-            inner.perform_action(&app, target, &action)
+            inner.acting(&app, return_state, |i| {
+                i.perform_action(&app, target, &action)
+            })
         })
     }
 
@@ -1017,6 +1105,69 @@ impl Inner {
         }
     }
 
+    /// Run one action and, when asked, re-read the window and attach what
+    /// changed.
+    ///
+    /// The re-read has to happen here rather than in a follow-up call for two
+    /// reasons. It is the same hop on the AX worker thread, so it cannot
+    /// interleave with another caller's action; and the *pre*-action tree has to
+    /// be rendered before the action runs, because the action replaces the
+    /// snapshot it would have been rendered from.
+    ///
+    /// Failing to re-read is not an error. The action already happened, and
+    /// reporting it as a failure because the follow-up read did not work would
+    /// invite a caller to retry something that already took effect.
+    fn acting<F>(&mut self, query: &str, return_state: bool, act: F) -> Result<ActionResult>
+    where
+        F: FnOnce(&mut Self) -> Result<ActionResult>,
+    {
+        let before = if return_state {
+            self.rendered_current_tree(query)
+        } else {
+            None
+        };
+
+        let mut result = act(self)?;
+
+        if return_state {
+            result.state = self.read_state_after(query, before);
+        }
+        Ok(result)
+    }
+
+    /// The outline of the snapshot this app already has, rendered the same way
+    /// the post-action read will be so the two are comparable.
+    fn rendered_current_tree(&self, query: &str) -> Option<String> {
+        let info = apps::resolve_app(query).ok()?;
+        let snap = self.snapshots.get(&info.pid)?;
+        Some(crate::snapshot::render_tree(
+            &snap.nodes,
+            post_action_render(),
+        ))
+    }
+
+    /// Re-walk the window after an action and diff it against `before`.
+    fn read_state_after(&mut self, query: &str, before: Option<String>) -> Option<PostActionState> {
+        let opts = StateOptions {
+            include_screenshot: false,
+            render: post_action_render(),
+            ..StateOptions::default()
+        };
+        let state = self.get_app_state(query, opts).ok()?;
+        Some(PostActionState {
+            snapshot_id: state.snapshot_id,
+            diff: before
+                .as_deref()
+                .map(|b| crate::snapshot::diff_trees(b, &state.tree)),
+            tree: if before.is_some() {
+                None
+            } else {
+                Some(state.tree)
+            },
+            node_count: state.node_count,
+        })
+    }
+
     fn click(&mut self, query: &str, target: Target, count: u8) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
@@ -1169,6 +1320,7 @@ impl Inner {
             delivery: Delivery::Pid,
             point: Some((x, y)),
             overlay_window_id: Some(wid),
+            state: None,
         })
     }
 
