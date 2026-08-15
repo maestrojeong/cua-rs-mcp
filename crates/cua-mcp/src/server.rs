@@ -110,21 +110,31 @@ struct ActionArgs {
     #[serde(default)]
     y: Option<f32>,
     /// Re-read the window after the action and report what changed, as a diff
-    /// against the tree before it.
+    /// against the tree from before it. **On by default.**
     ///
-    /// Worth setting whenever the next step depends on the result. `ui_changed`
-    /// is a heuristic — it compares the focused element and the window title —
-    /// and it reports `no` for real changes it cannot see, a menu opening in its
-    /// own window being the measured case. The diff is usually a few lines even
-    /// for a large window, and it carries a fresh `snapshot_id` to act against,
-    /// which saves the `get_app_state` round trip that would otherwise follow.
+    /// This is strictly cheaper than the `get_app_state` that would otherwise
+    /// follow: same single tree walk, but one round trip instead of two, and a
+    /// few lines of diff instead of the whole outline. It also replaces
+    /// `ui_changed`, which is only a heuristic — it compares the focused element
+    /// and the window title, and reports `no` for real changes it cannot see, a
+    /// menu opening in its own window being the measured case.
+    ///
+    /// Set it to `false` for a run of actions whose intermediate states nobody
+    /// will look at — filling three fields before submitting, say. That is the
+    /// one case where the re-read is pure cost, and on an app with a slow
+    /// accessibility tree the walk is seconds, not milliseconds.
     #[serde(default)]
     return_state: Option<bool>,
 }
 
 impl ActionArgs {
+    /// Defaults to `true`: the common loop is act-then-look, and an agent that
+    /// forgets to look draws conclusions from `ui_changed` alone — which is
+    /// exactly the failure this was built to remove. Paying for a re-read nobody
+    /// reads is the cheaper mistake, and it is the one a caller can turn off
+    /// knowingly.
     fn return_state(&self) -> bool {
-        self.return_state.unwrap_or(false)
+        self.return_state.unwrap_or(true)
     }
 
     fn target(&self) -> Result<Target, String> {
@@ -697,15 +707,24 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         },
         r.ui_changed.as_str(),
     );
-    s.push_str(match r.ui_changed {
-        cua_core::Observed::Changed => "",
-        cua_core::Observed::Unchanged => {
-            "  (no observable change; call get_app_state to check, or the control may be a no-op)"
-        }
-        cua_core::Observed::Unknown => {
-            "  (nothing to compare: this app published no window state before or after, so this is NOT evidence the action failed. Verify with get_app_state)"
-        }
-    });
+    // The advice attached to `ui_changed` all ends in "go and look" — which is
+    // wrong to print when the section below *is* the result of having looked.
+    // Two answers to the same question, one hedged and one measured, read as a
+    // contradiction and invite a redundant `get_app_state`.
+    let looked = r.state.as_ref().is_some_and(|s| s.diff.is_some());
+    if !looked {
+        s.push_str(match r.ui_changed {
+            cua_core::Observed::Changed => "",
+            cua_core::Observed::Unchanged => {
+                "  (no observable change; call get_app_state to check, or the control may be a no-op)"
+            }
+            cua_core::Observed::Unknown => {
+                "  (nothing to compare: this app published no window state before or after, so this is NOT evidence the action failed. Verify with get_app_state)"
+            }
+        });
+    } else if r.ui_changed != cua_core::Observed::Changed {
+        s.push_str("  (heuristic only — the tree diff below is the real answer)");
+    }
     if let Some(state) = &r.state {
         s.push_str(&render_post_action_state(state));
     }
