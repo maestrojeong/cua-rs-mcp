@@ -542,10 +542,28 @@ result.
 | waiting for activation to land | `waitUntilAppBelievesItIsFrontmost(2.0)`, polled | fixed 12 ms sleep | polls the target's `AXFrontmost` to the same 2 s ceiling |
 | keeping a background menu open | `clickEventTap: EventTap?` + `startSuppressingMenuDismissalEvents(menuPID:)` / `stopSuppressingMenuDismissalEvents()` | none | not built — see §10 |
 | post route | public `CGEventPostToPid` | private `SLEventPostToPid` | unchanged — see below |
+| deactivation | `deactivateFocusEnforcer()`, a lifecycle step | `ApplicationDeactivated` after *every* click | not sent per click — see below |
 | keyboard | `CGEventCreateKeyboardEvent` + `keyboardSetUnicodeString`, posted per-pid | global HID tap only; arbitrary keys refused outright | per-pid path written, gated (see §10) |
 | cursor feedback | `ComputerUseCursor`, a spring-animated overlay window; the visible "mouse" is drawn, not the system pointer | none | not built |
 
 Three of these deserve more than a table row.
+
+**Balancing every click with a deactivation was actively harmful.** Telling the
+target it went inactive immediately after telling it the opposite is not a
+no-op: measured on KakaoTalk, the chat window's own menu-bar item ("채팅")
+disappeared the instant that notice landed, and stayed gone. The control was
+still mid-gesture. Suppressing the notice kept the menu bar intact across the
+click. Leaving the target believing it is active is the smaller cost, it is what
+the reference does, and the real frontmost app was never touched either way.
+
+**Window level is not a reliability signal, and treating it as one broke
+clicks.** `is_plausible_target` required level 0. KakaoTalk publishes chat-room
+windows at level 3 (`NSFloatingWindowLevel`), so they were dropped from the
+candidate set; the click path then matched a *different* window of the same
+process and stamped that window's number onto the event, which the target
+discarded. The symptom — "this control ignores synthetic clicks" — pointed at
+the event, and the cause was the window lookup. The ceiling is now level 3, with
+menus, status items and overlays still excluded because they live far above it.
 
 **The construction order was backwards, and that was the bug.** A `CGEvent`
 synthesized from scratch has no AppKit identity: `-[NSEvent eventNumber]` reads

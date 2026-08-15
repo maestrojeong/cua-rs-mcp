@@ -352,10 +352,11 @@ pub fn click_background_pid(
         Ok(())
     })();
 
-    // Balance the activation notice even when the click itself failed: leaving
-    // the target believing it is active would change how it renders and how it
-    // treats the user's *next* real click.
-    let _ = post_activation_notice(pid, nsevent::notify_app_deactivated(window_number));
+    // Deliberately *not* balanced with an `ApplicationDeactivated` by default:
+    // see `deactivate_after_click` for the measurement that removed it.
+    if deactivate_after_click() {
+        let _ = post_activation_notice(pid, nsevent::notify_app_deactivated(window_number));
+    }
 
     result
 }
@@ -776,6 +777,30 @@ fn use_public_post() -> bool {
     static PUBLIC: OnceLock<bool> = OnceLock::new();
     *PUBLIC.get_or_init(|| {
         std::env::var("CUA_PUBLIC_POST")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether to send the balancing `ApplicationDeactivated` after a click.
+///
+/// Off by default, because sending it was measured to do harm. On KakaoTalk the
+/// chat window's own menu-bar item ("채팅") vanished the instant the notice
+/// landed: the target treated it as the window losing key status, mid-gesture,
+/// immediately after being told the opposite. Suppressing it kept the menu bar
+/// intact across the click.
+///
+/// Leaving the target believing it is active is the lesser problem, and it is
+/// what the reference implementation does too — it deactivates in a separate
+/// `deactivateFocusEnforcer()` lifecycle step rather than after every click. The
+/// belief is corrected by real AppKit events as soon as the user touches
+/// anything, and the *real* frontmost app was never changed in the first place.
+///
+/// `CUA_DEACTIVATE_AFTER_CLICK=1` restores the old behaviour for bisecting.
+fn deactivate_after_click() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CUA_DEACTIVATE_AFTER_CLICK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

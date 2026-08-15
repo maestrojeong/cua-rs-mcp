@@ -71,7 +71,9 @@ fn main() {
         .or_else(|| app_el.elements(attr::WINDOWS).into_iter().next());
     let assist = window_el.as_ref().and_then(|w| {
         let p = w.activation_point()?;
-        let owner = Element::system_wide().element_at(p.x as f32, p.y as f32).ok()?;
+        let owner = Element::system_wide()
+            .element_at(p.x as f32, p.y as f32)
+            .ok()?;
         let owner_pid = owner.pid().ok()?;
         let role = owner.role();
         println!(
@@ -130,7 +132,8 @@ fn main() {
         println!(
             "  {:?} {:?}",
             c.role(),
-            c.string(attr::TITLE).or_else(|| c.string(attr::DESCRIPTION))
+            c.string(attr::TITLE)
+                .or_else(|| c.string(attr::DESCRIPTION))
         );
     }
 }

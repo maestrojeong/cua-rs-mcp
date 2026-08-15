@@ -154,10 +154,26 @@ pub struct WindowInfo {
     pub app_name: Option<String>,
     pub frame: CGRect,
     pub on_screen: bool,
-    /// Window layer. `0` is normal content; anything else is a panel, menu,
-    /// dock tile, or overlay, which an agent almost never wants to drive.
+    /// Window layer, in `NSWindow` level terms. `0` is normal content and `3`
+    /// is floating; the high levels are menus, status items and overlays.
     pub layer: i64,
 }
+
+/// Highest window level still treated as ordinary content.
+///
+/// `NSNormalWindowLevel` is 0 and `NSFloatingWindowLevel` is 3, and the gap
+/// between them holds nothing an app uses for chrome. Everything an agent must
+/// not drive — `NSSubmenuWindowLevel`/`NSTornOffMenuWindowLevel` (3 is *not*
+/// one of them), `NSStatusWindowLevel` (25), `NSPopUpMenuWindowLevel` (101),
+/// screen-saver and overlay levels — sits far above.
+///
+/// This ceiling was raised from 0 after a measured failure: KakaoTalk publishes
+/// its chat-room windows at level 3, so a layer-0 rule dropped them from the
+/// candidate set entirely. The click path then matched some *other* window of
+/// the same process, stamped that window's number onto the event, and the
+/// target discarded input aimed at a window it was not for — which looked
+/// exactly like "this control ignores synthetic clicks".
+const MAX_ORDINARY_WINDOW_LEVEL: i64 = 3;
 
 impl WindowInfo {
     /// Whether this looks like a real document/content window rather than
@@ -165,10 +181,15 @@ impl WindowInfo {
     ///
     /// SCK reports a lot of windows that are technically real but useless as
     /// automation targets: 1x1 tracking windows, zero-size offscreen buffers,
-    /// status item overlays. Filtering on layer plus a minimum area removes
-    /// nearly all of them without needing a per-app blocklist.
+    /// status item overlays. Filtering on window level plus a minimum area
+    /// removes nearly all of them without needing a per-app blocklist.
+    ///
+    /// Negative levels are desktop and wallpaper backing stores, which are
+    /// never a target either.
     pub fn is_plausible_target(&self) -> bool {
-        self.layer == 0 && self.frame.size.width >= 40.0 && self.frame.size.height >= 40.0
+        (0..=MAX_ORDINARY_WINDOW_LEVEL).contains(&self.layer)
+            && self.frame.size.width >= 40.0
+            && self.frame.size.height >= 40.0
     }
 }
 
@@ -525,6 +546,36 @@ mod tests {
         assert!(
             !overlay.is_plausible_target(),
             "status overlays are not targets"
+        );
+
+        // Measured against KakaoTalk, which puts chat-room windows at the
+        // floating level. Excluding these made the click path stamp events with
+        // a different window's number, so they were silently discarded.
+        let floating = WindowInfo {
+            layer: 3,
+            ..base.clone()
+        };
+        assert!(
+            floating.is_plausible_target(),
+            "floating-level content windows are ordinary targets"
+        );
+
+        let popup_menu = WindowInfo {
+            layer: 101,
+            ..base.clone()
+        };
+        assert!(
+            !popup_menu.is_plausible_target(),
+            "pop-up menu windows are not targets"
+        );
+
+        let desktop = WindowInfo {
+            layer: -2147483623,
+            ..base.clone()
+        };
+        assert!(
+            !desktop.is_plausible_target(),
+            "desktop backing stores are not targets"
         );
 
         let sliver = WindowInfo {
