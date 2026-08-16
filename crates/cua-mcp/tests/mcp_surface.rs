@@ -304,3 +304,39 @@ fn instructions_tell_the_client_to_read_before_acting() {
         "instructions must name the call that must come first: {instructions}"
     );
 }
+
+#[test]
+fn the_acting_tools_advertise_the_destructive_confirmation() {
+    // The gate is only usable if the parameter that clears it is in the
+    // schema. A refusal that names `confirm_destructive` while the tool does
+    // not accept it would be an unescapable dead end, which is worse than
+    // having no gate at all.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    for name in ["click", "press_key", "perform_secondary_action"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert!(
+            !tool["inputSchema"]["properties"]["confirm_destructive"].is_null(),
+            "{name} must accept confirm_destructive"
+        );
+    }
+
+    // And the tools that cannot classify anything must not pretend they can.
+    // `click_in_window` has no element behind its point, so there is no label
+    // to judge and no honest confirmation to ask for.
+    let bare = tools
+        .iter()
+        .find(|t| t["name"] == "click_in_window")
+        .expect("click_in_window");
+    assert!(
+        bare["inputSchema"]["properties"]["confirm_destructive"].is_null(),
+        "click_in_window has no label to classify, so it must not offer a confirmation"
+    );
+}

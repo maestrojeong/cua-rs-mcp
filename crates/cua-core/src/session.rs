@@ -1012,15 +1012,20 @@ impl Cua {
     /// `return_state` re-reads the window afterwards and attaches the result;
     /// see [`PostActionState`] for why that is worth a round trip.
     ///
+    /// `confirm_destructive` clears the label gate in [`crate::safety`] for
+    /// this one call. It is a parameter rather than a prompt because an MCP
+    /// server has no channel to a human, and it is per-call rather than a mode
+    /// because the point is to put the decision in the transcript.
     pub fn click(
         &self,
         app: &str,
         target: Target,
         count: u8,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
-        let gate = crate::safety::Gate::at("click", &target);
+        let gate = crate::safety::Gate::at("click", &target).confirmed(confirm_destructive);
         self.exec_action(true, move |inner| {
             inner.acting(&app, gate, return_state, |i| i.click(&app, target, count))
         })
@@ -1129,16 +1134,22 @@ impl Cua {
     }
 
     /// Press a key, through AX when the key has a verb and HID otherwise.
+    ///
+    /// The key is classified as well as the element: `cmd+delete` is Move to
+    /// Trash regardless of what the row it lands on is called.
     pub fn press_key(
         &self,
         app: &str,
         target: Target,
         key: &str,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let key = key.to_string();
-        let gate = crate::safety::Gate::at("press_key", &target);
+        let gate = crate::safety::Gate::at("press_key", &target)
+            .with_key(&key)
+            .confirmed(confirm_destructive);
         self.exec_action(false, move |inner| {
             inner.acting(&app, gate, return_state, |i| {
                 i.press_key(&app, target, &key)
@@ -1153,10 +1164,12 @@ impl Cua {
         target: Target,
         action: &str,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let action = action.to_string();
-        let gate = crate::safety::Gate::at("perform_secondary_action", &target);
+        let gate = crate::safety::Gate::at("perform_secondary_action", &target)
+            .confirmed(confirm_destructive);
         self.exec_action(false, move |inner| {
             inner.acting(&app, gate, return_state, |i| {
                 i.perform_action(&app, target, &action)
@@ -1528,6 +1541,30 @@ impl Inner {
     /// Failing to re-read is not an error. The action already happened, and
     /// reporting it as a failure because the follow-up read did not work would
     /// invite a caller to retry something that already took effect.
+    /// The snapshot's own description of the element an action is aimed at.
+    ///
+    /// Read from the stored snapshot rather than from the live element: the
+    /// destructive heuristic has to judge the control the *caller* chose, which
+    /// is the one the tree showed them. `None` when nothing can be resolved,
+    /// which the gate treats as "unknown" rather than "harmless"; the action's
+    /// own resolution then reports the real reason.
+    fn safety_candidate(&self, query: &str, target: &Target) -> Option<crate::safety::Candidate> {
+        let info = apps::resolve_app(query).ok()?;
+        let snap = self.snapshots.get(&info.pid)?;
+        let node = match *target {
+            Target::Index { index, .. } => snap.nodes.get(index)?,
+            Target::Point { x, y } => hit_test(&snap.nodes, x, y)?,
+        };
+        Some(crate::safety::Candidate {
+            role: node.role.clone(),
+            label: node.label.clone(),
+            value: node.value.clone(),
+            help: node.help.clone(),
+            settable: node.settable,
+            description: describe_node(node),
+        })
+    }
+
     fn acting<F>(
         &mut self,
         query: &str,
@@ -1543,7 +1580,8 @@ impl Inner {
         // is gated by default instead of by remembering. An app that will not
         // resolve is left to the action, which reports that better.
         if let Ok(info) = apps::resolve_app(query) {
-            crate::safety::guard(&info, &gate)?;
+            let candidate = gate.target().and_then(|t| self.safety_candidate(query, t));
+            crate::safety::guard(&info, &gate, candidate.as_ref())?;
         }
 
         let before = if return_state {
