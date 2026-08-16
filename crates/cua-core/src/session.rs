@@ -30,6 +30,8 @@ use cua_ax::{AxNode, Element, Limits};
 use cua_capture::WindowInfo;
 use objc2_core_foundation::CGRect;
 
+use cua_hid::{Modifiers, MouseButton};
+
 use crate::apps::{self, AppInfo};
 use crate::overlay::Overlay;
 
@@ -161,6 +163,28 @@ pub enum CoreError {
         wid: u32,
         x: f64,
         y: f64,
+        reason: String,
+    },
+
+    /// A drag could not be delivered.
+    ///
+    /// One variant for the whole gesture rather than one per gate, because a
+    /// drag has two endpoints and the interesting part of the message is always
+    /// which of them went wrong and why — which `reason` says — not which of a
+    /// dozen enum arms it landed in.
+    #[error("cannot drag from {from} to {to} in `{app}`: {reason}")]
+    DragRefused {
+        app: String,
+        from: String,
+        to: String,
+        reason: String,
+    },
+
+    /// A hover or an event-tier scroll could not be delivered.
+    #[error("cannot deliver a {what} to `{app}`: {reason}")]
+    PointerEventRefused {
+        app: String,
+        what: &'static str,
         reason: String,
     },
 
@@ -464,6 +488,117 @@ pub enum Target {
     /// By screen point, in AX global points. Hit-tested to an element, then
     /// acted on through AX — never by moving the pointer.
     Point { x: f32, y: f32 },
+}
+
+/// The button and modifier keys a pointer action carries.
+///
+/// One value rather than two parameters on five methods, because the two always
+/// travel together and neither means anything without the delivery path the
+/// other one uses. Both default to "an ordinary click": left button, nothing
+/// held.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseOptions {
+    pub button: MouseButton,
+    pub modifiers: Modifiers,
+    /// Click count: 1, or 2 for a target that only opens on a double-click.
+    /// Ignored by the gestures that have no notion of one — a drag, a hover.
+    pub count: u8,
+}
+
+impl Default for MouseOptions {
+    fn default() -> Self {
+        Self {
+            button: MouseButton::Left,
+            // `Modifiers` is a re-exported `CGEventFlags`, which has no
+            // `Default` of its own, so this cannot be derived.
+            modifiers: Modifiers::empty(),
+            count: 1,
+        }
+    }
+}
+
+impl MouseOptions {
+    /// Parse the two strings an MCP caller supplies, together, so a caller who
+    /// misspells either gets one message naming which.
+    ///
+    /// Both may be empty: that is the default click. The modifier vocabulary is
+    /// `cua_hid::parse_modifiers`, which is the same table `press_key` uses, so
+    /// `cmd+shift` means the same thing whichever tool it is written on.
+    pub fn parse(button: &str, modifiers: &str) -> std::result::Result<Self, String> {
+        Ok(Self {
+            button: MouseButton::parse(button).map_err(|e| e.to_string())?,
+            modifiers: cua_hid::parse_modifiers(modifiers).map_err(|e| e.to_string())?,
+            ..Self::default()
+        })
+    }
+
+    /// Same options, with a click count. Separate from [`MouseOptions::parse`]
+    /// because a drag and a hover have no click count to set and should not
+    /// have to name one.
+    pub fn with_count(self, count: u8) -> Self {
+        Self { count, ..self }
+    }
+
+    /// How this reads in a result line: `left`, or `cmd+shift right`.
+    fn describe(&self) -> String {
+        let mods = describe_modifiers(self.modifiers);
+        if mods.is_empty() {
+            self.button.as_str().to_string()
+        } else {
+            format!("{mods} {}", self.button.as_str())
+        }
+    }
+}
+
+/// Render a modifier set back into the vocabulary it was parsed from, so a
+/// result line quotes something the caller could paste into the next call.
+fn describe_modifiers(flags: Modifiers) -> String {
+    [
+        (Modifiers::MaskCommand, "cmd"),
+        (Modifiers::MaskShift, "shift"),
+        (Modifiers::MaskAlternate, "alt"),
+        (Modifiers::MaskControl, "ctrl"),
+        (Modifiers::MaskSecondaryFn, "fn"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| flags.contains(*bit))
+    .map(|(_, name)| name)
+    .collect::<Vec<_>>()
+    .join("+")
+}
+
+/// Where a pointer event should land, for the actions that accept either an
+/// element or a bare pixel.
+///
+/// `click` does not offer this and deliberately keeps its elementless form in a
+/// separate tool: "the point covers nothing" is the shape of a typo, and a
+/// click on a typo is the worst outcome in this project. A drag endpoint and a
+/// hover are different. A drag frequently has one end on a real row and the
+/// other on empty canvas — a reorder into a gap, a selection rectangle drawn
+/// across background — and a hover presses nothing at all, so the same
+/// blind-click argument does not apply to either.
+#[derive(Debug, Clone)]
+pub enum PointerLocation {
+    /// Resolved through the snapshot exactly as `click` does.
+    Element(Target),
+    /// A point in POINTS from the top-left corner of the window the app's most
+    /// recent `get_app_state` read — the same coordinate space
+    /// `click_in_window` takes, and re-anchored to the window's live origin at
+    /// delivery time for the same reason.
+    WindowPoint { x: f64, y: f64 },
+}
+
+/// A pointer location resolved against a live window.
+struct PointerAim {
+    /// Screen point, in points.
+    point: (f64, f64),
+    /// The same point relative to the live window's origin.
+    window_local: (f64, f64),
+    /// What to name in the result.
+    desc: String,
+    /// Whether accessibility agreed something is there. False for a raw pixel,
+    /// which is what makes the whole action report `pid (no element)`.
+    from_element: bool,
 }
 
 /// The outcome of an action, in enough detail to be auditable.
@@ -1008,12 +1143,52 @@ impl Cua {
         &self,
         app: &str,
         target: Target,
-        count: u8,
+        mouse: MouseOptions,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| i.click(&app, target, count))
+            inner.acting(&app, return_state, |i| i.click(&app, target, mouse))
+        })
+    }
+
+    /// Press at one point, move through interpolated intermediate points, and
+    /// release at another — all inside one window.
+    ///
+    /// Either end may be an element or a bare window-local pixel, and they may
+    /// be different elements of the same app. See [`Inner::drag`] for the gates
+    /// and [`cua_hid::drag_path`] for why the moves are interpolated rather
+    /// than jumped.
+    pub fn drag(
+        &self,
+        app: &str,
+        from: PointerLocation,
+        to: PointerLocation,
+        mouse: MouseOptions,
+        return_state: bool,
+    ) -> Result<ActionResult> {
+        let app = app.to_string();
+        self.exec_action(true, move |inner| {
+            inner.acting(&app, return_state, |i| {
+                i.drag(&app, from.clone(), to.clone(), mouse)
+            })
+        })
+    }
+
+    /// Tell one window the pointer moved to a point, so hover-only UI appears.
+    ///
+    /// The real pointer does not move; this is a synthesized `mouseMoved`
+    /// event. See [`Inner::hover`] for what that cannot reach.
+    pub fn hover(
+        &self,
+        app: &str,
+        at: PointerLocation,
+        modifiers: Modifiers,
+        return_state: bool,
+    ) -> Result<ActionResult> {
+        let app = app.to_string();
+        self.exec_action(true, move |inner| {
+            inner.acting(&app, return_state, |i| i.hover(&app, at.clone(), modifiers))
         })
     }
 
@@ -1030,13 +1205,13 @@ impl Cua {
         window_id: u32,
         x: f64,
         y: f64,
-        count: u8,
+        mouse: MouseOptions,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
             inner.acting(&app, return_state, |i| {
-                i.click_in_window(&app, window_id, x, y, count)
+                i.click_in_window(&app, window_id, x, y, mouse)
             })
         })
     }
@@ -1056,18 +1231,21 @@ impl Cua {
         })
     }
 
-    /// Scroll a scrollable element by whole pages.
+    /// Scroll a scrollable element, by whole pages through accessibility or by
+    /// a wheel event when the element advertises no scroll action.
+    ///
+    /// The tier is chosen by [`scroll_tier`] and named in the result.
     pub fn scroll(
         &self,
         app: &str,
         target: Target,
         dir: ScrollDir,
-        pages: u32,
+        amount: ScrollAmount,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.scroll(&app, target, dir, pages))
+            inner.acting(&app, return_state, |i| i.scroll(&app, target, dir, amount))
         })
     }
 
@@ -1191,6 +1369,94 @@ impl ScrollDir {
             ScrollDir::Right => cua_ax::action::SCROLL_RIGHT_BY_PAGE,
         }
     }
+
+    /// The `(vertical, horizontal)` wheel delta that moves the view this way by
+    /// `amount` units.
+    ///
+    /// `CGEventCreateScrollWheelEvent2` counts a positive vertical delta as
+    /// scrolling *up* — the view moves toward the start of the document, which
+    /// is what `AXScrollUpByPage` also means — and a positive horizontal delta
+    /// as scrolling left. Down and right are therefore negations, and getting
+    /// that backwards is the single easiest mistake here, hence the unit test.
+    fn wheel_delta(self, amount: i32) -> (i32, i32) {
+        match self {
+            ScrollDir::Up => (amount, 0),
+            ScrollDir::Down => (-amount, 0),
+            ScrollDir::Left => (0, amount),
+            ScrollDir::Right => (0, -amount),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ScrollDir::Up => "up",
+            ScrollDir::Down => "down",
+            ScrollDir::Left => "left",
+            ScrollDir::Right => "right",
+        }
+    }
+}
+
+/// How much to scroll, and in which of the two vocabularies.
+///
+/// The distinction is not cosmetic: it selects the tier. Pages are what
+/// accessibility can express, so a page request goes through `AXScroll*ByPage`
+/// whenever the element advertises it. Points are what accessibility cannot
+/// express at all, so a point request is an event or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAmount {
+    /// Whole pages. Prefers the AX verb; falls back to a wheel event sized
+    /// against the element's own height for an element that advertises none.
+    Pages(u32),
+    /// Exactly this many points of content. Always a wheel event.
+    Points(u32),
+}
+
+/// Which mechanism a scroll used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTier {
+    /// `AXScroll*ByPage` on the element.
+    Ax,
+    /// A pid-routed `scrollWheel` event at the element's point.
+    Wheel,
+}
+
+/// Choose the scroll tier. Pure, so the policy is testable without a grant.
+///
+/// The AX verb wins whenever it is available and the caller asked in pages,
+/// because it is the better answer where it exists: the app decides what a page
+/// of *its* content is, it needs no coordinate, and it cannot be swallowed by a
+/// subview that happens to sit under the point. The wheel tier exists for the
+/// case that is otherwise a dead end — an Electron list, a canvas, a web area —
+/// where the element advertises no scroll action at all and there is nothing
+/// for the AX path to call.
+fn scroll_tier(amount: ScrollAmount, advertises_ax_scroll: bool) -> ScrollTier {
+    match amount {
+        ScrollAmount::Points(_) => ScrollTier::Wheel,
+        ScrollAmount::Pages(_) if advertises_ax_scroll => ScrollTier::Ax,
+        ScrollAmount::Pages(_) => ScrollTier::Wheel,
+    }
+}
+
+/// How many points of content one "page" is worth on the wheel tier.
+///
+/// Derived from the element's own height rather than from a constant, because a
+/// page is a property of the thing being scrolled: a page of a full-height
+/// message list and a page of a 120-point sidebar are not the same distance,
+/// and a constant would badly overshoot one and undershoot the other. The 0.9
+/// keeps roughly a line of overlap across the boundary, which is what every
+/// real page-down does so the reader does not lose their place.
+///
+/// The clamp bounds both ends of the guess. An element that reports no frame,
+/// or a degenerate one, still has to scroll by *something* usable, and no
+/// single wheel event should be able to fling a list by a screen height it
+/// never had.
+fn page_points(element_height: Option<f64>) -> i32 {
+    const FALLBACK: f64 = 400.0;
+    const MIN: f64 = 60.0;
+    const MAX: f64 = 4000.0;
+    let height = element_height.filter(|h| h.is_finite() && *h > 0.0);
+    (height.unwrap_or(FALLBACK) * 0.9).clamp(MIN, MAX) as i32
 }
 
 // ── worker-side implementation ───────────────────────────────────────────────
@@ -1616,7 +1882,8 @@ impl Inner {
         })
     }
 
-    fn click(&mut self, query: &str, target: Target, count: u8) -> Result<ActionResult> {
+    fn click(&mut self, query: &str, target: Target, mouse: MouseOptions) -> Result<ActionResult> {
+        let count = mouse.count;
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
@@ -1638,7 +1905,15 @@ impl Inner {
         // a mechanism. Retrying through AX after a pid failure reintroduces
         // exactly the app-specific AX quirks (`AXPress` advertised but
         // ignored, a stale-handle press) that motivated moving to pid at all.
-        if ax_first() && count <= 1 {
+        // The legacy AX-first order can only serve a plain single left click:
+        // `AXPress` has no notion of a click count, a button, or a held
+        // modifier, so a right click or a ⌘-click has nothing to fall back
+        // *to* and goes straight to the pid tier whatever this switch says.
+        if ax_first()
+            && count <= 1
+            && mouse.button == MouseButton::Left
+            && mouse.modifiers.is_empty()
+        {
             match el.activate() {
                 Ok(verb) => {
                     let changed = self.changed_since(info.pid, before);
@@ -1649,7 +1924,7 @@ impl Inner {
                     if !matches!(ax_err, cua_ax::AxError::Unsupported { .. }) {
                         return Err(CoreError::Ax(ax_err));
                     }
-                    return match self.pid_click_result(&info, &el, desc, count, expected, before) {
+                    return match self.pid_click_result(&info, &el, desc, mouse, expected, before) {
                         Ok(result) => Ok(result),
                         Err(PidFailure::Fatal(err)) => Err(err),
                         Err(PidFailure::Retryable(reason)) => Err(CoreError::PidClickUnavailable {
@@ -1661,7 +1936,7 @@ impl Inner {
             }
         }
 
-        match self.pid_click_result(&info, &el, desc, count, expected, before) {
+        match self.pid_click_result(&info, &el, desc, mouse, expected, before) {
             Ok(result) => Ok(result),
             Err(PidFailure::Fatal(err)) => Err(err),
             Err(PidFailure::Retryable(pid_reason)) => {
@@ -1687,10 +1962,11 @@ impl Inner {
         info: &AppInfo,
         el: &Element,
         desc: String,
-        count: u8,
+        mouse: MouseOptions,
         expected: Option<(usize, HashSet<String>)>,
         before: Option<String>,
     ) -> std::result::Result<ActionResult, PidFailure> {
+        let count = mouse.count;
         // `AXActivationPoint` is the app's answer to "where is this element
         // clicked", and it is not always the middle of its frame, so prefer it
         // when available.
@@ -1782,6 +2058,8 @@ impl Inner {
                 window_local,
                 wid,
                 count,
+                button: mouse.button,
+                modifiers: mouse.modifiers,
             },
             assist,
             &believes_frontmost,
@@ -1789,7 +2067,10 @@ impl Inner {
         .map_err(|e| PidFailure::Retryable(e.to_string()))?;
         let changed = self.changed_since(info.pid, before);
         Ok(ActionResult {
-            verb: format!("SkyLight pid-routed {count}-click at ({x:.0}, {y:.0})"),
+            verb: format!(
+                "SkyLight pid-routed {count}-click ({}) at ({x:.0}, {y:.0})",
+                mouse.describe()
+            ),
             target: desc,
             ui_changed: changed,
             delivery: Delivery::Pid,
@@ -1845,9 +2126,10 @@ impl Inner {
         wid: u32,
         x: f64,
         y: f64,
-        count: u8,
+        mouse: MouseOptions,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
+        let count = mouse.count;
         let info = apps::resolve_app(query)?;
         let refuse = |reason: String| CoreError::WindowClickRefused {
             app: info.name.clone(),
@@ -1926,6 +2208,8 @@ impl Inner {
                 window_local: (x, y),
                 wid,
                 count,
+                button: mouse.button,
+                modifiers: mouse.modifiers,
             },
             assist,
             &believes_frontmost,
@@ -1933,7 +2217,10 @@ impl Inner {
         .map_err(|e| refuse(e.to_string()))?;
 
         Ok(ActionResult {
-            verb: format!("SkyLight pid-routed {count}-click at window-local ({x:.0}, {y:.0})"),
+            verb: format!(
+                "SkyLight pid-routed {count}-click ({}) at window-local ({x:.0}, {y:.0})",
+                mouse.describe()
+            ),
             target: format!(
                 "window {wid} of {} at no element — the caller aimed this",
                 info.name
@@ -2230,23 +2517,373 @@ impl Inner {
         }
     }
 
+    /// Scroll an element, through accessibility where it advertises a scroll
+    /// action and through a pid-routed wheel event where it does not.
+    ///
+    /// Both tiers are kept because neither dominates. `AXScroll*ByPage` needs no
+    /// coordinate, lets the app decide what a page of its own content is, and
+    /// cannot be swallowed by whatever subview happens to sit under a point — so
+    /// it stays the default for a page-shaped request on an element that offers
+    /// it. But the elements an agent most often needs to scroll offer nothing:
+    /// an Electron list, a canvas, a web area inside a native shell all publish
+    /// a frame and no actions, and until now that was a refusal rather than a
+    /// mechanism. A `scrollWheel` event delivered on the same pid route as a
+    /// click reaches all of them.
+    ///
+    /// The tier that ran is named in `verb` and reflected in `delivery`, because
+    /// the two do not fail the same way: an AX page scroll that returns success
+    /// really did call the app's own scroller, while a wheel event is only
+    /// known to have been delivered to a point.
     fn scroll(
         &mut self,
         query: &str,
         target: Target,
         dir: ScrollDir,
-        pages: u32,
+        amount: ScrollAmount,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
         let verb = dir.verb();
-        for _ in 0..pages.max(1) {
-            el.perform(verb)?;
+        let advertises = el.actions().iter().any(|a| a == verb);
+
+        match scroll_tier(amount, advertises) {
+            ScrollTier::Ax => {
+                let before = self.window_fingerprint(info.pid);
+                let ScrollAmount::Pages(pages) = amount else {
+                    unreachable!("scroll_tier only chooses Ax for a page request")
+                };
+                for _ in 0..pages.max(1) {
+                    el.perform(verb)?;
+                }
+                let changed = self.changed_since(info.pid, before);
+                Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
+                    .with_overlay_target(self.overlay_target(info.pid)))
+            }
+            ScrollTier::Wheel => self.wheel_scroll(&info, &el, desc, dir, amount, advertises),
         }
+    }
+
+    /// The event tier of a scroll: a pid-routed `scrollWheel` at the element's
+    /// own point.
+    fn wheel_scroll(
+        &mut self,
+        info: &AppInfo,
+        el: &Element,
+        desc: String,
+        dir: ScrollDir,
+        amount: ScrollAmount,
+        advertises: bool,
+    ) -> Result<ActionResult> {
+        let refuse = |reason: String| CoreError::PointerEventRefused {
+            app: info.name.clone(),
+            what: "scroll wheel event",
+            reason,
+        };
+        if !cua_hid::skylight_available() {
+            return Err(refuse(
+                "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
+            ));
+        }
+        let (x, y) = element_point(el).ok_or_else(|| {
+            refuse(format!(
+                "this element advertises {}, and it publishes neither AXActivationPoint nor AXFrame, so there is no point to aim a wheel event at",
+                if advertises { "a scroll action but the caller asked in points" } else { "no scroll action" }
+            ))
+        })?;
+        let live = self.live_snapshot_window(info).map_err(refuse)?;
+        screen_point_inside(&live, x, y).map_err(|frame| {
+            refuse(format!(
+                "the element's point ({x:.0}, {y:.0}) is outside the current frame of window {} ({frame}); the AX element and window snapshot drifted apart. Call get_app_state again",
+                live.id
+            ))
+        })?;
+
+        let points = match amount {
+            ScrollAmount::Points(p) => p as i32,
+            ScrollAmount::Pages(pages) => {
+                page_points(el.frame().map(|f| f.size.height)) * pages.max(1) as i32
+            }
+        };
+        let (delta_y, delta_x) = dir.wheel_delta(points);
+        let before = self.window_fingerprint(info.pid);
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        cua_hid::scroll_background_pid(
+            cua_hid::PidScroll {
+                pid: info.pid,
+                point: (x, y),
+                window_local: (x - live.frame.origin.x, y - live.frame.origin.y),
+                wid: live.id,
+                delta_y,
+                delta_x,
+                unit: cua_hid::ScrollUnit::Pixel,
+                modifiers: Modifiers::empty(),
+            },
+            &believes_frontmost,
+        )
+        .map_err(|e| refuse(e.to_string()))?;
+
         let changed = self.changed_since(info.pid, before);
-        Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
-            .with_overlay_target(self.overlay_target(info.pid)))
+        Ok(ActionResult {
+            verb: format!(
+                "SkyLight pid-routed scrollWheel {} by {points} points at ({x:.0}, {y:.0}){}",
+                dir.as_str(),
+                if advertises {
+                    ""
+                } else {
+                    " (this element advertises no AXScroll action)"
+                }
+            ),
+            target: desc,
+            ui_changed: changed,
+            delivery: Delivery::Pid,
+            point: Some((x, y)),
+            overlay_target: Some((live.id, info.pid)),
+            state: None,
+        })
+    }
+
+    /// Press at one point, move through interpolated intermediate points, and
+    /// release at another.
+    ///
+    /// # Why both endpoints are checked against one window
+    ///
+    /// A pid-routed event carries a window number, and every event of one
+    /// gesture has to carry the same one — the window server routes on it, and
+    /// a drag whose up lands in a different window than its down is not a drag
+    /// anywhere. So a drag is confined to the window this app's most recent
+    /// `get_app_state` read, both endpoints must fall inside its *live* frame,
+    /// and a request spanning two windows is refused rather than interpolated
+    /// across the boundary.
+    ///
+    /// # What it can and cannot promise
+    ///
+    /// The events were delivered, in order, and the release was sent even if a
+    /// move failed partway — see [`cua_hid::drag_background_pid`]. Whether the
+    /// target implemented a drag at all, and whether it accepted this one, is
+    /// what `return_state` is for. Where either endpoint is a raw pixel the
+    /// result is labelled `pid (no element)`, because then nothing verified
+    /// there was anything at that end.
+    fn drag(
+        &mut self,
+        query: &str,
+        from: PointerLocation,
+        to: PointerLocation,
+        mouse: MouseOptions,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+        let (from_name, to_name) = (describe_location(&from), describe_location(&to));
+        let refuse = |reason: String| CoreError::DragRefused {
+            app: info.name.clone(),
+            from: from_name.clone(),
+            to: to_name.clone(),
+            reason,
+        };
+
+        if !cua_hid::skylight_available() {
+            return Err(refuse(
+                "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
+            ));
+        }
+        let live = self.live_snapshot_window(&info).map_err(&refuse)?;
+        let origin = self.aim(query, &live, &from).map_err(&refuse)?;
+        let destination = self.aim(query, &live, &to).map_err(&refuse)?;
+
+        // A drag onto its own origin is a click with extra steps, and almost
+        // always a caller that resolved both ends to the same element by
+        // mistake. Refusing names the mistake; delivering would leave a
+        // press-and-release the caller will read as a successful drag.
+        if origin.point == destination.point {
+            return Err(refuse(format!(
+                "both ends resolve to the same point ({:.0}, {:.0}). A drag needs two different points; use click if a press and release in one place is what you meant",
+                origin.point.0, origin.point.1
+            )));
+        }
+
+        let before = self.window_fingerprint(info.pid);
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        let assist = window_focus_assist(info.pid, &live);
+        let steps = cua_hid::drag_step_count(origin.point, destination.point);
+        cua_hid::drag_background_pid(
+            cua_hid::PidDrag {
+                pid: info.pid,
+                wid: live.id,
+                window_origin: (live.frame.origin.x, live.frame.origin.y),
+                origin: origin.point,
+                destination: destination.point,
+                button: mouse.button,
+                modifiers: mouse.modifiers,
+            },
+            assist,
+            &believes_frontmost,
+        )
+        .map_err(|e| refuse(e.to_string()))?;
+
+        let changed = self.changed_since(info.pid, before);
+        let verified = origin.from_element && destination.from_element;
+        Ok(ActionResult {
+            verb: format!(
+                "SkyLight pid-routed {} drag ({}) from ({:.0}, {:.0}) to ({:.0}, {:.0}) through {steps} interpolated moves",
+                mouse.button.as_str(),
+                mouse.describe(),
+                origin.point.0,
+                origin.point.1,
+                destination.point.0,
+                destination.point.1,
+            ),
+            target: format!("{} → {}", origin.desc, destination.desc),
+            ui_changed: changed,
+            delivery: if verified {
+                Delivery::Pid
+            } else {
+                Delivery::PidNoElement
+            },
+            point: Some(destination.point),
+            overlay_target: Some((live.id, info.pid)),
+            state: None,
+        })
+    }
+
+    /// Tell one window the pointer arrived at a point, so hover-revealed UI
+    /// appears and is readable in the next snapshot.
+    ///
+    /// # The real pointer does not move
+    ///
+    /// This is a synthesized `mouseMoved` addressed to the target process. The
+    /// human's cursor stays exactly where they left it, which is the point of
+    /// the whole project — and also the honest limit of this tool. An app that
+    /// reads where the pointer *is* (`NSEvent.mouseLocation`, a poll of the
+    /// cursor position) rather than where the event says it went will not
+    /// respond, and no version of this call can make it. Apps that track the
+    /// event — anything using `NSTrackingArea`, and everything web-based — do.
+    ///
+    /// Nothing is pressed, so unlike a click this never synthesizes the
+    /// activation-assist click on the window's own activation point; only the
+    /// two activation *notices* are sent.
+    fn hover(
+        &mut self,
+        query: &str,
+        at: PointerLocation,
+        modifiers: Modifiers,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+        let refuse = |reason: String| CoreError::PointerEventRefused {
+            app: info.name.clone(),
+            what: "hover (mouseMoved) event",
+            reason,
+        };
+        if !cua_hid::skylight_available() {
+            return Err(refuse(
+                "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
+            ));
+        }
+        let live = self.live_snapshot_window(&info).map_err(&refuse)?;
+        let aim = self.aim(query, &live, &at).map_err(&refuse)?;
+
+        let before = self.window_fingerprint(info.pid);
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        cua_hid::move_mouse_background_pid(
+            cua_hid::PidMouseMove {
+                pid: info.pid,
+                point: aim.point,
+                window_local: aim.window_local,
+                wid: live.id,
+                modifiers,
+            },
+            &believes_frontmost,
+        )
+        .map_err(|e| refuse(e.to_string()))?;
+
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult {
+            verb: format!(
+                "SkyLight pid-routed mouseMoved to ({:.0}, {:.0}) — the real pointer did not move",
+                aim.point.0, aim.point.1
+            ),
+            target: aim.desc,
+            ui_changed: changed,
+            delivery: if aim.from_element {
+                Delivery::Pid
+            } else {
+                Delivery::PidNoElement
+            },
+            point: Some(aim.point),
+            overlay_target: Some((live.id, info.pid)),
+            state: None,
+        })
+    }
+
+    /// The one live window a pointer gesture may be pinned to: the window this
+    /// app's most recent `get_app_state` read, re-enumerated now.
+    ///
+    /// Re-enumerated rather than trusted from the snapshot for the same reason
+    /// [`Inner::click_in_window`] does it: a pid-addressed event carrying a
+    /// stale or recycled window id is precisely the thing that must not be
+    /// sent.
+    fn live_snapshot_window(&self, info: &AppInfo) -> std::result::Result<WindowInfo, String> {
+        let wid = self
+            .snapshots
+            .get(&info.pid)
+            .and_then(|snap| snap.window.as_ref())
+            .map(|w| w.id)
+            .ok_or_else(|| {
+                "no verified window has been read for this app. Call get_app_state first (and grant Screen Recording, which is what identifies the window)".to_string()
+            })?;
+        let live_windows = cua_capture::list_windows()
+            .map_err(|e| format!("could not revalidate the window before input: {e}"))?;
+        live_window_for_pid_click(&live_windows, wid, info.pid)
+    }
+
+    /// Resolve a [`PointerLocation`] to a screen point inside `live`.
+    fn aim(
+        &self,
+        query: &str,
+        live: &WindowInfo,
+        loc: &PointerLocation,
+    ) -> std::result::Result<PointerAim, String> {
+        let (point, desc, from_element) = match loc {
+            PointerLocation::Element(target) => {
+                let (_, el, desc) = self.resolve(query, target).map_err(|e| e.to_string())?;
+                let point = element_point(&el).ok_or_else(|| {
+                    format!("{desc} publishes neither AXActivationPoint nor AXFrame, so there is no point to aim at")
+                })?;
+                (point, desc, true)
+            }
+            PointerLocation::WindowPoint { x, y } => {
+                if *x < 0.0 || *y < 0.0 {
+                    return Err(format!(
+                        "window-local coordinates are measured from the window's top-left corner, so neither of ({x:.0}, {y:.0}) can be negative"
+                    ));
+                }
+                (
+                    (live.frame.origin.x + x, live.frame.origin.y + y),
+                    format!("window-local ({x:.0}, {y:.0}) — no element, the caller aimed this"),
+                    false,
+                )
+            }
+        };
+        screen_point_inside(live, point.0, point.1).map_err(|frame| {
+            format!(
+                "({:.0}, {:.0}) is outside the current frame of window {} ({frame}); a gesture cannot cross a window boundary, and cua-rs will not guess which window you meant",
+                point.0, point.1, live.id
+            )
+        })?;
+        Ok(PointerAim {
+            point,
+            window_local: (point.0 - live.frame.origin.x, point.1 - live.frame.origin.y),
+            desc,
+            from_element,
+        })
     }
 
     fn overlay_target(&self, pid: libc::pid_t) -> Option<(u32, libc::pid_t)> {
@@ -2602,6 +3239,17 @@ fn hit_test(nodes: &[AxNode], x: f32, y: f32) -> Option<&AxNode> {
                 // element is the more specific answer.
                 .then(b.depth.cmp(&a.depth))
         })
+}
+
+/// A pointer location as it should read in an error, before anything has been
+/// resolved. Errors about a drag have to name both ends, and by the time one of
+/// them fails to resolve there is nothing better to call it.
+fn describe_location(loc: &PointerLocation) -> String {
+    match loc {
+        PointerLocation::Element(Target::Index { index, .. }) => format!("element {index}"),
+        PointerLocation::Element(Target::Point { x, y }) => format!("the element at ({x}, {y})"),
+        PointerLocation::WindowPoint { x, y } => format!("window-local ({x:.0}, {y:.0})"),
+    }
 }
 
 fn describe_node(node: &AxNode) -> String {
@@ -2994,6 +3642,117 @@ mod tests {
         assert_eq!(ax_verb_for_key("cmd+shift+p"), None);
         assert_eq!(ax_verb_for_key("a"), None);
         assert_eq!(ax_verb_for_key("f5"), None);
+    }
+
+    #[test]
+    fn a_page_request_prefers_accessibility_and_falls_through_when_there_is_none() {
+        // The whole point of keeping both tiers: the AX verb is better where it
+        // exists, and where it does not there used to be nothing at all.
+        assert_eq!(
+            scroll_tier(ScrollAmount::Pages(1), true),
+            ScrollTier::Ax,
+            "an element that advertises AXScroll*ByPage should be paged through it"
+        );
+        assert_eq!(
+            scroll_tier(ScrollAmount::Pages(1), false),
+            ScrollTier::Wheel,
+            "an Electron list advertises nothing, and used to be unscrollable"
+        );
+    }
+
+    #[test]
+    fn a_distance_request_is_always_an_event() {
+        // Accessibility has no vocabulary for "scroll 120 points" — only whole
+        // pages — so asking in points cannot be served by the AX tier even
+        // where the AX tier is available.
+        assert_eq!(
+            scroll_tier(ScrollAmount::Points(120), true),
+            ScrollTier::Wheel
+        );
+        assert_eq!(
+            scroll_tier(ScrollAmount::Points(120), false),
+            ScrollTier::Wheel
+        );
+    }
+
+    #[test]
+    fn a_page_on_the_wheel_tier_is_sized_from_the_element() {
+        // 90% of the element's own height, so a page of a tall list and a page
+        // of a short sidebar are different distances, as they should be.
+        assert_eq!(page_points(Some(1000.0)), 900);
+        assert_eq!(page_points(Some(200.0)), 180);
+        // ...bounded at both ends, and with a usable answer for an element that
+        // publishes no frame at all.
+        assert_eq!(page_points(Some(1.0)), 60);
+        assert_eq!(page_points(Some(100_000.0)), 4000);
+        assert_eq!(page_points(None), 360);
+        assert_eq!(page_points(Some(f64::NAN)), 360);
+        assert_eq!(page_points(Some(-5.0)), 360);
+    }
+
+    #[test]
+    fn wheel_deltas_point_the_way_the_direction_says() {
+        // Positive vertical is up and positive horizontal is left, per
+        // CGEventCreateScrollWheelEvent2. Inverting either is the easiest
+        // possible mistake and is invisible without an app to watch.
+        assert_eq!(ScrollDir::Up.wheel_delta(120), (120, 0));
+        assert_eq!(ScrollDir::Down.wheel_delta(120), (-120, 0));
+        assert_eq!(ScrollDir::Left.wheel_delta(120), (0, 120));
+        assert_eq!(ScrollDir::Right.wheel_delta(120), (0, -120));
+    }
+
+    #[test]
+    fn mouse_options_parse_the_same_modifier_vocabulary_as_press_key() {
+        let m = MouseOptions::parse("right", "cmd+shift").unwrap();
+        assert_eq!(m.button, MouseButton::Right);
+        assert!(m.modifiers.contains(Modifiers::MaskCommand));
+        assert!(m.modifiers.contains(Modifiers::MaskShift));
+        assert_eq!(m.count, 1, "a click count is not part of parsing");
+
+        // Both fields empty is the ordinary click, not an error: an MCP caller
+        // forwards optional strings and should not have to special-case them.
+        let d = MouseOptions::parse("", "").unwrap();
+        assert_eq!(d.button, MouseButton::Left);
+        assert!(d.modifiers.is_empty());
+
+        assert!(MouseOptions::parse("mouse3", "").is_err());
+        assert!(MouseOptions::parse("left", "cmd+clik").is_err());
+    }
+
+    #[test]
+    fn a_mouse_option_set_describes_itself_in_the_words_it_was_given() {
+        // The result line has to be quotable back into the next call.
+        assert_eq!(MouseOptions::default().describe(), "left");
+        assert_eq!(
+            MouseOptions::parse("right", "cmd+shift")
+                .unwrap()
+                .describe(),
+            "cmd+shift right"
+        );
+        // Canonical order regardless of how the caller wrote it, so two
+        // equivalent calls do not produce two different-looking results.
+        assert_eq!(
+            MouseOptions::parse("left", "shift+cmd").unwrap().describe(),
+            MouseOptions::parse("left", "cmd+shift").unwrap().describe()
+        );
+    }
+
+    #[test]
+    fn a_drag_end_names_itself_before_anything_is_resolved() {
+        // A drag error has to name both ends, and one of them may be the end
+        // that failed to resolve at all.
+        assert_eq!(
+            describe_location(&PointerLocation::Element(Target::Index {
+                index: 12,
+                snapshot_id: None,
+                expected_role: None,
+            })),
+            "element 12"
+        );
+        assert_eq!(
+            describe_location(&PointerLocation::WindowPoint { x: 40.4, y: 12.0 }),
+            "window-local (40, 12)"
+        );
     }
 
     #[test]

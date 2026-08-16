@@ -22,9 +22,16 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
-    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, Observed, Permissions,
-    PostActionState, Presence, Screenshot, ScrollDir, StateOptions, Target, WaitOutcome,
+    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, MouseOptions, Observed,
+    Permissions, PointerLocation, PostActionState, Presence, Screenshot, ScrollAmount, ScrollDir,
+    StateOptions, Target, WaitOutcome,
 };
+
+/// Re-exported so a caller can name a mouse button or a modifier set without
+/// depending on `cua-hid` directly. `cua-hid` is the only crate that
+/// synthesizes input, and that boundary is worth keeping visible in the
+/// dependency graph rather than spreading across every consumer.
+pub use cua_hid::{Modifiers, MouseButton};
 pub use snapshot::{diff_trees, render_tree, RenderOptions, TreeDiff};
 
 /// Re-exported so callers can tune tree limits without depending on `cua-ax`

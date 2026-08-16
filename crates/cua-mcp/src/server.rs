@@ -3,7 +3,7 @@
 //! # Tool naming
 //!
 //! The tool names here (`list_apps`, `get_app_state`, `click`, `type_text`,
-//! `press_key`, `scroll`, `drag`, `set_value`, `select_text`,
+//! `press_key`, `scroll`, `drag`, `hover`, `set_value`, `select_text`,
 //! `perform_secondary_action`) deliberately match the vocabulary that has become
 //! de-facto standard for this capability on macOS, which models have already
 //! seen. Inventing a prefixed dialect would buy nothing and cost recognition.
@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use cua_core::{Cua, Presence, ScrollDir, StateOptions, Target};
+use cua_core::{
+    Cua, MouseOptions, PointerLocation, Presence, ScrollAmount, ScrollDir, StateOptions, Target,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -138,6 +140,32 @@ struct ActionArgs {
     return_state: Option<bool>,
 }
 
+/// Turn an `element_token` into a pinned [`Target`].
+///
+/// Free-standing rather than a method so the tools that address two elements at
+/// once — `drag` — parse each end exactly the way every other tool parses its
+/// single one.
+fn parse_element_token(raw: &str) -> Result<Target, String> {
+    let raw = raw.trim();
+    let mut parts = raw.splitn(3, '-');
+    let (Some(snap), Some(idx), Some(role)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!(
+            "element_token should look like `7-12-AXButton` (snapshot-index-role), got {raw:?}"
+        ));
+    };
+    let snapshot_id: u64 = snap
+        .parse()
+        .map_err(|_| format!("element_token has a non-numeric snapshot id: {raw:?}"))?;
+    let index: usize = idx
+        .parse()
+        .map_err(|_| format!("element_token has a non-numeric index: {raw:?}"))?;
+    Ok(Target::Index {
+        index,
+        snapshot_id: Some(snapshot_id),
+        expected_role: Some(role.to_string()),
+    })
+}
+
 impl ActionArgs {
     /// Defaults to `true`: the common loop is act-then-look, and an agent that
     /// forgets to look draws conclusions from `ui_changed` alone — which is
@@ -152,25 +180,7 @@ impl ActionArgs {
         // Token first: it is the form that pins everything, so a caller that
         // supplies both should get the stricter reading.
         if let Some(raw) = &self.element_token {
-            let raw = raw.trim();
-            let mut parts = raw.splitn(3, '-');
-            let (Some(snap), Some(idx), Some(role)) = (parts.next(), parts.next(), parts.next())
-            else {
-                return Err(format!(
-                    "element_token should look like `7-12-AXButton` (snapshot-index-role), got {raw:?}"
-                ));
-            };
-            let snapshot_id: u64 = snap
-                .parse()
-                .map_err(|_| format!("element_token has a non-numeric snapshot id: {raw:?}"))?;
-            let index: usize = idx
-                .parse()
-                .map_err(|_| format!("element_token has a non-numeric index: {raw:?}"))?;
-            return Ok(Target::Index {
-                index,
-                snapshot_id: Some(snapshot_id),
-                expected_role: Some(role.to_string()),
-            });
+            return parse_element_token(raw);
         }
         if let Some(raw) = &self.element_index {
             let index: usize = raw
@@ -190,10 +200,47 @@ impl ActionArgs {
     }
 }
 
+/// The button and the held modifier keys, shared by every tool that presses
+/// something.
+///
+/// Flattened rather than repeated so the two fields cannot drift apart between
+/// `click`, `click_in_window` and `drag` — and so a caller who learns the
+/// `modifiers` spelling once has learned it everywhere.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MouseArgs {
+    /// Which mouse button: `left` (default), `right` or `middle`. `right`
+    /// sends a real rightMouseDown/rightMouseUp pair rather than the AXShowMenu
+    /// accessibility action, which is the only thing that opens a context menu
+    /// on a custom-drawn control that advertises no actions at all. Use
+    /// perform_secondary_action with AXShowMenu instead when the element does
+    /// advertise it — that path needs no coordinate.
+    #[serde(default)]
+    button: Option<String>,
+    /// Modifier keys to hold for the duration of the press, as a `+`-separated
+    /// list: `cmd`, `shift`, `alt` (or `option`), `ctrl`, `fn`, and any
+    /// combination such as `cmd+shift`. Same spelling as press_key. This is how
+    /// you get ⌘-click to open a link in a new tab, ⇧-click to extend a
+    /// selection to a row, or ⌥-click to reveal an alternate action. Omit it
+    /// for a plain click.
+    #[serde(default)]
+    modifiers: Option<String>,
+}
+
+impl MouseArgs {
+    fn options(&self) -> Result<MouseOptions, String> {
+        MouseOptions::parse(
+            self.button.as_deref().unwrap_or(""),
+            self.modifiers.as_deref().unwrap_or(""),
+        )
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ClickArgs {
     #[serde(flatten)]
     target: ActionArgs,
+    #[serde(flatten)]
+    mouse: MouseArgs,
     /// Click count. `2` for a double-click, for targets that open on
     /// double-click and merely select on single-click — chat and file lists,
     /// typically. Anything above 1 skips the accessibility path entirely
@@ -201,6 +248,159 @@ struct ClickArgs {
     /// SkyLight delivery.
     #[serde(default)]
     count: Option<u8>,
+}
+
+/// One end of a `drag`, or the destination of a `hover`.
+///
+/// Two ways to say where, and only two: an element handle from `get_app_state`,
+/// or a window-local pixel. There is deliberately no screen coordinate — a
+/// gesture is pinned to one window, and window-local coordinates are re-anchored
+/// to that window's live position just before the events go out, so the user
+/// moving the window between the read and the drag is harmless.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EndpointArgs {
+    /// An `element_token` from get_app_state, e.g. `"7-12-AXButton"`.
+    /// Preferred: it pins the snapshot, the index and the role together.
+    #[serde(default)]
+    element_token: Option<String>,
+    /// An element index from the app's most recent get_app_state, e.g. `"12"`.
+    /// Accepted; `element_token` is stricter for free.
+    #[serde(default)]
+    element_index: Option<String>,
+    /// Horizontal offset in POINTS from the window's top-left corner, for an
+    /// end that is empty canvas rather than an element — not screen
+    /// coordinates, and not screenshot pixels (divide a screenshot pixel by the
+    /// `px per point` scale get_app_state reports). Both this and the vertical
+    /// offset are required together, and only when no element handle is given.
+    #[serde(default)]
+    window_x: Option<f64>,
+    /// Vertical offset in POINTS from the window's top-left corner, measured
+    /// downward.
+    #[serde(default)]
+    window_y: Option<f64>,
+}
+
+impl EndpointArgs {
+    /// `prefix` is what this endpoint's fields are actually called on the tool
+    /// — `"from_"` and `"to_"` on `drag`, empty on `hover` — so an error names
+    /// arguments the caller can find in the schema rather than a canonical
+    /// spelling that does not appear there.
+    fn location(&self, snapshot_id: Option<u64>, prefix: &str) -> Result<PointerLocation, String> {
+        if let Some(raw) = &self.element_token {
+            return parse_element_token(raw).map(PointerLocation::Element);
+        }
+        if let Some(raw) = &self.element_index {
+            let index: usize = raw.trim().parse().map_err(|_| {
+                format!("{prefix}element_index must be a whole number, got {raw:?}")
+            })?;
+            return Ok(PointerLocation::Element(Target::Index {
+                index,
+                snapshot_id,
+                expected_role: None,
+            }));
+        }
+        match (self.window_x, self.window_y) {
+            (Some(x), Some(y)) => Ok(PointerLocation::WindowPoint { x, y }),
+            _ => Err(format!(
+                "pass {prefix}element_token (preferred), {prefix}element_index, or both {prefix}window_x and {prefix}window_y"
+            )),
+        }
+    }
+}
+
+/// Both ends of a `drag`, spelled out rather than nested.
+///
+/// serde has no field-prefix support, so the two endpoints cannot be one
+/// flattened struct used twice; and a nested object would be worse anyway,
+/// because MCP clients render a flat argument list far more legibly than a
+/// schema with two sub-objects in it.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DragArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    /// Where the button goes down: an `element_token` from get_app_state.
+    #[serde(default)]
+    from_element_token: Option<String>,
+    /// Where the button goes down, as an element index from the app's most
+    /// recent get_app_state.
+    #[serde(default)]
+    from_element_index: Option<String>,
+    /// Where the button goes down, as a horizontal offset in POINTS from the
+    /// window's top-left corner. Use this end-form for empty canvas, where
+    /// there is no element to name. Needs `from_window_y` too.
+    #[serde(default)]
+    from_window_x: Option<f64>,
+    /// Vertical offset in POINTS from the window's top-left corner, measured
+    /// downward.
+    #[serde(default)]
+    from_window_y: Option<f64>,
+    /// Where the button comes back up: an `element_token`. May be a different
+    /// element of the same app — a row and the folder it is dropped into, say.
+    #[serde(default)]
+    to_element_token: Option<String>,
+    /// Where the button comes back up, as an element index.
+    #[serde(default)]
+    to_element_index: Option<String>,
+    /// Where the button comes back up, as a horizontal offset in POINTS from
+    /// the window's top-left corner. Needs `to_window_y` too.
+    #[serde(default)]
+    to_window_x: Option<f64>,
+    /// Vertical offset in POINTS from the window's top-left corner, measured
+    /// downward.
+    #[serde(default)]
+    to_window_y: Option<f64>,
+    #[serde(flatten)]
+    mouse: MouseArgs,
+    /// Pass the `snapshot_id` from get_app_state to make the call fail loudly
+    /// if the UI has been re-snapshotted since. Applies to both ends.
+    #[serde(default)]
+    snapshot_id: Option<u64>,
+    /// Re-read the window afterwards and report what changed. On by default.
+    #[serde(default)]
+    return_state: Option<bool>,
+}
+
+impl DragArgs {
+    fn drag_origin(&self) -> Result<PointerLocation, String> {
+        EndpointArgs {
+            element_token: self.from_element_token.clone(),
+            element_index: self.from_element_index.clone(),
+            window_x: self.from_window_x,
+            window_y: self.from_window_y,
+        }
+        .location(self.snapshot_id, "from_")
+    }
+
+    fn drag_destination(&self) -> Result<PointerLocation, String> {
+        EndpointArgs {
+            element_token: self.to_element_token.clone(),
+            element_index: self.to_element_index.clone(),
+            window_x: self.to_window_x,
+            window_y: self.to_window_y,
+        }
+        .location(self.snapshot_id, "to_")
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HoverArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    #[serde(flatten)]
+    at: EndpointArgs,
+    /// Modifier keys to appear to be holding while the pointer arrives, e.g.
+    /// `alt` for an app that reveals a different tooltip under ⌥. Usually
+    /// omitted.
+    #[serde(default)]
+    modifiers: Option<String>,
+    /// Pass the `snapshot_id` from get_app_state to make the call fail loudly
+    /// if the UI has been re-snapshotted since.
+    #[serde(default)]
+    snapshot_id: Option<u64>,
+    /// Re-read the window afterwards and report what changed. Leave this on:
+    /// the diff is how the hover-revealed UI becomes visible to you.
+    #[serde(default)]
+    return_state: Option<bool>,
 }
 
 /// Arguments for the elementless click.
@@ -227,6 +427,8 @@ struct ClickInWindowArgs {
     /// Click count. 2 for a double-click.
     #[serde(default)]
     count: Option<u8>,
+    #[serde(flatten)]
+    mouse: MouseArgs,
     /// Re-read the window afterwards and attach what changed. On a canvas the
     /// delta is usually empty, which is not evidence either way.
     #[serde(default)]
@@ -248,9 +450,19 @@ struct ScrollArgs {
     target: ActionArgs,
     /// `up`, `down`, `left` or `right`.
     direction: String,
-    /// Number of pages. Defaults to 1.
+    /// Number of pages. Defaults to 1. A page is whatever the element's own
+    /// accessibility scroller calls a page; on the wheel tier below it is 90%
+    /// of the element's height, which keeps a line of overlap.
     #[serde(default)]
     pages: Option<u32>,
+    /// Scroll by exactly this many POINTS of content instead of by pages. This
+    /// forces the wheel-event tier even on an element that does advertise an
+    /// accessibility scroll action, because accessibility cannot express a
+    /// distance — it only has whole pages. Use it when a page is too coarse:
+    /// nudging a long list a few rows, or scrolling a canvas that has no notion
+    /// of a page at all.
+    #[serde(default)]
+    pixels: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -483,7 +695,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. There is no real-pointer fallback."
+        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. Pass button=right for a real rightMouseDown/rightMouseUp pair (a context menu on a control that advertises no AXShowMenu), button=middle for a middle click, and modifiers=\"cmd\" / \"shift\" / \"alt\" / \"ctrl\" (or a combination like \"cmd+shift\") to hold keys down for the press — that is how you open a link in a new tab, extend a selection to a row, or reach an app's alternate ⌥ action. There is no real-pointer fallback."
     )]
     async fn click(
         &self,
@@ -493,11 +705,68 @@ impl CuaServer {
             Ok(t) => t,
             Err(e) => return Ok(fail(e)),
         };
+        let mouse = match a.mouse.options() {
+            Ok(m) => m,
+            Err(e) => return Ok(fail(e)),
+        };
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
-        let count = a.count.unwrap_or(1).clamp(1, 3);
+        let mouse = mouse.with_count(a.count.unwrap_or(1).clamp(1, 3));
         match self
-            .native(move |c| c.click(&app, target, count, want_state))
+            .native(move |c| c.click(&app, target, mouse, want_state))
+            .await
+        {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Press the mouse down at one point, move through interpolated intermediate points, and release at another — a real drag, delivered to the target process by pid with the cursor, keyboard focus, frontmost app and Space all untouched. Use it to reorder a list row, drag a file onto a folder, draw a selection rectangle on a canvas, move a slider knob, or resize a split. Each end is named independently and the two may be different elements of the same app: pass from_element_token / to_element_token (preferred, from get_app_state), or from_element_index / to_element_index, or from_window_x+from_window_y / to_window_x+to_window_y for an end that is bare canvas with no element behind it. Window coordinates are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), re-anchored to the window's live position just before the events go out. Both ends must be inside the SAME window that the app's most recent get_app_state read — a gesture cannot cross a window boundary and cua-rs refuses rather than guessing. The intermediate moves are interpolated rather than jumped, because a down at A followed by an up at B is not a drag to anything that implements one. `button` and `modifiers` work as they do on click. A success means the events were delivered in order and the mouse-up was sent even if a move failed partway; whether the target implemented a drag at all is what the returned state diff is for."
+    )]
+    async fn drag(&self, Parameters(a): Parameters<DragArgs>) -> Result<CallToolResult, McpError> {
+        let from = match a.drag_origin() {
+            Ok(l) => l,
+            Err(e) => return Ok(fail(e)),
+        };
+        let to = match a.drag_destination() {
+            Ok(l) => l,
+            Err(e) => return Ok(fail(e)),
+        };
+        let mouse = match a.mouse.options() {
+            Ok(m) => m,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.app.clone();
+        let want_state = a.return_state.unwrap_or(true);
+        match self
+            .native(move |c| c.drag(&app, from, to, mouse, want_state))
+            .await
+        {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Move the pointer over a point WITHOUT clicking, so hover-only UI appears: a tooltip, a submenu, a row's delete button that is only drawn under the cursor, a chart's value readout. Follow it with get_app_state (or leave return_state on, which is the default) to read whatever appeared. Address it like a drag end: element_token (preferred), element_index, or window_x + window_y in POINTS from the window's top-left corner for a spot with no element. IMPORTANT — your real cursor does not move. This sends a synthesized mouseMoved event to the target process, which is what makes it safe to use while the user is working, and also its one limitation: an app that asks where the pointer IS (NSEvent.mouseLocation, a poll of the cursor position) rather than reading the event it was handed will not react, and no setting changes that. Apps that use NSTrackingArea, and anything web-based, do react. The hover lasts until the app decides otherwise; there is no matching un-hover, and a later click or hover elsewhere replaces it."
+    )]
+    async fn hover(
+        &self,
+        Parameters(a): Parameters<HoverArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let at = match a.at.location(a.snapshot_id, "") {
+            Ok(l) => l,
+            Err(e) => return Ok(fail(e)),
+        };
+        let modifiers = match MouseOptions::parse("", a.modifiers.as_deref().unwrap_or("")) {
+            Ok(m) => m.modifiers,
+            Err(e) => return Ok(fail(e)),
+        };
+        let app = a.app.clone();
+        let want_state = a.return_state.unwrap_or(true);
+        match self
+            .native(move |c| c.hover(&app, at, modifiers, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -515,9 +784,12 @@ impl CuaServer {
         let app = a.app.clone();
         let (wid, x, y) = (a.window_id, a.x, a.y);
         let want_state = a.return_state.unwrap_or(true);
-        let count = a.count.unwrap_or(1).clamp(1, 3);
+        let mouse = match a.mouse.options() {
+            Ok(m) => m.with_count(a.count.unwrap_or(1).clamp(1, 3)),
+            Err(e) => return Ok(fail(e)),
+        };
         match self
-            .native(move |c| c.click_in_window(&app, wid, x, y, count, want_state))
+            .native(move |c| c.click_in_window(&app, wid, x, y, mouse, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -549,7 +821,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Scroll a scrollable element by whole pages, using the accessibility scroll actions rather than wheel events. Target the scroll area or table itself, not the element you want to reveal."
+        description = "Scroll a scrollable element. Two tiers, chosen automatically and named in the result. If the element advertises an accessibility scroll action, whole pages go through it (`delivery: ax`) — that is the better answer where it exists, because the app decides what a page of its own content is and no coordinate is involved. If it advertises none — an Electron list, a canvas, a web area inside a native shell, which is the common case and used to be a dead end — a real scrollWheel event is delivered at the element's point, routed to the target process by pid (`delivery: pid`), with the cursor, keyboard focus and frontmost app untouched. Pass `pixels` to scroll by an exact number of POINTS instead of by pages; that always uses the wheel tier, because accessibility cannot express a distance at all. Target the scroll area, list or table itself, not the element you want to reveal."
     )]
     async fn scroll(
         &self,
@@ -572,9 +844,14 @@ impl CuaServer {
         };
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
-        let pages = a.pages.unwrap_or(1).clamp(1, 50);
+        // `pixels` wins when both are given: it is the more specific request,
+        // and it is the only one of the two that can express a distance at all.
+        let amount = match a.pixels {
+            Some(px) => ScrollAmount::Points(px.clamp(1, 20_000)),
+            None => ScrollAmount::Pages(a.pages.unwrap_or(1).clamp(1, 50)),
+        };
         match self
-            .native(move |c| c.scroll(&app, target, dir, pages, want_state))
+            .native(move |c| c.scroll(&app, target, dir, amount, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -629,7 +906,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press a background-safe semantic key on an element. `return`/`enter` and `escape` map to AXConfirm and AXCancel, and `up`/`down` map to AXIncrement/AXDecrement on steppers and sliders. Arbitrary keys and chords are refused because they require shared HID input and would steal keyboard focus. Successful results always report `delivery: ax`."
+        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The keys are real key events routed to the target process by pid and reported as `delivery: pid (keyboard)` — the shared keyboard tap is never used, so the user's own typing keeps going where it was going. They land wherever that process's own first responder currently is; cua-rs best-effort-focuses the element you name first (AXFocused, where the app makes it settable) but cannot guarantee it, so re-read the element afterwards when it matters which field received the keys."
     )]
     async fn press_key(
         &self,
@@ -903,7 +1180,11 @@ impl rmcp::ServerHandler for CuaServer {
              first: it returns the window's element tree plus a screenshot and assigns the \
              [N] indices that click / set_value / scroll take as element_index. Actions use \
              element-addressed accessibility verbs when available; custom controls can use a \
-             window-pinned event routed directly to the target process (delivery: pid). Neither \
+             window-pinned event routed directly to the target process (delivery: pid). Beyond \
+             click there is drag (press, interpolated moves, release, either end an element or \
+             a bare pixel), hover (a synthesized mouseMoved that reveals hover-only UI), and \
+             scroll (the accessibility page verb where the element has one, a real wheel event \
+             where it does not). Neither \
              path moves the cursor, changes keyboard focus, raises the app, or switches Space — \
              you can drive a background window while the user keeps working in another one. \
              Indices are only valid until \

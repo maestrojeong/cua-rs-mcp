@@ -116,8 +116,10 @@ fn advertises_the_expected_tools() {
             "check_permissions",
             "click",
             "click_in_window",
+            "drag",
             "find",
             "get_app_state",
+            "hover",
             "list_apps",
             "perform_secondary_action",
             "press_key",
@@ -287,6 +289,113 @@ fn an_action_with_no_target_says_what_is_missing() {
     assert!(
         text.contains("element_index") && text.contains("x and y"),
         "must name both ways to target: {text}"
+    );
+}
+
+#[test]
+fn the_pointer_tools_advertise_the_button_and_modifier_vocabulary() {
+    // These are the only way an agent learns that a right-click or a
+    // command-click is available at all, so losing the fields silently would
+    // remove the capability from every caller's point of view.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    for name in ["click", "click_in_window", "drag"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        let props = &tool["inputSchema"]["properties"];
+        for key in ["button", "modifiers"] {
+            assert!(
+                !props[key].is_null(),
+                "{name} must advertise {key}; schema was {props:#?}"
+            );
+        }
+    }
+
+    // A drag names both ends independently, and either may be an element or a
+    // bare pixel. A schema missing one of the four shapes makes that end
+    // unreachable.
+    let drag = tools.iter().find(|t| t["name"] == "drag").unwrap();
+    let props = &drag["inputSchema"]["properties"];
+    for key in [
+        "from_element_token",
+        "from_window_x",
+        "from_window_y",
+        "to_element_token",
+        "to_window_x",
+        "to_window_y",
+    ] {
+        assert!(!props[key].is_null(), "drag must advertise {key}");
+    }
+
+    // Scroll's event tier is only reachable if the caller can ask in a
+    // distance, which is the one thing accessibility cannot express.
+    let scroll = tools.iter().find(|t| t["name"] == "scroll").unwrap();
+    assert!(
+        !scroll["inputSchema"]["properties"]["pixels"].is_null(),
+        "scroll must advertise pixels"
+    );
+}
+
+#[test]
+fn a_bad_button_or_modifier_is_rejected_before_any_native_call() {
+    // Runs with no grants: parsing happens in the MCP layer, before the
+    // accessibility check.
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"click","arguments":{"app":"Finder","element_index":"1","button":"mouse3"}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"click","arguments":{"app":"Finder","element_index":"1","modifiers":"cmd+clik"}}}"#,
+        ],
+    );
+    let button = call_text(&responses, 6);
+    assert_eq!(response(&responses, 6)["result"]["isError"], true);
+    assert!(
+        button.contains("left") && button.contains("right") && button.contains("middle"),
+        "a bad button must list the real ones: {button}"
+    );
+    let modifier = call_text(&responses, 7);
+    assert_eq!(response(&responses, 7)["result"]["isError"], true);
+    assert!(
+        modifier.contains("clik"),
+        "a bad modifier must name the offending token: {modifier}"
+    );
+}
+
+#[test]
+fn a_drag_with_one_end_missing_says_which_end_and_how_to_name_it() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"drag","arguments":{"app":"Finder","from_element_index":"3"}}}"#,
+        ],
+    );
+    let text = call_text(&responses, 8);
+    assert_eq!(response(&responses, 8)["result"]["isError"], true);
+    assert!(
+        text.contains("to_element_token") && text.contains("to_window_x"),
+        "must name the missing end's own argument spellings: {text}"
+    );
+}
+
+#[test]
+fn a_hover_with_no_destination_says_what_is_missing() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"hover","arguments":{"app":"Finder"}}}"#,
+        ],
+    );
+    let text = call_text(&responses, 9);
+    assert_eq!(response(&responses, 9)["result"]["isError"], true);
+    assert!(
+        text.contains("element_token") && text.contains("window_x"),
+        "must name both ways to aim a hover: {text}"
     );
 }
 
