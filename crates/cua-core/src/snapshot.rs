@@ -729,7 +729,8 @@ mod diff_tests {
 
     #[test]
     fn a_menu_opening_survives_a_reshuffle_of_everything_else() {
-        let before = "[0] AXWindow\n  [1] AXButton\n    [2] AXCell\n      [3] AXTextArea = \"hi\"\n";
+        let before =
+            "[0] AXWindow\n  [1] AXButton\n    [2] AXCell\n      [3] AXTextArea = \"hi\"\n";
         let after = "[0] AXWindow\n  [1] AXButton\n    [2] AXMenu \"_NS:244\"\n  [3] AXCell\n    [4] AXTextArea = \"hi\"\n";
         let d = diff_trees(before, after);
         assert_eq!(d.added, vec!["    [2] AXMenu \"_NS:244\"".to_string()]);

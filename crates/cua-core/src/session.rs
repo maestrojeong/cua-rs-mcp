@@ -263,12 +263,16 @@ fn capture_failure_warning(err: &str, nodes: &[AxNode]) -> String {
 /// output cutoff. A stated reason is worth more than a wrong diff.
 fn diff_basis(scoped: bool, limits: Limits) -> std::result::Result<(), &'static str> {
     if scoped {
-        return Err("the previous snapshot was scoped to one subtree, which a whole-window \
-                    re-read cannot be subtracted from");
+        return Err(
+            "the previous snapshot was scoped to one subtree, which a whole-window \
+                    re-read cannot be subtracted from",
+        );
     }
     if limits != post_action_limits() {
-        return Err("the previous snapshot was walked under different caps, so it never described \
-                    the whole window and the difference would be mostly nodes it did not reach");
+        return Err(
+            "the previous snapshot was walked under different caps, so it never described \
+                    the whole window and the difference would be mostly nodes it did not reach",
+        );
     }
     Ok(())
 }
@@ -1305,8 +1309,10 @@ impl Inner {
             if before_window == after_window {
                 Ok(tree)
             } else {
-                Err("the window this app is showing is not the one the previous snapshot \
-                     described, so there is nothing to diff against")
+                Err(
+                    "the window this app is showing is not the one the previous snapshot \
+                     described, so there is nothing to diff against",
+                )
             }
         });
 
