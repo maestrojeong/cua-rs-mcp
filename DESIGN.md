@@ -659,19 +659,63 @@ with it.
 
 | gate | default | flag | what it refuses |
 |---|:--|:--|:--|
+| session scope | **off** | `CUA_ALLOWED_APPS=id,id` | actions on any app outside the scope the launcher named |
 | forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots |
 | destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something |
 | screen lock | **on** | — | every action while the session is locked or the saver is up |
 | yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using |
 | HTTP bearer token | **on** | `CUA_HTTP_TOKEN` sets it | any `/mcp` request without `Authorization: Bearer` |
 
-All four action gates are checked once, in `Inner::acting`, which every action
+Every action gate is checked once, in `Inner::acting`, which every action
 already passes through. That is deliberate: a tool added later is gated by
 default instead of by somebody remembering, and the order (session → app →
 element) means the error names the most fundamental reason rather than the last
 one checked. Refusing a click on "Delete" as destructive when the real problem
 is that the screen has been locked for an hour sends the agent down the wrong
 path.
+
+### A scope beats a blocklist, and the two are not alternatives
+
+The forbidden list and the five heuristics beside it all answer the same
+question — *is this dangerous?* — and they answer it by enumerating danger. That
+is structurally lossy: every app nobody thought of is admitted, and the list can
+only ever grow behind the ecosystem. `CUA_ALLOWED_APPS` inverts it and asks a
+question that has an actual answer, *what is this run for?* Everything outside
+that fails closed by construction rather than by vigilance.
+
+Three properties are load-bearing.
+
+**It is set by the launcher, and there is no tool to widen it.** A `grant_app`
+tool would let the agent extend its own reach, which is not a scope at all. So it
+is an environment variable, read once through a `OnceLock`, never writable at
+runtime. The refusal says the human has to change it and restart, because that is
+true and the agent should stop trying.
+
+**It narrows and never widens.** Scoping a run *to* a password manager does not
+lift the forbidden floor — `guard` checks the floor first, and there is a test
+pinning that both are true of the same bundle id at once. The two gates compose in
+one direction only. That also fixes the coarseness the blocklist had on its own:
+System Settings is blocked whole because a bundle id cannot say which pane is
+open, and the only escape used to be `CUA_ALLOW_FORBIDDEN_TARGETS=1`, which lifts
+*everything*. With a scope you can hand one app the permission it needs without
+disarming the floor for the rest.
+
+**An empty value means unscoped, not "refuse everything".** A run that can act on
+no app at all is indistinguishable from a broken install, and a typo in a shell
+export should not present as one. `CUA_ALLOWED_APPS=` and `CUA_ALLOWED_APPS=,,`
+log a warning and leave the run unscoped.
+
+Two smaller rules, both tested. Matching is exact on the whole identifier, never
+a prefix, so `com.apple.Safari` does not admit Safari Technology Preview and
+`com.apple` does not quietly mean every Apple app. And a process publishing no
+bundle identifier at all is refused under a scope rather than admitted, because
+an allowlist that waves through what it cannot name is not one; the refusal is a
+separate variant from "not on the list" so the two call for different fixes.
+
+Reads are untouched, including screenshots. The scope answers what may be
+*driven*, not what may be looked at — and unlike the forbidden list there is no
+secrecy argument here, since the human chose the machine's contents, not the
+scope's silence.
 
 ### Reading is allowed; acting is not; photographing is not either
 

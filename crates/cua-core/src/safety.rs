@@ -89,6 +89,48 @@ pub enum Refused {
     )]
     SessionLocked { verb: &'static str },
 
+    /// The app is outside the scope the human granted when they started the
+    /// server.
+    ///
+    /// Deliberately a different refusal from [`Refused::ForbiddenTarget`]: that
+    /// one says "nobody may drive this", this one says "this run may drive only
+    /// what it was scoped to". The distinction matters to the caller, because
+    /// only one of them is resolvable at all, and neither is resolvable by the
+    /// agent itself.
+    #[error(
+        "refusing to {verb} in `{app}` ({bundle_id}): this cua-rs run is scoped to \
+         CUA_ALLOWED_APPS={allowed}, and `{bundle_id}` is not in it. Reading is still allowed \
+         (get_app_state, find, list_apps) — the scope limits what may be *acted on*. Only the \
+         human who launched the server can widen it: add the bundle identifier to \
+         CUA_ALLOWED_APPS and restart. list_apps prints the identifier for every running app"
+    )]
+    NotInAllowlist {
+        verb: &'static str,
+        app: String,
+        bundle_id: String,
+        allowed: String,
+    },
+
+    /// Scoped run, and the target does not present a bundle identifier at all.
+    ///
+    /// Fails closed: an allowlist that silently admits everything it cannot name
+    /// is not an allowlist. Kept separate from
+    /// [`Refused::NotInAllowlist`] because "not on the list" and "cannot be
+    /// compared to the list" call for different fixes.
+    #[error(
+        "refusing to {verb} in `{app}` (pid {pid}): this cua-rs run is scoped to \
+         CUA_ALLOWED_APPS={allowed}, and this process publishes no bundle identifier, so it \
+         cannot be matched against that scope. Scoping fails closed rather than admitting what it \
+         cannot name. Reading is still allowed. Unset CUA_ALLOWED_APPS to drive unbundled \
+         processes"
+    )]
+    UnidentifiableUnderAllowlist {
+        verb: &'static str,
+        app: String,
+        pid: i32,
+        allowed: String,
+    },
+
     #[error(
         "refusing to {verb} {target}: this reads as a destructive control (matched {matched:?}). \
          Pass confirm_destructive: true on this same call to proceed — that is the whole gate, \
@@ -171,6 +213,92 @@ pub fn forbidden_targets_allowed() -> bool {
         }
         allowed
     })
+}
+
+/// The bundle identifiers this run is allowed to *act* on, if it was scoped.
+///
+/// `None` means unscoped — every app is actionable, which is what cua-rs has
+/// always done and stays the default so an existing install does not break on
+/// upgrade. `Some` means the human who launched the process named the apps this
+/// run is for, and everything else is refused.
+///
+/// # Why an environment variable and not a tool
+///
+/// A `grant_app` tool would let the agent widen its own scope, which is not a
+/// scope. The whole value here is that the boundary is set by the human who
+/// started the process and cannot be moved from inside it — so it lives in the
+/// environment, is read once, and is never writable at runtime.
+///
+/// # Why bundle identifiers
+///
+/// Same reason [`FORBIDDEN`] matches on them: display names are localized, and
+/// a Korean-language machine defeats a list of English names. `list_apps`
+/// already prints the identifier next to every app, so the value a user needs
+/// is one call away.
+///
+/// Comparison is case-insensitive and entries are trimmed, because a bundle id
+/// pasted out of a plist or a log should not fail on whitespace.
+pub fn allowed_apps() -> Option<&'static [String]> {
+    static ALLOWED: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| {
+            let parsed = parse_allowlist(&std::env::var("CUA_ALLOWED_APPS").ok()?);
+            match &parsed {
+                None => tracing::warn!(
+                    "CUA_ALLOWED_APPS is set but lists no bundle identifier; ignoring it and \
+                     leaving this run unscoped"
+                ),
+                Some(list) => tracing::info!(
+                    "scoped to {} app(s) for actions: {}",
+                    list.len(),
+                    list.join(", ")
+                ),
+            }
+            parsed
+        })
+        .as_deref()
+}
+
+/// Split and normalize the raw variable. Separate from [`allowed_apps`] so the
+/// rules are testable without a process-wide environment or a `OnceLock` that
+/// can only be initialized once per test binary.
+///
+/// `None` for a value that names nothing. An empty or whitespace-only
+/// `CUA_ALLOWED_APPS` is a mistake, not "allow nothing": a run that can act on
+/// no app at all is indistinguishable from a broken install, and a typo in a
+/// shell export should not present as one.
+fn parse_allowlist(raw: &str) -> Option<Vec<String>> {
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Whether a normalized scope admits a bundle identifier.
+///
+/// Exact match on the whole identifier, never a prefix: `com.apple.Safari` must
+/// not admit `com.apple.SafariTechnologyPreview`, and a scope of `com.apple`
+/// must not quietly mean "all of Apple's apps".
+fn in_scope(list: &[String], bundle_id: &str) -> bool {
+    let want = bundle_id.trim().to_ascii_lowercase();
+    list.contains(&want)
+}
+
+/// How the scope reads back in a refusal.
+fn allowed_apps_display() -> String {
+    allowed_apps()
+        .map(|apps| apps.join(","))
+        .unwrap_or_default()
+}
+
+/// Whether `bundle_id` is inside this run's scope. `true` when unscoped.
+pub fn app_allowed(bundle_id: &str) -> bool {
+    match allowed_apps() {
+        None => true,
+        Some(apps) => in_scope(apps, bundle_id),
+    }
 }
 
 /// Whether cua-rs should stop acting on an app the human has started using.
@@ -1050,6 +1178,32 @@ pub(crate) fn guard(
         }
     }
 
+    // Checked after the forbidden floor on purpose. When an app is both
+    // forbidden and out of scope, "nobody may drive this" is the reason worth
+    // reporting: adding it to CUA_ALLOWED_APPS would not help, and a caller told
+    // otherwise will send the human to edit the wrong variable.
+    if allowed_apps().is_some() {
+        match app.bundle_id.as_deref() {
+            Some(bundle_id) if !app_allowed(bundle_id) => {
+                return Err(Refused::NotInAllowlist {
+                    verb,
+                    app: app.name.clone(),
+                    bundle_id: bundle_id.to_string(),
+                    allowed: allowed_apps_display(),
+                })
+            }
+            None => {
+                return Err(Refused::UnidentifiableUnderAllowlist {
+                    verb,
+                    app: app.name.clone(),
+                    pid: app.pid,
+                    allowed: allowed_apps_display(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+
     match &watch.watch {
         Watch::Off => {}
         Watch::Broken { reason } => {
@@ -1510,5 +1664,64 @@ mod tests {
         assert_eq!(parse("1"), 250);
         assert_eq!(parse("999999"), 60_000);
         assert_eq!(parse("nonsense"), 3_000);
+    }
+
+    // ── the session scope ────────────────────────────────────────────────────
+
+    #[test]
+    fn an_allowlist_is_split_trimmed_and_lowercased() {
+        assert_eq!(
+            parse_allowlist("com.kakao.KakaoTalkMac , com.apple.TextEdit"),
+            Some(vec![
+                "com.kakao.kakaotalkmac".to_string(),
+                "com.apple.textedit".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_allowlist("  com.apple.Safari  "),
+            Some(vec!["com.apple.safari".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_scope_that_names_nothing_is_no_scope_at_all() {
+        // A run scoped to nothing looks exactly like a broken install, so an
+        // empty value is read as "unscoped" rather than "refuse everything".
+        assert_eq!(parse_allowlist(""), None);
+        assert_eq!(parse_allowlist("   "), None);
+        assert_eq!(parse_allowlist(",,"), None);
+        assert_eq!(parse_allowlist(" , , "), None);
+    }
+
+    #[test]
+    fn scope_matching_ignores_case_and_surrounding_space() {
+        let list = parse_allowlist("com.kakao.KakaoTalkMac").unwrap();
+        assert!(in_scope(&list, "com.kakao.KakaoTalkMac"));
+        assert!(in_scope(&list, "com.kakao.kakaotalkmac"));
+        assert!(in_scope(&list, "  com.kakao.KakaoTalkMac  "));
+        assert!(!in_scope(&list, "com.apple.TextEdit"));
+    }
+
+    #[test]
+    fn a_scope_entry_never_matches_a_prefix() {
+        // The failure this rules out is a scope of `com.apple.Safari` silently
+        // admitting Safari Technology Preview, and a scope of `com.apple`
+        // admitting every Apple app on the machine.
+        let one = parse_allowlist("com.apple.Safari").unwrap();
+        assert!(!in_scope(&one, "com.apple.SafariTechnologyPreview"));
+
+        let vendor = parse_allowlist("com.apple").unwrap();
+        assert!(!in_scope(&vendor, "com.apple.Safari"));
+        assert!(!in_scope(&vendor, "com.apple.TextEdit"));
+    }
+
+    #[test]
+    fn the_scope_and_the_forbidden_floor_are_independent() {
+        // Scoping a run to a password manager must not lift the floor: the
+        // allowlist widens nothing, it only narrows. `guard` checks the floor
+        // first for exactly this reason.
+        let list = parse_allowlist("com.1password.1password").unwrap();
+        assert!(in_scope(&list, "com.1password.1password"));
+        assert!(forbidden_bundle("com.1password.1password").is_some());
     }
 }

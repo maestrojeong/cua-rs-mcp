@@ -198,6 +198,7 @@ fn main() -> anyhow::Result<()> {
                        AXPress/AXPick/AXConfirm first; custom-drawn controls use\n                         \
                        process-routed SkyLight events. Neither path moves the cursor.\n\n\
                      SAFETY GATES:\n  \
+                       apps this run may act on                   all (CUA_ALLOWED_APPS=id,id)\n  \
                        credential managers and security surfaces  refused (CUA_ALLOW_FORBIDDEN_TARGETS=1)\n  \
                        destructive-looking targets                need confirm_destructive on the call\n  \
                        locked screen or screen saver              refused\n  \

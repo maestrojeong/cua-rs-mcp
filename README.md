@@ -89,11 +89,12 @@ for. stdio mode needs no token: the client already owns the process.
 
 ## Safety
 
-Five gates. Each refusal names what to pass or change, so an agent can resolve
+Six gates. Each refusal names what to pass or change, so an agent can resolve
 it in one round trip. [DESIGN.md §7a](DESIGN.md) has the reasoning.
 
 | | default | how to change it |
 |---|:--|:--|
+| **Scope this run to the apps you actually want driven.** Unset, every app is actionable. Set, acting on anything else is refused — reading still works. Bundle identifiers, comma-separated; `list_apps` prints them. | unscoped | `CUA_ALLOWED_APPS=com.kakao.KakaoTalkMac,com.apple.TextEdit` |
 | **Credential and security apps are never driven.** Keychain Access, the Passwords app, 1Password / Bitwarden / LastPass / Dashlane / KeePass and friends, System Settings, login and unlock prompts. Matched on bundle identifier, not display name. | on | `CUA_ALLOW_FORBIDDEN_TARGETS=1` |
 | **Reading them is still allowed** — `get_app_state`, `find`, `list_apps` — because a blocked app you cannot even look at is one you cannot explain. The screenshot is withheld, though: pixels reproduce the secret rather than describing it. | on | same flag |
 | **Destructive controls need confirming.** A target whose label reads as Delete / Remove / Erase / Reset / Move to Trash / Don't Save / 삭제 / 제거 / 초기화 / 나가기 is refused, as is `cmd+delete` and a bare `delete` outside a text field. | on | pass `confirm_destructive: true` on that call |
@@ -103,6 +104,14 @@ it in one round trip. [DESIGN.md §7a](DESIGN.md) has the reasoning.
 The label classifier deliberately over-reports: a false positive costs one extra
 call, a false negative costs a deleted conversation. If a refusal looks wrong,
 confirming is the right answer.
+
+**`CUA_ALLOWED_APPS` is the recommended posture**, and the one gate that is a
+scope rather than a heuristic. The other five guess at what is dangerous; this
+one asks you what the run is *for*. A blocklist fails open on every app nobody
+thought to list — a scope cannot. It is off by default only so an upgrade does
+not break a working install, and only the human who launches the process can set
+it: there is deliberately no tool to widen it from inside, because a boundary the
+agent can move is not a boundary.
 
 ## Use
 
