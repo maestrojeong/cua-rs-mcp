@@ -254,6 +254,52 @@ window in the system including the visibly frontmost one. `killall replayd`
 restored it. Check that before concluding anything about a particular window —
 it nearly produced a bug report against this crate's own `on_screen` field.
 
+### One anomaly chased down: a shell capture that refused a pop-up id
+
+Filed during the pop-up work and left unexplained: a shell
+`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
+create image from window`, once, while every in-process `capture_window` around
+it returned an image. Two capture paths disagreeing about one window id in the
+same moment would be a real and worrying finding, so it was worth the bounded
+attempt. **It reproduces, and it is not that.**
+
+`cargo run -p cua-core --example popup_capture_probe` opens a pop-up with a
+pid-routed right-click, then alternates a shell capture and an in-process capture
+against that window's id, reading the window's liveness between every step —
+because macOS emits the same string for "this window refuses to be photographed"
+and for "this window does not exist", and without a liveness read between them
+the two are indistinguishable. That is the whole of the original mistake.
+
+Against a Calculator context menu (level 101, a new window of the app's own pid):
+
+- **Four runs of 30–40 rounds, 129 live rounds in total: both paths succeeded
+  every time.** Identical byte counts round to round, no refusal from either.
+- **On the pop-up's id after it had closed, the shell command fails with exactly
+  `could not create image from window`, 3 attempts out of 3.** That is the
+  original message, from a dead window id, with no window-server refusal
+  involved.
+- The in-process path usually does *not* produce that text for a dead id, which
+  is what made the two look like they disagreed: `capture_window` enumerates
+  windows first and returns `window <id> not found (it may have closed)`
+  instead. It produces the raw refusal only when the window dies inside the gap
+  between that enumeration and the capture, which one round against a TextEdit
+  context menu did: `live` before the shell capture, gone after it, and the
+  in-process call in between surfaced `could not create image from window`.
+
+So the asymmetry was never between two capture APIs. It was between a call with a
+preflight and a bare shell invocation without one, aimed at a pop-up id whose
+window had gone — and a pop-up is exactly the kind of window that goes away while
+you are looking at it. A pop-up id is not a durable handle, which is also why
+§10's conclusion (macOS photographs a window together with the pop-up attached to
+it, so ask for the *parent*) is the right way to get its pixels.
+
+**This changes nothing about `capture_failure_warning` and must not be read as
+weakening it.** That warning is about a *live* window of an app that has a menu
+open, and it already says the correlation is not established. Nothing here
+touched that case: every window in these runs was either alive and captured
+successfully by both paths, or gone. The hedge stands, and so does the reason for
+it.
+
 ### ScreenCaptureKit instead of `screencapture` buys nothing here
 
 The modern alternative is `SCScreenshotManager.captureImageWithFilter` over
@@ -1546,6 +1592,95 @@ against the pixel count and keeping the one whose horizontal and vertical
 px-per-point agree, and both the covered rect and the window's own frame are
 reported.
 
+**An `AXMenuItem` does act on the first `AXPress`. The old claim that it does
+not was a read taken too early.** This section carried, from a single
+observation, that "an `AXMenuItem` does not reliably act on the first `AXPress`
+— the first press selected it and the second opened the dialog", with the
+`return_state` diff reporting exactly one changed line, `(selected)`. That has
+now been characterized, and it does not reproduce.
+
+The target has to be a menu that publishes accessibility at all, so this is not
+about the pop-up above: a menu opened by a click is a `CGWindow` with no AX
+representation and has no `AXMenuItem` to press. It is about the menu-bar
+hierarchy every app here publishes — `AXMenuBar` → `AXMenuBarItem` → `AXMenu` →
+`AXMenuItem`, each item advertising `AXCancel`, `AXPress`, `AXPick`. Three
+harmless, reversible toggles were used, deliberately across both ways an app
+writes one: Calculator's View → RPN mode and TextEdit's View → Use Dark
+Background for Windows carry a checkmark, and Calculator's View → Show/Hide
+Thousands Separators flips its own title instead. The read-back is the pressed
+element's own title and `AXMenuItemMarkChar`, so nothing is inferred from a
+window diff. `cargo run -p cua-ax --example menu_item_press` is the probe.
+
+**Six arms × 10 trials × 3 items: 180 presses, 180 acted on the first press.**
+
+| arm | result |
+|---|:--|
+| menu never opened, one `AXPress` on the item | 10/10 on each item |
+| menu opened first by `AXPress` on its `AXMenuBarItem` | 10/10 on each item |
+| `AXSelected` written `true`, then one `AXPress` | 10/10 on each item |
+| press again if the first press appeared not to act | the second press never fired |
+| alternating, no state restored between trials, so consecutive presses toggle in opposite directions — run both with the menu opened and with it closed | 10/10 on each item, both directions |
+
+Not one trial in any run was rescued by a second press: the "acted within two
+presses" count equalled the "acted on one press" count in every arm of every
+run, including the arms scored before the probe was finished.
+
+**What the original observation actually saw is the read latency.** Polling the
+item every 50 ms after the press, the time until the change became *readable*:
+
+| item | menu closed | menu opened first |
+|---|---|---|
+| TextEdit, Use Dark Background | 50–56 ms | 370–386 ms |
+| Calculator, RPN mode | 803–1033 ms | 1358–1437 ms |
+| Calculator, Thousands Separators | 821–1042 ms | 1371–1708 ms |
+
+Up to 1.7 s, against the 120 ms settle `ui_changed` uses — fourteen times it. A
+read at any fixed short delay reports a press that worked as having done
+nothing, and the natural response is to press again. On a toggle that undoes the
+first press; on an item that opens a dialog it looks exactly like "the second one
+worked". That is the whole of the original finding, and it is a bug in the
+observation rather than in `AXPress`.
+
+Two things fall out of it that were not the question:
+
+- **Opening the menu first makes it slower, and is not needed.** Every item acted
+  with the menu never opened, and the latency was consistently *lower* that way.
+  There is no first-press-selects step to get past.
+- **`AXSelected` is settable and means nothing here.** `is_settable("AXSelected")`
+  is true on every item tried, the write returns success, and it never read back
+  `true` — 0/180 in the arms that write it — nor did it change whether the press
+  worked. The one place `AXSelected` did read `true` after a press was an early
+  run against TextEdit's Show/Hide Tab Bar item with the menu opened first, 10/10.
+  That is the menu's own highlight while it is on screen, which is what the
+  original `(selected)` diff line was: the menu was open, so one row was
+  highlighted, and the diff attributed the highlight to the press.
+
+The probe recorded the frontmost pid before and after, because pressing a
+*background* app's `AXMenuBarItem` is the obvious way this could have cheated —
+the menu bar only ever shows the frontmost app's menus. It never changed: 60
+presses against TextEdit with a terminal frontmost throughout, and the Calculator
+runs with Finder or a terminal frontmost.
+
+Two smaller measurements from the same sessions, recorded because they will
+otherwise be rediscovered:
+
+- **A menu item's `AXEnabled` is not a static property.** TextEdit's View items
+  read `enabled=false` before that menu had ever been opened and `true`
+  afterwards; Finder's window-scoped View items (Show Path Bar, Hide Sidebar)
+  read `false` with no Finder window open. AppKit validates a menu item when the
+  menu is about to be shown, so "disabled" can equally mean "not yet validated",
+  and a caller must not read it as a refusal.
+- **Calculator quit on its own** partway through one run, after roughly 120
+  presses in that session. Not reproduced across four later runs of the same
+  length. Recorded, not explained.
+
+The consequence for cua-rs is not about `AXPress`. It is that the 120 ms
+`ui_changed` settle cannot see a menu item's effect on two of the three items
+here, so a caller acting on a menu item should re-read that element rather than
+trust the returned diff — which is what the first paragraph of this section says
+about `ui_changed` generally, now with a number attached. `AXObserver`
+notifications remain the real fix.
+
 **Both per-pid keyboard functions are wired in now.**
 `press_chord_background_pid` and `type_text_background_pid` are built the same
 way — `CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
@@ -1588,10 +1723,9 @@ focused element gives cua-rs nothing to check against, and the honest report is
 that nothing is known. `AXObserver` notifications would be the real fix here as
 they would be for `ui_changed`.
 
-`post_chord` remains the unreachable, focus-stealing shared-input path. Its
-last stated reason to exist — being the only way to type real keystrokes into a
-terminal — is gone with `mechanism: "keystrokes"`, and §11 says it should be
-deleted.
+`post_chord`, the focus-stealing shared-input keyboard path that both of these
+made redundant, has been deleted — §11 has what it was for and why nothing
+needed it.
 
 ---
 
@@ -2046,21 +2180,47 @@ a pid, so a miss stays inside the target process.
 
 ### What stays closed
 
-`post_chord` remains unreachable from the server. It exists so the shared-input
-keyboard path is visible in one file and can be reasoned about. Its last
-argument for existing — being the only way to type real keystrokes into a
-terminal — is gone now that `type_text` can do it per-pid, so it should be
-deleted; it is left in this change only because deleting it is a separate edit
-from the one that made it redundant.
+**The shared tier is now closed by absence, not by policy.** Both of the
+functions that could write to it have been deleted, and each deletion took an
+import with it, which turns a promise into something a reader can check with
+`grep`.
 
-Its mouse counterpart is already gone. `click_by_moving_pointer` warped the real
-pointer, clicked through the shared HID stream, and warped back; every control it
-existed for is now reachable by the elementless pid click, so keeping a working
-pointer warp in the tree was leaving a temptation rather than a fallback. Its
-deletion took the last `CGWarpMouseCursorPosition` reference with it, and that
-absence is now the check: nothing in the workspace imports the only API that can
-move the user's cursor, so no edit elsewhere can reintroduce a warp without
-adding the import back first.
+`click_by_moving_pointer` went first. It warped the real pointer, clicked through
+the shared HID stream, and warped back; every control it existed for is now
+reachable by the elementless pid click. Its deletion took the last
+`CGWarpMouseCursorPosition` reference with it.
+
+`post_chord` has now gone the same way. It posted a key or chord with
+`CGEventPost(kCGHIDEventTap)` — no `app` parameter, deliberately, because
+pretending to target an app while writing to the shared stream would have been a
+lie. It was the one function in `cua-hid` that took the human's keyboard focus,
+and it existed because the crate was built believing there was no per-app
+keyboard route: an arbitrary chord, a terminal, and a canvas app that only reads
+real key events were all unreachable without it. That belief is what
+`press_chord_background_pid` and `type_text_background_pid` disproved (§10), and
+the last argument for keeping it — being the only way to type real keystrokes
+into a terminal — expired with `type_text mechanism: "keystrokes"`. It was last
+reachable in 0.3.0, as the HID half of §1's rejected option 3, and has been
+unreachable from the server since 0.3.1 removed that flag: `press_key` routes
+through the pid tier, `CUA_KEY_AX_ONLY=1` selects an AX-verb-only path that
+synthesizes nothing at all, and no example or probe in the workspace called it
+either. So nothing had to be rewired to delete it — the function and its
+shared-stream `CGEventTapLocation` import were removed, and the workspace built,
+tested and linted unchanged.
+
+That import is the check. `CGEventTapLocation` is the only argument
+`CGEventPost` takes, so with it gone from the file that does the posting, a
+shared-stream write cannot be added there without putting it back first — the
+same test the missing cursor-warp import provides. Both absences are verifiable
+in one `grep` over `crates/*/src`: `CGEvent::post` returns only `post_to_pid`
+calls, every one of which names a target process, and
+`CGWarpMouseCursorPosition` returns nothing but prose. `CGEventTapLocation` has
+exactly one surviving `src` use, in `humanwatch`, where it says where to
+*create* the listen-only tap (§9) and is never handed to a post. The probe
+examples under `crates/cua-hid/examples/` do still post to the shared tap,
+deliberately and only there: `click_probe`'s `global` arm exists to reproduce
+the finding that a warped-pointer shared click works where `CGEventPostToPid`
+does not, and an example is not shipped in the binary.
 
 Global HID delivery and cursor warping are not planned, not gated behind a flag,
 and not a future option: they are the thing this project exists to not do.

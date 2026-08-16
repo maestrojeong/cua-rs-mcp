@@ -5,6 +5,97 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## Unreleased
+
+### The shell capture that refused a pop-up id was a dead window id
+
+An unexplained observation from the pop-up work: a shell
+`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
+create image from window` while every in-process `capture_window` around it
+succeeded. Chased with `cargo run -p cua-core --example popup_capture_probe`,
+which opens a pop-up and alternates both paths against its window id while
+reading the window's liveness between every step.
+
+129 live rounds across four runs: both paths succeeded every time. Asked for the
+same id *after* the pop-up closed, the shell command fails with exactly that
+message, 3 out of 3. The in-process path normally reports `window <id> not found
+(it may have closed)` instead, because it enumerates first — which is the whole of
+the apparent disagreement. One round caught the raw refusal in-process too, when
+the window died inside the gap between that enumeration and the capture.
+
+So a pop-up id is not a durable handle, and §10's answer — ask for the parent
+window, which macOS photographs with the pop-up attached — remains the way to get
+a pop-up's pixels. `capture_failure_warning` is unchanged and undiminished: it
+describes a *live* window of an app with a menu open, which is a different case
+and still an unestablished correlation.
+
+### An `AXMenuItem` does act on the first `AXPress`
+
+DESIGN.md §10 carried, from one observation, that it does not — that the first
+press only selects the item and a second is needed to make it act. Characterized
+now with `cargo run -p cua-ax --example menu_item_press`, a new probe: six arms ×
+10 trials × 3 menu-bar toggles in two apps, **180 presses, all 180 acting on the
+first press**. No trial in any arm was ever rescued by a second press.
+
+What the original observation saw was the read. Polling the pressed item every
+50 ms, the change takes 50 ms to 1.7 s to become readable — up to fourteen times
+the 120 ms settle `ui_changed` uses. A read at a fixed short delay reports a
+press that worked as having done nothing, and pressing again then undoes it on a
+toggle or looks like success on a dialog. `AXSelected` on a menu item is settable
+and inert: the write never reads back, and it changes nothing about whether the
+press works.
+
+Nothing in the shipped code changed. The practical note for callers is in §10:
+after acting on a menu item, re-read that element rather than trusting the
+returned diff.
+
+### CI notices a directory under `crates/` that is not a crate
+
+`crates/cua-sky/examples/` sat in the working tree as debris from an abandoned
+experiment. Git never carried it — it holds no files, and git does not track
+empty directories — so it was never in a commit, a release, or a clone. What let
+it linger is that nothing referenced it: `cua-sky` was not a workspace member, so
+no build, lint or test step had any reason to name it, and CI's per-crate build
+loop spelled its six crates out by hand.
+
+CI now derives that list from `cargo metadata` and asserts it matches `ls crates`
+in both directions. A directory that is not a member fails the job, and so does a
+member whose directory is gone. Checked against the case that motivated it:
+recreating `crates/cua-sky/examples/` makes the step fail with `> cua-sky`.
+
+No other reference to a crate that does not exist was found — not in
+`Cargo.toml`, `.github/workflows/`, `install.sh`, `README.md` or `DESIGN.md`.
+
+### `cua_hid::post_chord` is deleted
+
+It posted a key or chord through `CGEventPost(kCGHIDEventTap)` — the session's
+one shared keyboard stream — so it went to whatever app had focus and took that
+focus from the human. It was the only function in `cua-hid` that did, and it
+existed because the crate was built believing there was no per-app keyboard
+route: without it, an arbitrary chord, a terminal and a canvas app that reads
+only real key events were unreachable.
+
+Nothing needs it now. `press_chord_background_pid` and
+`type_text_background_pid` deliver keys per-pid, `press_key` uses the former as
+its only tier, and `type_text mechanism: "keystrokes"` uses the latter — which
+took away its last stated reason to exist, being the only way to type into a
+terminal. It has been unreachable from the server since 0.3.1 removed the flag
+that reached it, and no example or probe called it either, so nothing was
+rewired: the function went, and with it `cua-hid`'s `CGEventTapLocation` import.
+
+That import is the point. It is the only argument `CGEventPost` takes, so with it
+gone from the file that does the posting, a shared-stream write cannot be added
+there without putting it back first — the same check the absent
+`CGWarpMouseCursorPosition` gives for the cursor. `grep -rn 'CGEvent::post'
+crates/*/src/` now returns only `post_to_pid`, and the one surviving
+`CGEventTapLocation` in `src/` is `humanwatch`'s listen-only tap, which creates a
+tap and posts nothing. DESIGN.md §11 has the reasoning; §10 and the crate docs no
+longer describe a fallback that exists.
+
+`parse_chord` is untouched: it is shared with the pid keyboard path. Nothing
+tested `post_chord` — there was no way to assert on a write to the shared stream
+— so the workspace test count is unchanged at 212.
+
 ## 0.7.0
 
 The mouse model widened, a safety layer arrived, and four coordinate bugs came

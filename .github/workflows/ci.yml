@@ -20,6 +20,26 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      # `crates/` and the workspace member list must agree in both directions.
+      # A directory under `crates/` that is not a member is invisible to every
+      # other step here — nothing builds it, nothing lints it, nothing tests it —
+      # so it can sit in the tree indefinitely looking like a crate. That
+      # happened: `crates/cua-sky/examples/` was left behind by an abandoned
+      # experiment and no command in this file had any reason to mention it. The
+      # other direction is the ordinary typo, a member whose directory is gone.
+      - name: crates/ and the workspace member list agree
+        run: |
+          members=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print("\n".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))')
+          dirs=$(ls -1 crates | sort)
+          if [ "$members" != "$dirs" ]; then
+            echo "crates/ and the workspace members disagree:"
+            diff <(echo "$members") <(echo "$dirs") || true
+            echo "Left is a workspace member; right is a directory under crates/."
+            exit 1
+          fi
+          echo "CRATES=$(echo $members)" >> "$GITHUB_ENV"
+
       # Runs BEFORE the workspace commands, and with a target dir of its own per
       # crate, because a workspace build is exactly what hides this class of bug.
       # Cargo unifies features across the whole graph, so a crate that uses an
@@ -30,9 +50,12 @@ jobs:
       # declared it. Every workspace build passed and `cargo build -p cua-overlay`
       # did not. A separate CARGO_TARGET_DIR matters as much as the `-p`: sharing
       # one lets an earlier unified build leave usable artifacts behind.
+      #
+      # The list comes from the step above rather than being written out here, so
+      # a new crate cannot be added to the workspace and silently skip this check.
       - name: Each crate builds on its own features
         run: |
-          for crate in cua-ax cua-capture cua-hid cua-core cua-mcp cua-overlay; do
+          for crate in $CRATES; do
             echo "::group::$crate"
             CARGO_TARGET_DIR="target/isolated/$crate" cargo build -p "$crate"
             echo "::endgroup::"
