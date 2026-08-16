@@ -33,8 +33,20 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType};
-use objc2_core_graphics::CGEvent;
+use objc2_core_graphics::{CGEvent, CGEventFlags};
 use objc2_foundation::NSPoint;
+
+/// The AppKit spelling of a set of CG event flags.
+///
+/// A straight bit reinterpretation, and that is not a coincidence:
+/// `NSEventModifierFlagShift` and `kCGEventFlagMaskShift` are both `1 << 17`,
+/// and the same holds for every other modifier. Keeping one canonical set
+/// (`CGEventFlags`, because that is what `parse_chord` already produces) and
+/// converting at the AppKit boundary avoids a second parallel table that could
+/// drift out of agreement with the first.
+pub(crate) fn appkit_modifiers(flags: CGEventFlags) -> NSEventModifierFlags {
+    NSEventModifierFlags::from_bits_retain(flags.0 as usize)
+}
 
 /// `NSEventTypeAppKitDefined`. AppKit routes these to `NSApplication`'s
 /// internal handling rather than to a view, which is what makes them usable as
@@ -107,9 +119,17 @@ pub(crate) fn uptime_nanos() -> u64 {
 /// real one is what lets `-[NSEvent window]` resolve inside the target process;
 /// passing 0 produces a windowless event that only a global tracking area would
 /// ever see.
+///
+/// `modifiers` are the held modifier keys the event should appear to carry, as
+/// AppKit flags. They go in at construction time *and* are re-stamped onto the
+/// `CGEvent` afterwards by the caller: `-[NSEvent modifierFlags]` is read off the
+/// header AppKit builds here, while anything reading `CGEventGetFlags` — a
+/// Chromium or Electron renderer, for instance — reads the CG record. The two
+/// enums share their bit values, so the same set satisfies both.
 pub(crate) fn mouse_event(
     kind: NSEventType,
     location: NSPoint,
+    modifiers: NSEventModifierFlags,
     window_number: isize,
     event_number: isize,
     click_count: isize,
@@ -118,7 +138,7 @@ pub(crate) fn mouse_event(
     let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
         kind,
         location,
-        NSEventModifierFlags::empty(),
+        modifiers,
         // Timestamp 0 here on purpose: `send` re-stamps every event with a
         // fresh uptime reading immediately before posting, and a value baked in
         // at construction time would already be stale by then.

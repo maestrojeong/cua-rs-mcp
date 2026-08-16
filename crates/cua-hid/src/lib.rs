@@ -3,9 +3,20 @@
 //! # Read this before using this crate
 //!
 //! This is the only crate in the workspace that can synthesize input outside
-//! the accessibility API. The server uses one entry point:
-//! [`click_background_pid`], which targets one process without moving the
-//! shared pointer.
+//! the accessibility API. Every entry point the server uses targets one process
+//! and never touches the shared pointer:
+//!
+//! | | |
+//! |---|:--|
+//! | [`click_background_pid`] | a press and release at a point, with a button, modifiers and a click count |
+//! | [`drag_background_pid`] | a press, a run of interpolated moves, and a release |
+//! | [`move_mouse_background_pid`] | a bare `mouseMoved`, for hover-revealed UI |
+//! | [`scroll_background_pid`] | a `scrollWheel` with a pixel or line delta |
+//! | [`press_chord_background_pid`] | a key or chord |
+//!
+//! They share one model — `{origin, destination, button, modifiers,
+//! click_count}` — and one delivery path, so widening what cua-rs can express
+//! never widens *how* it is delivered.
 //!
 //! Exactly one shared-input helper is left: [`post_chord`] writes into the
 //! session's single, shared HID event stream. It is global by necessity — there
@@ -101,11 +112,16 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 // pointer warp without adding it back here first.
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
-    CGEventType, CGMouseButton,
+    CGEventType, CGMouseButton, CGScrollEventUnit,
 };
 
 mod nsevent;
 mod skylight;
+
+/// Re-exported so a caller can name a modifier set without taking its own
+/// dependency on `objc2-core-graphics`. [`parse_modifiers`] and [`parse_chord`]
+/// both produce one of these, and `CGEventFlags::empty()` is "no modifiers".
+pub use objc2_core_graphics::CGEventFlags as Modifiers;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum HidError {
@@ -117,6 +133,18 @@ pub enum HidError {
 
     #[error("chord {0:?} has modifiers but no key")]
     NoKey(String),
+
+    /// A modifier list contained something that is not a modifier. Separate
+    /// from [`HidError::UnknownToken`] because the vocabularies differ: a
+    /// modifier list has no key in it, so naming the key table in the message
+    /// would send the caller looking in the wrong place.
+    #[error(
+        "unknown modifier `{token}` in {modifiers:?}. Modifiers: cmd, shift, alt/option, ctrl, fn"
+    )]
+    UnknownModifier { modifiers: String, token: String },
+
+    #[error("unknown mouse button {0:?}. Buttons: left, right, middle")]
+    UnknownButton(String),
 
     #[error("could not create a HID event source; the Accessibility grant may have been revoked")]
     NoSource,
@@ -132,6 +160,132 @@ pub type Result<T> = std::result::Result<T, HidError>;
 pub struct Chord {
     pub key: u16,
     pub flags: CGEventFlags,
+}
+
+/// Which physical button a synthesized mouse event carries.
+///
+/// The three macOS buttons that have their own `NSEventType` family. Anything
+/// beyond them travels as `otherMouse*` with a button number, which no app
+/// cua-rs targets has been observed to want, so it is not modelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+impl MouseButton {
+    /// Parse `left`, `right` or `middle`, case-insensitively.
+    ///
+    /// An empty or whitespace-only string is [`MouseButton::Left`], so a caller
+    /// that always passes the field through can leave it blank and get the
+    /// default rather than an error.
+    pub fn parse(button: &str) -> Result<Self> {
+        match button.trim().to_lowercase().as_str() {
+            "" | "left" | "primary" => Ok(MouseButton::Left),
+            "right" | "secondary" | "context" => Ok(MouseButton::Right),
+            "middle" | "center" | "centre" | "wheel" => Ok(MouseButton::Middle),
+            _ => Err(HidError::UnknownButton(button.to_string())),
+        }
+    }
+
+    /// `kCGMouseEventButtonNumber`: 0 left, 1 right, 2 middle.
+    fn number(self) -> i64 {
+        match self {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+        }
+    }
+
+    /// The three `NSEventType`s this button's gesture is made of, in the order
+    /// they are sent: down, dragged, up.
+    ///
+    /// AppKit keeps a separate type per button rather than a shared type with a
+    /// button field, and a view implementing `rightMouseDown:` will never see a
+    /// `leftMouseDown` no matter what button number is stamped on it — so the
+    /// type, not the stamped field, is what actually selects the handler.
+    fn types(self) -> (NSEventType, NSEventType, NSEventType) {
+        match self {
+            MouseButton::Left => (
+                NSEventType::LeftMouseDown,
+                NSEventType::LeftMouseDragged,
+                NSEventType::LeftMouseUp,
+            ),
+            MouseButton::Right => (
+                NSEventType::RightMouseDown,
+                NSEventType::RightMouseDragged,
+                NSEventType::RightMouseUp,
+            ),
+            MouseButton::Middle => (
+                NSEventType::OtherMouseDown,
+                NSEventType::OtherMouseDragged,
+                NSEventType::OtherMouseUp,
+            ),
+        }
+    }
+
+    /// How this button is spelled in a result line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MouseButton::Left => "left",
+            MouseButton::Right => "right",
+            MouseButton::Middle => "middle",
+        }
+    }
+}
+
+/// The modifier flag a token names, or `None` if the token is not a modifier.
+///
+/// The single source of the modifier vocabulary. [`parse_chord`] and
+/// [`parse_modifiers`] both go through it, so `cmd+shift` means the same thing
+/// in `press_key` as it does on a click and neither can grow an alias the other
+/// does not have.
+fn modifier_flag(token: &str) -> Option<CGEventFlags> {
+    match token {
+        "cmd" | "command" | "meta" | "super" => Some(CGEventFlags::MaskCommand),
+        "shift" => Some(CGEventFlags::MaskShift),
+        "alt" | "opt" | "option" => Some(CGEventFlags::MaskAlternate),
+        "ctrl" | "control" => Some(CGEventFlags::MaskControl),
+        "fn" | "function" => Some(CGEventFlags::MaskSecondaryFn),
+        _ => None,
+    }
+}
+
+/// Split a chord-shaped string into its tokens.
+///
+/// `-` is only a separator when there is no `+`, for the reason [`parse_chord`]
+/// explains: `-` is also a key name.
+fn chord_tokens(s: &str) -> impl Iterator<Item = &str> {
+    let separators: &[char] = if s.contains('+') { &['+'] } else { &['+', '-'] };
+    s.split(separators).map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Parse a modifier list like `cmd`, `cmd+shift`, `alt-shift` — the same
+/// vocabulary and the same separators [`parse_chord`] accepts, minus the key.
+///
+/// An empty or whitespace-only string is no modifiers at all, which is what a
+/// caller that always forwards an optional field wants. Anything that is not a
+/// modifier is an error rather than being ignored: a caller who wrote
+/// `cmd+click` meant something, and silently dropping `click` would deliver a
+/// plain ⌘-click that looks like it worked.
+///
+/// Pure and unit-tested; posts nothing.
+pub fn parse_modifiers(modifiers: &str) -> Result<CGEventFlags> {
+    let mut flags = CGEventFlags::empty();
+    for raw in chord_tokens(modifiers) {
+        match modifier_flag(&raw.to_lowercase()) {
+            Some(flag) => flags |= flag,
+            None => {
+                return Err(HidError::UnknownModifier {
+                    modifiers: modifiers.to_string(),
+                    token: raw.to_string(),
+                })
+            }
+        }
+    }
+    Ok(flags)
 }
 
 /// Parse a chord like `cmd+shift+p`, `escape`, `f5`, `ctrl+alt+delete`.
@@ -151,33 +305,20 @@ pub fn parse_chord(chord: &str) -> Result<Chord> {
     let mut flags = CGEventFlags::empty();
     let mut key: Option<u16> = None;
 
-    let separators: &[char] = if chord.contains('+') {
-        &['+']
-    } else {
-        &['+', '-']
-    };
-
-    for raw in chord
-        .split(separators)
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    for raw in chord_tokens(chord) {
         let token = raw.to_lowercase();
-        match token.as_str() {
-            "cmd" | "command" | "meta" | "super" => flags |= CGEventFlags::MaskCommand,
-            "shift" => flags |= CGEventFlags::MaskShift,
-            "alt" | "opt" | "option" => flags |= CGEventFlags::MaskAlternate,
-            "ctrl" | "control" => flags |= CGEventFlags::MaskControl,
-            "fn" | "function" => flags |= CGEventFlags::MaskSecondaryFn,
-            other => match table.get(other) {
-                Some(&code) => key = Some(code),
-                None => {
-                    return Err(HidError::UnknownToken {
-                        chord: chord.to_string(),
-                        token: raw.to_string(),
-                    })
-                }
-            },
+        if let Some(flag) = modifier_flag(&token) {
+            flags |= flag;
+            continue;
+        }
+        match table.get(token.as_str()) {
+            Some(&code) => key = Some(code),
+            None => {
+                return Err(HidError::UnknownToken {
+                    chord: chord.to_string(),
+                    token: raw.to_string(),
+                })
+            }
         }
     }
 
@@ -266,8 +407,14 @@ pub fn skylight_available() -> bool {
     skylight::is_available()
 }
 
-/// Deliver a left click to a background process's window without moving the
+/// Deliver a click to a background process's window without moving the
 /// pointer, raising the window, or stealing focus.
+///
+/// The button, the modifier flags and the click count all come from
+/// [`PidClick`]. A right click here is a real `rightMouseDown`/`rightMouseUp`
+/// pair, not `AXShowMenu`: the controls that most need a context menu are
+/// exactly the custom-drawn ones that advertise no accessibility action to
+/// perform.
 ///
 /// This is the strict-background subset of cua-driver's `click_at_xy_inner`
 /// recipe and composes six layers into one call:
@@ -312,6 +459,8 @@ pub fn click_background_pid(
         window_local,
         wid,
         count,
+        button,
+        modifiers,
     } = target;
     if !skylight::is_available() {
         return Err(HidError::PrimitiveUnavailable(
@@ -326,12 +475,7 @@ pub fn click_background_pid(
 
     // Layer 3/5: a fresh sub-second group id ties the down/up pair together in
     // the server's gesture coalescing.
-    let click_group_id = {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as i64)
-            .unwrap_or(0)
-    };
+    let click_group_id = fresh_click_group_id();
 
     // Convince the target it is active before any mouse event arrives. A view
     // that gates on `NSApp.isActive` or `-[NSWindow isKeyWindow]` decides
@@ -347,9 +491,17 @@ pub fn click_background_pid(
     }
     wait_until_believed_frontmost(believes_it_is_frontmost);
 
-    post_mouse_moved_primer(pid, point, window_local, wid, click_group_id)?;
+    let route = MouseRoute {
+        pid,
+        wid,
+        button,
+        modifiers,
+        click_group_id,
+    };
+    post_mouse_moved_primer(&route, point, window_local)?;
     std::thread::sleep(std::time::Duration::from_millis(12));
 
+    let (down_type, _, up_type) = button.types();
     let n = if count == 0 { 1 } else { count };
     let result = (|| -> Result<()> {
         for pair_index in 0..n {
@@ -363,28 +515,24 @@ pub fn click_background_pid(
             // pair must differ.
             let event_number = nsevent::next_event_number();
 
-            let down = nsevent::mouse_event(
-                NSEventType::LeftMouseDown,
+            route.post(MouseEventSpec {
+                kind: down_type,
                 point,
-                window_number,
+                window_local,
                 event_number,
                 click_count,
-                1.0,
-            )
-            .ok_or(HidError::NoSource)?;
-            post_mouse_event(pid, &down, point, window_local, wid, click_group_id)?;
+                pressure: 1.0,
+            })?;
             std::thread::sleep(std::time::Duration::from_millis(28));
 
-            let up = nsevent::mouse_event(
-                NSEventType::LeftMouseUp,
+            route.post(MouseEventSpec {
+                kind: up_type,
                 point,
-                window_number,
+                window_local,
                 event_number,
                 click_count,
-                0.0,
-            )
-            .ok_or(HidError::NoSource)?;
-            post_mouse_event(pid, &up, point, window_local, wid, click_group_id)?;
+                pressure: 0.0,
+            })?;
 
             if n > 1 && pair_index + 1 < n {
                 std::thread::sleep(std::time::Duration::from_millis(HUMAN_CLICK_INTERVAL_MS));
@@ -566,6 +714,96 @@ pub struct PidClick {
     pub wid: u32,
     /// Click count: 1, or 2 for a target that only opens on a double-click.
     pub count: u8,
+    /// Which button. Right produces a real `rightMouseDown`/`rightMouseUp`
+    /// pair rather than `AXShowMenu`, which is the only thing that reaches a
+    /// control advertising no accessibility actions.
+    pub button: MouseButton,
+    /// Modifier keys the click should appear to be held down with, e.g.
+    /// `MaskCommand` for a ⌘-click. Build one with [`parse_modifiers`].
+    pub modifiers: CGEventFlags,
+}
+
+/// A press at one point, a run of moves, and a release at another — all pinned
+/// to one window.
+///
+/// The two endpoints are given as screen points plus the window's current frame
+/// origin, rather than as two pre-converted window-local pairs the way
+/// [`PidClick`] does it, because the intermediate points are computed *here*:
+/// handing the conversion back to the caller would mean converting a list whose
+/// length this module chooses. One origin covers the whole gesture, which is
+/// also the statement that a drag never crosses a window boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct PidDrag {
+    pub pid: i32,
+    /// `CGWindowID` of the window both endpoints were validated against.
+    pub wid: u32,
+    /// Frame origin of that window, in screen points, read immediately before
+    /// the drag.
+    pub window_origin: (f64, f64),
+    /// Where the button goes down, in screen points.
+    pub origin: (f64, f64),
+    /// Where it comes back up, in screen points.
+    pub destination: (f64, f64),
+    pub button: MouseButton,
+    pub modifiers: CGEventFlags,
+}
+
+/// A single `mouseMoved` event at a point in a window.
+///
+/// The real pointer is not involved and does not move; this is a synthetic
+/// event that makes the target *believe* the pointer arrived, which is what
+/// hover-revealed UI reacts to.
+#[derive(Debug, Clone, Copy)]
+pub struct PidMouseMove {
+    pub pid: i32,
+    pub point: (f64, f64),
+    pub window_local: (f64, f64),
+    pub wid: u32,
+    pub modifiers: CGEventFlags,
+}
+
+/// A `scrollWheel` event with a delta, aimed at a point in a window.
+#[derive(Debug, Clone, Copy)]
+pub struct PidScroll {
+    pub pid: i32,
+    pub point: (f64, f64),
+    pub window_local: (f64, f64),
+    pub wid: u32,
+    /// Vertical delta. Positive scrolls *up* — that is, content moves down —
+    /// which is the sign convention `CGEventCreateScrollWheelEvent2` uses.
+    pub delta_y: i32,
+    /// Horizontal delta. Positive scrolls left.
+    pub delta_x: i32,
+    pub unit: ScrollUnit,
+    pub modifiers: CGEventFlags,
+}
+
+/// What a scroll delta is counted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollUnit {
+    /// Points of content. What a trackpad sends, and what a web view or an
+    /// Electron list expects.
+    #[default]
+    Pixel,
+    /// Wheel notches. What a physical mouse wheel sends; a receiver is free to
+    /// turn one line into any number of points.
+    Line,
+}
+
+impl ScrollUnit {
+    fn cg(self) -> CGScrollEventUnit {
+        match self {
+            ScrollUnit::Pixel => CGScrollEventUnit::Pixel,
+            ScrollUnit::Line => CGScrollEventUnit::Line,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollUnit::Pixel => "pixel",
+            ScrollUnit::Line => "line",
+        }
+    }
 }
 
 /// Everything needed to send the *localized* form of an activation notice, rather
@@ -694,16 +932,356 @@ fn post_window_focus_click(
     // mouse-up that belongs to no down it saw.
     let event_number = nsevent::next_event_number();
 
+    let route = MouseRoute {
+        pid,
+        wid,
+        button: MouseButton::Left,
+        // No modifiers, ever: this is a click the caller did not ask for, sent
+        // only to make the window key. Carrying the caller's ⌘ or ⇧ into it
+        // could turn a focus assist into a range-select or an open-in-new-tab
+        // on whatever the activation point covers.
+        modifiers: CGEventFlags::empty(),
+        click_group_id,
+    };
     for (kind, pressure) in [
         (NSEventType::LeftMouseDown, 1.0_f32),
         (NSEventType::LeftMouseUp, 0.0_f32),
     ] {
-        let event = nsevent::mouse_event(kind, point, window_number, event_number, 1, pressure)
-            .ok_or(HidError::NoSource)?;
-        post_mouse_event(pid, &event, point, window_local, wid, click_group_id)?;
+        route.post(MouseEventSpec {
+            kind,
+            point,
+            window_local,
+            event_number,
+            click_count: 1,
+            pressure,
+        })?;
         std::thread::sleep(std::time::Duration::from_millis(12));
     }
     Ok(())
+}
+
+/// Press at one point, move through interpolated intermediate points, release
+/// at another — all inside one window, without the real pointer moving.
+///
+/// # Why the moves are interpolated
+///
+/// A down at A followed immediately by an up at B is not a drag to anything
+/// that implements one. AppKit's own drag sources arm on a `mouseDragged` that
+/// exceeds a small threshold and then track each subsequent move; a single jump
+/// gives them one move that they may or may not see before the up arrives, and
+/// a web view or an Electron list — which reconstructs the gesture from
+/// `mousemove` events — sees no movement at all. So the gesture is a run of
+/// `mouseDragged` events along the straight line between the endpoints, sent
+/// one per display frame. See [`drag_step_count`] for the count and
+/// [`DRAG_STEP_INTERVAL_MS`] for the interval, both of which are chosen rather
+/// than tuned.
+///
+/// # The mouse-up is not optional
+///
+/// A drag that fails halfway leaves the target mid-gesture: a row lifted out of
+/// a list, a selection rectangle still growing, a window stuck to a pointer
+/// that will never move again. So the release is attempted even when a move
+/// fails, and the *first* error is what gets returned — the failure that
+/// explains what happened, not the cleanup's opinion of it.
+pub fn drag_background_pid(
+    drag: PidDrag,
+    assist: Option<ActivationAssist>,
+    believes_it_is_frontmost: &dyn Fn() -> bool,
+) -> Result<()> {
+    let PidDrag {
+        pid,
+        wid,
+        window_origin,
+        origin,
+        destination,
+        button,
+        modifiers,
+    } = drag;
+    if !skylight::is_available() {
+        return Err(HidError::PrimitiveUnavailable(
+            "SLEventPostToPid + CGEventSetWindowLocation + SLEventSetIntegerValueField",
+        ));
+    }
+    let window_number = wid as isize;
+    let click_group_id = fresh_click_group_id();
+    let local = |(x, y): (f64, f64)| (x - window_origin.0, y - window_origin.1);
+
+    post_activation_notice(pid, nsevent::notify_window_key_focus_returned())?;
+    post_activation_notice(pid, nsevent::notify_app_activated(window_number))?;
+    if let Some(assist) = assist {
+        post_window_focus_click(pid, window_number, assist, click_group_id)?;
+    }
+    wait_until_believed_frontmost(believes_it_is_frontmost);
+
+    let route = MouseRoute {
+        pid,
+        wid,
+        button,
+        modifiers,
+        click_group_id,
+    };
+    let start = CGPoint::new(origin.0, origin.1);
+    post_mouse_moved_primer(&route, start, local(origin))?;
+    std::thread::sleep(std::time::Duration::from_millis(12));
+
+    let (down_type, dragged_type, up_type) = button.types();
+    // One event number for the whole gesture. AppKit correlates every event of
+    // a tracking session — the down, each drag, and the up — by this field, so
+    // allocating a fresh one per move would hand a view a stream of unrelated
+    // single events instead of one drag.
+    let event_number = nsevent::next_event_number();
+
+    route.post(MouseEventSpec {
+        kind: down_type,
+        point: start,
+        window_local: local(origin),
+        event_number,
+        click_count: 1,
+        pressure: 1.0,
+    })?;
+    // Long enough for the target to have processed the press and armed whatever
+    // tracking loop the drags are for. This is the same 28 ms a click leaves
+    // between its own down and up.
+    std::thread::sleep(std::time::Duration::from_millis(28));
+
+    let moves = (|| -> Result<()> {
+        for point in drag_path(origin, destination) {
+            route.post(MouseEventSpec {
+                kind: dragged_type,
+                point: CGPoint::new(point.0, point.1),
+                window_local: local(point),
+                event_number,
+                // A drag carries no click count. `-[NSEvent clickCount]` on a
+                // real `mouseDragged` is the count of the press it belongs to,
+                // but views read it on the down; stamping it here has been
+                // observed to matter nowhere and 1 is the honest value.
+                click_count: 1,
+                pressure: 1.0,
+            })?;
+            std::thread::sleep(std::time::Duration::from_millis(DRAG_STEP_INTERVAL_MS));
+        }
+        Ok(())
+    })();
+
+    let release = route.post(MouseEventSpec {
+        kind: up_type,
+        point: CGPoint::new(destination.0, destination.1),
+        window_local: local(destination),
+        event_number,
+        click_count: 1,
+        pressure: 0.0,
+    });
+
+    if deactivate_after_click() {
+        let _ = post_activation_notice(pid, nsevent::notify_app_deactivated(window_number));
+    }
+
+    moves.and(release)
+}
+
+/// Tell one process's window that the pointer moved to a point, without moving
+/// the real pointer.
+///
+/// This is the whole of "hover": a `mouseMoved` event carrying the target
+/// point, delivered by pid. A view with an `NSTrackingArea`, a web page with a
+/// `:hover` rule, or a toolbar that reveals a button under the cursor all react
+/// to the event, so the revealed UI shows up in the next snapshot.
+///
+/// **What it cannot reach:** anything that asks where the pointer *is* rather
+/// than reading where the event says it went — `NSEvent.mouseLocation`,
+/// `-[NSWindow mouseLocationOutsideOfEventStream]`, a poll of the `NSCursor`
+/// position. Those answer with the real pointer, which is still wherever the
+/// human left it, and cua-rs will not move it. An app built that way will not
+/// respond, and there is no version of this call that changes that.
+pub fn move_mouse_background_pid(
+    target: PidMouseMove,
+    believes_it_is_frontmost: &dyn Fn() -> bool,
+) -> Result<()> {
+    let PidMouseMove {
+        pid,
+        point: (x, y),
+        window_local,
+        wid,
+        modifiers,
+    } = target;
+    if !skylight::is_available() {
+        return Err(HidError::PrimitiveUnavailable(
+            "SLEventPostToPid + CGEventSetWindowLocation + SLEventSetIntegerValueField",
+        ));
+    }
+    // The notices, but never the assist click: an assist is a real click on the
+    // window's activation point, and a caller asking to hover has not asked to
+    // press anything.
+    prime_pointer_target(pid, wid as isize, believes_it_is_frontmost);
+
+    let route = MouseRoute {
+        pid,
+        wid,
+        button: MouseButton::Left,
+        modifiers,
+        click_group_id: fresh_click_group_id(),
+    };
+    post_mouse_moved_primer(&route, CGPoint::new(x, y), window_local)
+}
+
+/// Deliver a scroll-wheel event with a delta to one process's window.
+///
+/// Unlike every other event in this module, this one is *not* built through an
+/// `NSEvent` factory, because there is no scroll-wheel factory to build it
+/// with: the AppKit constructors cover mouse, keyboard and the "other" family
+/// only. That costs nothing here. The AppKit header the mouse path exists to
+/// obtain — event number, click count, window number — is what a view uses to
+/// validate a *click*; `-[NSEvent scrollingDeltaY]` reads the CG record's own
+/// wheel fields, which `CGEventCreateScrollWheelEvent2` fills in correctly.
+/// The window routing, the pid stamp and the fresh timestamp are all applied
+/// exactly as they are to a mouse event.
+pub fn scroll_background_pid(
+    scroll: PidScroll,
+    believes_it_is_frontmost: &dyn Fn() -> bool,
+) -> Result<()> {
+    let PidScroll {
+        pid,
+        point: (x, y),
+        window_local,
+        wid,
+        delta_y,
+        delta_x,
+        unit,
+        modifiers,
+    } = scroll;
+    if !skylight::is_available() {
+        return Err(HidError::PrimitiveUnavailable(
+            "SLEventPostToPid + CGEventSetWindowLocation + SLEventSetIntegerValueField",
+        ));
+    }
+    prime_pointer_target(pid, wid as isize, believes_it_is_frontmost);
+
+    // A scroll is only believable where the pointer is, so the same move that
+    // precedes a click precedes this: a view that decides which of its subviews
+    // owns the wheel by hit-testing the last known pointer position needs to
+    // have been told the pointer is over the target first.
+    let route = MouseRoute {
+        pid,
+        wid,
+        button: MouseButton::Left,
+        modifiers,
+        click_group_id: fresh_click_group_id(),
+    };
+    let point = CGPoint::new(x, y);
+    post_mouse_moved_primer(&route, point, window_local)?;
+    std::thread::sleep(std::time::Duration::from_millis(12));
+
+    let source =
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok_or(HidError::NoSource)?;
+    // Two wheels: vertical first, horizontal second, which is the order
+    // `CGEventCreateScrollWheelEvent2` documents. Asking for one wheel and then
+    // stamping the horizontal axis afterwards leaves the event describing
+    // itself as one-dimensional.
+    let event = CGEvent::new_scroll_wheel_event2(Some(&source), unit.cg(), 2, delta_y, delta_x, 0)
+        .ok_or(HidError::NoSource)?;
+    CGEvent::set_flags(Some(&event), modifiers);
+    CGEvent::set_location(Some(&event), point);
+
+    let ptr = CFRetained::as_ptr(&event).as_ptr() as *mut c_void;
+    route.stamp(ptr, window_local)?;
+    CGEvent::set_timestamp(Some(&event), nsevent::uptime_nanos());
+    post_once(pid, &event, ptr)
+}
+
+/// How many `mouseDragged` events to interpolate between a drag's endpoints.
+///
+/// Distance-aware rather than fixed, because the two failure modes pull in
+/// opposite directions and a single constant cannot avoid both:
+///
+/// - **too few** and each step is a jump. A drop target the drag passes over
+///   never sees a move inside itself, so it never highlights, and a source that
+///   arms on exceeding a threshold may be handed its whole distance in one
+///   event.
+/// - **too many** and the gesture takes long enough that a list's drag-autoscroll
+///   starts, or the target coalesces the moves it cannot draw anyway.
+///
+/// So the step *length* is what is held constant, at
+/// [`DRAG_MAX_STEP_POINTS`] — about the height of a list row or a toolbar
+/// button, so no ordinarily-sized drop target is stepped over entirely. The
+/// floor of [`DRAG_MIN_STEPS`] keeps a short drag from degenerating into the
+/// single jump this exists to avoid; the ceiling of [`DRAG_MAX_STEPS`] bounds
+/// the whole gesture at about half a second.
+pub fn drag_step_count(origin: (f64, f64), destination: (f64, f64)) -> usize {
+    let distance = ((destination.0 - origin.0).powi(2) + (destination.1 - origin.1).powi(2)).sqrt();
+    let wanted = (distance / DRAG_MAX_STEP_POINTS).ceil();
+    // `as usize` after the clamp, so a NaN distance (two non-finite endpoints)
+    // lands on the floor rather than saturating or wrapping.
+    if wanted.is_nan() {
+        return DRAG_MIN_STEPS;
+    }
+    (wanted as usize).clamp(DRAG_MIN_STEPS, DRAG_MAX_STEPS)
+}
+
+/// The points a drag's `mouseDragged` events are sent at, in order.
+///
+/// The origin is **not** repeated here — the mouse-down already delivered it —
+/// and the destination is always the last element, exactly, rather than
+/// whatever the interpolation arithmetic rounds to. A drag that ends a fraction
+/// of a point away from where the caller aimed is a drop into the wrong row.
+pub fn drag_path(origin: (f64, f64), destination: (f64, f64)) -> Vec<(f64, f64)> {
+    let steps = drag_step_count(origin, destination);
+    (1..=steps)
+        .map(|i| {
+            if i == steps {
+                destination
+            } else {
+                let t = i as f64 / steps as f64;
+                (
+                    origin.0 + (destination.0 - origin.0) * t,
+                    origin.1 + (destination.1 - origin.1) * t,
+                )
+            }
+        })
+        .collect()
+}
+
+/// Longest straight-line distance one interpolated drag step may cover, in
+/// points. Roughly one list row.
+const DRAG_MAX_STEP_POINTS: f64 = 24.0;
+/// Fewest interpolated steps, however short the drag.
+const DRAG_MIN_STEPS: usize = 6;
+/// Most interpolated steps, however long the drag. At
+/// [`DRAG_STEP_INTERVAL_MS`] each, this caps the moving part of a gesture at
+/// about half a second.
+const DRAG_MAX_STEPS: usize = 32;
+
+/// Gap between two interpolated drag steps, in milliseconds.
+///
+/// One display frame at 60 Hz. A target redraws at most once per frame, so
+/// moves sent faster than this are moves it cannot act on separately and may
+/// coalesce; moves sent slower make an ordinary drag take visibly longer than a
+/// human one, which is what starts autoscroll timers.
+pub const DRAG_STEP_INTERVAL_MS: u64 = 16;
+
+/// A fresh sub-second group id, tying the events of one gesture together in the
+/// window server's coalescing.
+fn fresh_click_group_id() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Send the activation notices — and only the notices — before a pointer event
+/// that is not a press.
+///
+/// [`click_background_pid`] can additionally synthesize a real click on the
+/// window's activation point ([`ActivationAssist`]) to make the window key.
+/// That is appropriate when the caller asked for a click and inappropriate when
+/// they asked for a hover or a scroll, so this half is what those get.
+fn prime_pointer_target(
+    pid: i32,
+    window_number: isize,
+    believes_it_is_frontmost: &dyn Fn() -> bool,
+) {
+    let _ = post_activation_notice(pid, nsevent::notify_window_key_focus_returned());
+    let _ = post_activation_notice(pid, nsevent::notify_app_activated(window_number));
+    wait_until_believed_frontmost(believes_it_is_frontmost);
 }
 
 /// Post one `NSEventTypeAppKitDefined` activation notice, stamped and routed the
@@ -735,88 +1313,120 @@ fn post_activation_notice(pid: i32, event: Option<Retained<CGEvent>>) -> Result<
 /// Built through AppKit like the click itself, and with `clickCount` 0, which is
 /// what a real move carries.
 fn post_mouse_moved_primer(
-    pid: i32,
+    route: &MouseRoute,
     point: CGPoint,
     window_local: (f64, f64),
-    wid: u32,
-    click_group_id: i64,
 ) -> Result<()> {
-    if let Some(event) = nsevent::mouse_event(
-        NSEventType::MouseMoved,
+    route.post(MouseEventSpec {
+        kind: NSEventType::MouseMoved,
         point,
-        wid as isize,
-        nsevent::next_event_number(),
-        0,
-        0.0,
-    ) {
-        post_mouse_event(pid, &event, point, window_local, wid, click_group_id)?;
-    }
-    Ok(())
+        window_local,
+        event_number: nsevent::next_event_number(),
+        click_count: 0,
+        pressure: 0.0,
+    })
 }
 
-/// Stamp (layers 2 and 3) and post (layer 4) one prepared mouse event to `pid`.
+/// Everything about *where a gesture is going* that does not change between its
+/// events: the process, the window, the button and the modifier keys.
 ///
-/// The event arrives already carrying its AppKit identity — type, event number,
-/// click count and window number all came from the `NSEvent` factory — so this
-/// only fills in what AppKit does not own:
-///
-/// - the CG-space screen location, because `NSEvent` interpreted the location it
-///   was handed in flipped AppKit coordinates;
-/// - the window-local location, so the click lands correctly even for a window
-///   that has moved since the snapshot;
-/// - the private window-routing fields the window server reads to decide which
-///   window should handle the event.
-///
-/// Deliberately *not* stamped any more: `kCGMouseEventClickState` and the window
-/// number, which `-[NSEvent clickCount]` and `-[NSEvent windowNumber]` already
-/// carry from construction. Writing them again was at best redundant and at
-/// worst contradicted the header AppKit validates against.
-fn post_mouse_event(
+/// Split out from [`MouseEventSpec`] because a click, a drag and a hover differ
+/// only in the per-event half. Keeping the constant half in one value means the
+/// button number and the pid stamp cannot disagree between the down and the up
+/// of the same gesture.
+#[derive(Debug, Clone, Copy)]
+struct MouseRoute {
     pid: i32,
-    event: &Retained<CGEvent>,
+    wid: u32,
+    button: MouseButton,
+    modifiers: CGEventFlags,
+    click_group_id: i64,
+}
+
+/// The per-event half: what distinguishes this one event from the others in its
+/// gesture.
+#[derive(Debug, Clone, Copy)]
+struct MouseEventSpec {
+    kind: NSEventType,
     point: CGPoint,
     window_local: (f64, f64),
-    wid: u32,
-    click_group_id: i64,
-) -> Result<()> {
-    let ptr = nsevent::as_raw(event);
+    event_number: isize,
+    click_count: isize,
+    pressure: f32,
+}
 
-    // AppKit built this event from a flipped, window-relative location. The
-    // window server routes on the CG-space one, so overwrite it with the screen
-    // point the caller actually validated.
-    CGEvent::set_location(Some(event), point);
+impl MouseRoute {
+    /// Build one AppKit mouse event, stamp it, and post it to the target pid.
+    fn post(&self, spec: MouseEventSpec) -> Result<()> {
+        let event = nsevent::mouse_event(
+            spec.kind,
+            spec.point,
+            nsevent::appkit_modifiers(self.modifiers),
+            self.wid as isize,
+            spec.event_number,
+            spec.click_count,
+            spec.pressure,
+        )
+        .ok_or(HidError::NoSource)?;
+        let ptr = nsevent::as_raw(&event);
 
-    // A stale timestamp is treated as a replayed event and can be coalesced away
-    // or dropped outright, so it is read as late as possible — immediately
-    // before the post, after all stamping is done.
-    CGEvent::set_timestamp(Some(event), nsevent::uptime_nanos());
+        // AppKit built this event from a flipped, window-relative location. The
+        // window server routes on the CG-space one, so overwrite it with the
+        // screen point the caller actually validated.
+        CGEvent::set_location(Some(&event), spec.point);
+        // Also re-stamped rather than trusted from the `NSEvent` header,
+        // because a receiver reading `CGEventGetFlags` — anything Chromium
+        // based — reads the CG record, not the AppKit one.
+        CGEvent::set_flags(Some(&event), self.modifiers);
 
-    if !skylight::set_window_location(ptr, window_local.0, window_local.1) {
-        return Err(HidError::PrimitiveUnavailable("CGEventSetWindowLocation"));
+        self.stamp(ptr, spec.window_local)?;
+
+        // A stale timestamp is treated as a replayed event and can be coalesced
+        // away or dropped outright, so it is read as late as possible —
+        // immediately before the post, after all stamping is done.
+        CGEvent::set_timestamp(Some(&event), nsevent::uptime_nanos());
+
+        // Post exactly once. Duplicating this through CGEventPostToPid can turn
+        // one logical click into two queue entries on macOS versions where both
+        // routes are accepted, and the public post carries no success signal
+        // anyway.
+        post_once(self.pid, &event, ptr)
     }
 
-    let set = |field: u32, value: i64| -> Result<()> {
-        skylight::set_integer_field(ptr, field, value)
-            .then_some(())
-            .ok_or(HidError::PrimitiveUnavailable(
-                "SLEventSetIntegerValueField",
-            ))
-    };
-    set(skylight::BUTTON_NUMBER, 0)?; // left
-    set(skylight::SUBTYPE, 3)?;
+    /// Stamp the private window-routing fields (layers 2 and 3) onto a prepared
+    /// event record.
+    ///
+    /// Applies to any pointer event, whether or not AppKit built it — the
+    /// scroll path shares this exactly, which is why it takes a raw pointer
+    /// rather than a typed event.
+    ///
+    /// Deliberately *not* stamped: `kCGMouseEventClickState` and the window
+    /// number, which `-[NSEvent clickCount]` and `-[NSEvent windowNumber]`
+    /// already carry from construction. Writing them again was at best
+    /// redundant and at worst contradicted the header AppKit validates against.
+    fn stamp(&self, ptr: *mut c_void, window_local: (f64, f64)) -> Result<()> {
+        if !skylight::set_window_location(ptr, window_local.0, window_local.1) {
+            return Err(HidError::PrimitiveUnavailable("CGEventSetWindowLocation"));
+        }
 
-    let window_id = wid as i64;
-    set(skylight::CLICK_GROUP, click_group_id)?;
-    set(skylight::WINDOW_UNDER_MOUSE, window_id)?;
-    set(skylight::WINDOW_UNDER_MOUSE_HANDLING, window_id)?;
+        let set = |field: u32, value: i64| -> Result<()> {
+            skylight::set_integer_field(ptr, field, value)
+                .then_some(())
+                .ok_or(HidError::PrimitiveUnavailable(
+                    "SLEventSetIntegerValueField",
+                ))
+        };
+        set(skylight::BUTTON_NUMBER, self.button.number())?;
+        set(skylight::SUBTYPE, 3)?;
 
-    // Target pid is always stamped — it is the whole point of the route.
-    set(skylight::TARGET_PID, pid as i64)?;
+        let window_id = self.wid as i64;
+        set(skylight::CLICK_GROUP, self.click_group_id)?;
+        set(skylight::WINDOW_UNDER_MOUSE, window_id)?;
+        set(skylight::WINDOW_UNDER_MOUSE_HANDLING, window_id)?;
 
-    // Post exactly once. Duplicating this through CGEventPostToPid can turn one
-    // logical click into two queue entries on macOS versions where both routes
-    // are accepted, and the public post carries no success signal anyway.
-    post_once(pid, event, ptr)
+        // Target pid is always stamped — it is the whole point of the route.
+        set(skylight::TARGET_PID, self.pid as i64)
+    }
 }
 
 /// Whether to deliver through the public `CGEventPostToPid` instead of the
@@ -870,7 +1480,7 @@ fn deactivate_after_click() -> bool {
 /// The public call returns nothing at all — not even "the process is gone" — so a
 /// `true` here means "handed over", never "delivered". The private route is not
 /// much better, but it at least reports a missing symbol.
-fn post_once(pid: i32, event: &Retained<CGEvent>, ptr: *mut c_void) -> Result<()> {
+fn post_once(pid: i32, event: &CGEvent, ptr: *mut c_void) -> Result<()> {
     if use_public_post() {
         CGEvent::post_to_pid(pid, Some(event));
         return Ok(());
@@ -1014,6 +1624,143 @@ fn key_table() -> HashMap<&'static str, u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_modifier_list_shares_the_chord_vocabulary() {
+        // The point of routing both parsers through one table: whatever spells
+        // a modifier in `press_key` must spell it on a click too.
+        for alias in ["cmd", "command", "meta", "super"] {
+            assert_eq!(
+                parse_modifiers(alias).unwrap(),
+                CGEventFlags::MaskCommand,
+                "{alias} must mean command on a click as well as in a chord"
+            );
+        }
+        assert_eq!(
+            parse_modifiers("cmd+shift").unwrap(),
+            parse_chord("cmd+shift+a").unwrap().flags,
+            "a modifier list and the modifier half of a chord must agree"
+        );
+        // Same separator rules, so a model that writes dashes in one place and
+        // pluses in the other gets the same answer.
+        assert_eq!(
+            parse_modifiers("alt-ctrl").unwrap(),
+            parse_modifiers("ctrl+alt").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_empty_modifier_list_is_no_modifiers_not_an_error() {
+        // A caller forwarding an optional field should not have to special-case
+        // the absent case.
+        assert!(parse_modifiers("").unwrap().is_empty());
+        assert!(parse_modifiers("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_key_name_in_a_modifier_list_is_refused_not_ignored() {
+        // `cmd+click` is a thing a model will write. Dropping the `click`
+        // silently would deliver a plain command-click that looks correct.
+        let err = parse_modifiers("cmd+click").unwrap_err();
+        match err {
+            HidError::UnknownModifier { token, .. } => assert_eq!(token, "click"),
+            other => panic!("expected UnknownModifier, got {other:?}"),
+        }
+        // Even a token that IS a valid key: a modifier list has no key in it.
+        assert!(matches!(
+            parse_modifiers("shift+p").unwrap_err(),
+            HidError::UnknownModifier { .. }
+        ));
+    }
+
+    #[test]
+    fn buttons_parse_by_name_and_default_to_left() {
+        assert_eq!(MouseButton::parse("").unwrap(), MouseButton::Left);
+        assert_eq!(MouseButton::parse("  Right ").unwrap(), MouseButton::Right);
+        assert_eq!(MouseButton::parse("MIDDLE").unwrap(), MouseButton::Middle);
+        assert!(matches!(
+            MouseButton::parse("mouse2").unwrap_err(),
+            HidError::UnknownButton(_)
+        ));
+    }
+
+    #[test]
+    fn each_button_gets_its_own_event_type_family() {
+        // A view implementing `rightMouseDown:` never sees a `leftMouseDown`,
+        // whatever button number is stamped on it, so the type is what selects
+        // the handler and the three families must not be mixed up.
+        let (down, dragged, up) = MouseButton::Right.types();
+        assert_eq!(down, NSEventType::RightMouseDown);
+        assert_eq!(dragged, NSEventType::RightMouseDragged);
+        assert_eq!(up, NSEventType::RightMouseUp);
+
+        let (down, dragged, up) = MouseButton::Middle.types();
+        assert_eq!(down, NSEventType::OtherMouseDown);
+        assert_eq!(dragged, NSEventType::OtherMouseDragged);
+        assert_eq!(up, NSEventType::OtherMouseUp);
+
+        assert_eq!(MouseButton::Left.number(), 0);
+        assert_eq!(MouseButton::Right.number(), 1);
+        assert_eq!(MouseButton::Middle.number(), 2);
+    }
+
+    #[test]
+    fn a_drag_path_ends_exactly_where_it_was_aimed() {
+        // Not "within a rounding error": a drop a fraction of a point short is
+        // a drop into the neighbouring row.
+        let path = drag_path((100.0, 100.0), (300.0, 250.0));
+        assert_eq!(*path.last().unwrap(), (300.0, 250.0));
+        assert!(
+            !path.contains(&(100.0, 100.0)),
+            "the origin belongs to the mouse-down, not to the move run"
+        );
+    }
+
+    #[test]
+    fn a_drag_path_is_monotone_along_both_axes() {
+        let path = drag_path((0.0, 0.0), (100.0, -50.0));
+        for pair in path.windows(2) {
+            assert!(pair[1].0 > pair[0].0, "x must advance: {path:?}");
+            assert!(pair[1].1 < pair[0].1, "y must advance: {path:?}");
+        }
+    }
+
+    #[test]
+    fn step_count_holds_the_step_length_constant_between_its_bounds() {
+        // 24 points per step in the middle of the range...
+        assert_eq!(drag_step_count((0.0, 0.0), (0.0, 240.0)), 10);
+        // ...the floor for anything short, so a 5-point drag is still a run of
+        // moves and not one jump...
+        assert_eq!(drag_step_count((0.0, 0.0), (5.0, 0.0)), DRAG_MIN_STEPS);
+        assert_eq!(drag_step_count((7.0, 7.0), (7.0, 7.0)), DRAG_MIN_STEPS);
+        // ...and the ceiling for anything long, so one gesture cannot run for
+        // seconds.
+        assert_eq!(drag_step_count((0.0, 0.0), (4000.0, 0.0)), DRAG_MAX_STEPS);
+    }
+
+    #[test]
+    fn a_zero_length_drag_still_produces_a_usable_path() {
+        // Origin == destination is a caller error the tiers above catch, but it
+        // must not produce an empty path here: an empty path would mean a
+        // mouse-down with no moves, which is the shape a stuck drag has.
+        let path = drag_path((10.0, 10.0), (10.0, 10.0));
+        assert_eq!(path.len(), DRAG_MIN_STEPS);
+        assert!(path.iter().all(|p| *p == (10.0, 10.0)));
+    }
+
+    #[test]
+    fn a_non_finite_endpoint_does_not_blow_up_the_step_count() {
+        // `f64 as usize` saturates rather than wrapping, but NaN converts to 0,
+        // and 0 steps is a drag with no moves in it.
+        assert_eq!(
+            drag_step_count((0.0, 0.0), (f64::NAN, f64::NAN)),
+            DRAG_MIN_STEPS
+        );
+        assert_eq!(
+            drag_step_count((0.0, 0.0), (f64::INFINITY, 0.0)),
+            DRAG_MAX_STEPS
+        );
+    }
 
     #[test]
     fn parses_a_plain_key() {

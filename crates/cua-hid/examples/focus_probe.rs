@@ -109,6 +109,8 @@ fn main() {
             window_local: (x - win.frame.origin.x, y - win.frame.origin.y),
             wid: win.id,
             count: 1,
+            button: cua_hid::MouseButton::Left,
+            modifiers: cua_hid::Modifiers::empty(),
         },
         assist,
         &believes,
