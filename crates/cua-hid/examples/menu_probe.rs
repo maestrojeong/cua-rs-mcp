@@ -5,25 +5,24 @@
 //! timestamp is fresh, the focus notices land (`AXFrontmost` flips), and the
 //! private and public per-pid post routes behave identically.
 //!
-//! This probe bisects the two arms that remain interesting, back to back on the
-//! same target:
+//! It runs two arms back to back on the same target: `quiet`, the server's path
+//! — a pid-routed click with the cursor untouched — and `activate`, which hands
+//! the target real frontmost status first.
 //!
-//! | mode | what it does |
-//! |---|---|
-//! | `quiet` | the server's path — pid-routed click, cursor untouched |
-//! | `warp`  | move the real pointer there first, click, put it back |
-//!
-//! Measured so far on KakaoTalk's chat-room header menu: **neither opens it**.
-//! `warp` failing is the more informative half — it disproves "menu tracking
+//! A third arm used to warp the real pointer onto the control before clicking.
+//! Measured on KakaoTalk's chat-room header menu, it did not open the menu
+//! either, which is the more informative result: it disproves "menu tracking
 //! needs the real pointer under the control", which was the leading theory, and
-//! means the remaining difference is *around* the click rather than in it.
+//! means the remaining difference is *around* the click rather than in it. That
+//! conclusion is what the arm was for, and it has been drawn, so the arm and the
+//! pointer-warping function behind it are both gone.
 //!
 //! Two real bugs did fall out of running it, both now fixed in the library: the
 //! window-level filter excluded floating-level windows (so the click was stamped
 //! with another window's number), and the per-click `ApplicationDeactivated`
 //! tore down the target's key-window state mid-gesture.
 //!
-//! Usage: menu_probe <pid> <screen-x> <screen-y> [quiet|warp|both]
+//! Usage: menu_probe <pid> <screen-x> <screen-y> [quiet|activate|both]
 //!
 //! Detection is deliberately unfiltered: it dumps every top-level application
 //! child *and* every window of the pid. A pop-up menu is neither a child of the
@@ -136,7 +135,7 @@ fn main() {
     require_trusted().expect("Accessibility is not granted to this process");
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: menu_probe <pid> <screen-x> <screen-y> [quiet|activate|warp|both]");
+        eprintln!("usage: menu_probe <pid> <screen-x> <screen-y> [quiet|activate|both]");
         std::process::exit(2);
     }
     let pid: libc::pid_t = args[1].parse().expect("pid");
@@ -266,21 +265,6 @@ fn main() {
             really_activate(prev);
             println!("[activ] restored frontmost={:?}", real_frontmost());
         }
-    }
-
-    if mode == "warp" || mode == "both" {
-        dismiss(&app);
-        let r = cua_hid::click_by_moving_pointer(x, y, 1);
-        settle();
-        println!("[warp ] click={r:?}");
-        for line in app_children(&app) {
-            println!("   {line}");
-        }
-        println!("   -- windows --");
-        for line in pid_windows(pid) {
-            println!("   {line}");
-        }
-        dismiss(&app);
     }
 }
 

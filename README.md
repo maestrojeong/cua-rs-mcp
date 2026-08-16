@@ -34,7 +34,7 @@ the API, it is **what they are willing to take from you**.
 
 | | shared input | per-process, plus focus | cua-rs |
 |---|:--|:--|:--|
-| how a click travels | cursor warp, then the global HID queue | synthesized event routed to one pid | AX action; a pid-routed event only where no AX action exists |
+| how a click travels | cursor warp, then the global HID queue | synthesized event routed to one pid | AX action; a pid-routed event where no AX action, or on request no element, exists |
 | the pointer | moves | stays | stays |
 | keyboard focus | goes wherever the click lands | target is activated and held | unchanged |
 | your Space | can switch | can switch | never |
@@ -56,14 +56,16 @@ the background contract" in its own words. Which transport you get depends on ho
 the agent found the target: a tree gives you a pid, a screenshot gives you a
 pixel.
 
-cua-rs implements only the background half. That is the honest reason canvas and
-games are out: not that accessibility is missing — it is — but that there is no
-foreground path here to fall back to, by choice.
+cua-rs implements only the background half — and it turns out the background half
+reaches further than "accessibility only" suggests. The pid route needs a window
+and a point, not an element, so `click_in_window` can be aimed at a bare pixel of
+a canvas without a cursor warp. It just cannot tell you whether anything was
+there, which is why it is a separate opt-in tool rather than a fallback.
 
 So cua-rs is best described by what it will not do. There is no flag that warps
 the pointer, posts to the shared keyboard stream, or raises a window: those paths
 are absent, and [DESIGN.md](DESIGN.md) covers what that costs — no chords, no
-drag, no canvas.
+drag, and no verification once you aim at a pixel yourself.
 
 ## Install
 
@@ -149,7 +151,8 @@ names a place.
 |---|:--|
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
 | `find` · `wait_for` | search the snapshot; poll until text appears or goes |
-| `click` | `AXPress` → `AXPick` → `AXConfirm` |
+| `click` | `AXPress` → `AXPick` → `AXConfirm`, else a pid-routed event |
+| `click_in_window` | last resort: a bare point, no element, nothing verified |
 | `set_value` · `type_text` · `select_text` | write, append, select a substring |
 | `press_key` | Return / Escape / arrows via AX; chords are refused |
 | `scroll` · `perform_secondary_action` | page a scroll area; any AX verb |
@@ -176,12 +179,21 @@ Honest ones, not a roadmap.
 | Electron apps | yes — the tree builds lazily, so read twice |
 | Return, Escape, stepper arrows | yes, as AX verbs |
 | arbitrary chords (`⌘⇧P`), drag | **no** — no AX verb exists |
-| canvas apps, terminals | **no** — nothing to address, and no pixel fallback |
+| canvas apps, games | clickable, but you supply the coordinate and the confidence |
+| terminals | reading yes; typing no — they ignore AX writes |
 
 `set_value` replaces, `type_text` appends, and an app that only reacts to real
 key events will ignore both. Controls with no AX action at all get a mouse event
 routed to the target process by window id, reported as `delivery: pid`; if that
 is unavailable the action fails rather than touching your pointer.
+
+For a surface that publishes no elements at all, `click_in_window` takes a
+window-local point in points — a screenshot pixel divided by the scale
+`get_app_state` reports — and posts the click through the same pid route. It
+refuses a window id your last read did not produce, and an offset outside the
+window's live frame. What it will not do is confirm: there is no element to read
+back, so the result says `delivery: pid (no element)` and means the event was
+delivered to that pixel, not that anything was hit.
 
 ## The drawn cursor
 

@@ -103,6 +103,7 @@ fn advertises_the_expected_tools() {
         [
             "check_permissions",
             "click",
+            "click_in_window",
             "find",
             "get_app_state",
             "list_apps",

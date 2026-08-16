@@ -123,6 +123,22 @@ pub enum CoreError {
     #[error("no element of `{app}` covers ({x}, {y}) in its current snapshot. Coordinates are resolved against the snapshot's geometry, so the point has to be inside the window get_app_state read; call it again and click the element_index you want")]
     NoElementAtPoint { app: String, x: f32, y: f32 },
 
+    /// An elementless click could not be delivered.
+    ///
+    /// Deliberately separate from [`CoreError::PidClickUnavailable`], which is
+    /// phrased as "the accessibility route was tried and this is why the quiet
+    /// fallback also failed". Nothing was tried here: the caller asked for the
+    /// pid route by name, so there is no `original` accessibility error to
+    /// report and suggesting `perform_secondary_action` instead would be noise.
+    #[error("cannot click ({x:.0}, {y:.0}) inside window {wid} of `{app}`: {reason}")]
+    WindowClickRefused {
+        app: String,
+        wid: u32,
+        x: f64,
+        y: f64,
+        reason: String,
+    },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -200,6 +216,15 @@ pub struct AppState {
     pub actionable_count: usize,
     pub window_title: Option<String>,
     pub window_frame: Option<CGRect>,
+    /// CGWindowID of the window this walk describes, when one was verified.
+    ///
+    /// Reported because it is the only handle the elementless click tier can be
+    /// anchored to: with no element to name, the window is what the caller has
+    /// to identify, and guessing it from `list_apps` would defeat the point of
+    /// requiring evidence that the caller looked at this window through cua-rs.
+    /// `None` when no window could be verified, in which case there is nothing
+    /// safe to click blindly either.
+    pub window_id: Option<u32>,
     pub screenshot: Option<Screenshot>,
     /// Non-fatal problems worth telling the agent about, e.g. a missing screen
     /// recording grant when the tree itself came back fine.
@@ -599,6 +624,17 @@ pub enum Delivery {
     /// `SLEventPostToPid` SPI. The cursor never moves and nothing is raised or
     /// activated. This is the only synthesized-input delivery mode.
     Pid,
+    /// The same pid-routed SkyLight delivery as [`Delivery::Pid`], addressed to a
+    /// point in a window rather than to an element.
+    ///
+    /// Reported separately because the difference is not the mechanism, it is
+    /// what the result can be trusted to mean. Every other delivery mode
+    /// resolved an element first, so the result names a thing accessibility
+    /// agreed was there. This one names a pixel the caller chose. cua-rs
+    /// promises the event reached that pixel of that window and nothing more:
+    /// there is no element to inspect afterwards, so a caller that needs to know
+    /// whether anything was hit has to look for itself.
+    PidNoElement,
 }
 
 impl Delivery {
@@ -606,6 +642,7 @@ impl Delivery {
         match self {
             Delivery::Ax => "ax",
             Delivery::Pid => "pid",
+            Delivery::PidNoElement => "pid (no element)",
         }
     }
 }
@@ -875,6 +912,30 @@ impl Cua {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
             inner.acting(&app, return_state, |i| i.click(&app, target, count))
+        })
+    }
+
+    /// Click a window-local point directly, with no element behind it.
+    ///
+    /// The deliberate opt-in for canvas-style targets. `x`/`y` are points from
+    /// the window's top-left corner, and the result is labelled
+    /// `pid (no element)` because nothing verified that anything is there. See
+    /// [`Inner::click_in_window`] for the gates and for why this is not a
+    /// fallback from [`Cua::click`].
+    pub fn click_in_window(
+        &self,
+        app: &str,
+        window_id: u32,
+        x: f64,
+        y: f64,
+        count: u8,
+        return_state: bool,
+    ) -> Result<ActionResult> {
+        let app = app.to_string();
+        self.exec_action(true, move |inner| {
+            inner.acting(&app, return_state, |i| {
+                i.click_in_window(&app, window_id, x, y, count)
+            })
         })
     }
 
@@ -1210,6 +1271,7 @@ impl Inner {
             node_count,
             actionable_count,
             window_title,
+            window_id: window.as_ref().map(|w| w.id),
             window_frame: window.map(|w| w.frame).or(ax_frame),
             screenshot,
             warnings,
@@ -1603,6 +1665,153 @@ impl Inner {
             ui_changed: changed,
             delivery: Delivery::Pid,
             point: Some((x, y)),
+            overlay_target: Some((wid, info.pid)),
+            state: None,
+        })
+    }
+
+    /// Click a point in a window that accessibility does not describe.
+    ///
+    /// This is the one action in cua-rs that does not resolve an element first,
+    /// and it exists because a canvas is not a bug in accessibility — a
+    /// custom-drawn map, chart, or game view genuinely publishes no children, so
+    /// there is no element for `click` to find and nothing a better tree walk
+    /// would reveal. An agent looking at the screenshot has a pixel, and until
+    /// now that was a dead end by policy rather than by capability: [`PidClick`]
+    /// is `{pid, point, window_local, wid, count}` and never contained an
+    /// `Element`. Accessibility is how cua-rs normally decides *where* to click;
+    /// it was never how the click is delivered.
+    ///
+    /// It is a distinct entry point and never a fallback from [`Inner::click`].
+    /// "The point covers nothing" is exactly the shape of a typo, and clicking a
+    /// typo blindly is the worst outcome available here, so the caller has to
+    /// ask for this by name.
+    ///
+    /// # Coordinates are window-local
+    ///
+    /// `x`/`y` are measured from the window's top-left corner, in points — the
+    /// same space as the screenshot `get_app_state` returns, divided by its
+    /// `scale`. Screen coordinates were the obvious alternative and are worse:
+    /// the caller would have to add the window origin itself, and the sum would
+    /// silently address the wrong pixel the moment the user moved the window
+    /// between the read and the click. Window-local coordinates are re-anchored
+    /// to the live origin here, immediately before posting, so a window move
+    /// between the two calls is harmless rather than invisible.
+    ///
+    /// For the same reason this does not consult the snapshot's geometry and so
+    /// has no reason to reject an `acted_on` snapshot: there is no element whose
+    /// position could have gone stale. What it does require is that a snapshot
+    /// exists and describes this very window, which is the only available
+    /// evidence that the caller is aiming at something it actually looked at.
+    ///
+    /// # What this cannot do
+    ///
+    /// Verify. There is no element to re-read, so the post-action delta is the
+    /// only feedback available, and on a canvas even that is empty. A successful
+    /// return means the events were accepted for delivery to that pixel of that
+    /// window — not that anything was there.
+    fn click_in_window(
+        &mut self,
+        query: &str,
+        wid: u32,
+        x: f64,
+        y: f64,
+        count: u8,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+        let refuse = |reason: String| CoreError::WindowClickRefused {
+            app: info.name.clone(),
+            wid,
+            x,
+            y,
+            reason,
+        };
+
+        if !cua_hid::skylight_available() {
+            return Err(refuse(
+                "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
+            ));
+        }
+        if x < 0.0 || y < 0.0 {
+            return Err(refuse(
+                "coordinates are window-local and measured from the window's top-left corner, so neither can be negative".into(),
+            ));
+        }
+
+        // Gate 1: the caller must have read this window through cua-rs. Without
+        // an element, the window id is the whole of the addressing, and an id
+        // taken from anywhere else is an id whose contents the caller has never
+        // seen.
+        let snapshot_wid = self
+            .snapshots
+            .get(&info.pid)
+            .and_then(|snap| snap.window.as_ref())
+            .map(|w| w.id);
+        match snapshot_wid {
+            Some(seen) if seen == wid => {}
+            Some(seen) => {
+                return Err(refuse(format!(
+                    "the last get_app_state of this app read window {seen}, not {wid}. Read the window you mean to click first"
+                )));
+            }
+            None => {
+                return Err(refuse(
+                    "no verified window has been read for this app. Call get_app_state first and pass the window_id it reports".into(),
+                ));
+            }
+        }
+
+        // Gate 2: the window still exists, still belongs to this pid, and is
+        // still an ordinary window. Re-enumerated here rather than trusted from
+        // the snapshot, because a pid-addressed event carrying a stale window id
+        // is exactly the thing that must not be sent.
+        let live_windows = cua_capture::list_windows()
+            .map_err(|e| refuse(format!("could not revalidate the window before input: {e}")))?;
+        let live_window =
+            live_window_for_pid_click(&live_windows, wid, info.pid).map_err(refuse)?;
+
+        // Only now does a screen point exist: the live origin is what the
+        // window-local coordinates are measured against.
+        let (sx, sy) = (
+            live_window.frame.origin.x + x,
+            live_window.frame.origin.y + y,
+        );
+        screen_point_inside(&live_window, sx, sy).map_err(|frame| {
+            refuse(format!(
+                "the window is currently {:.0}x{:.0} points, so ({x:.0}, {y:.0}) falls outside it (frame {frame})",
+                live_window.frame.size.width, live_window.frame.size.height
+            ))
+        })?;
+
+        let before = self.window_fingerprint(info.pid);
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        let assist = window_focus_assist(info.pid, &live_window);
+        cua_hid::click_background_pid(
+            cua_hid::PidClick {
+                pid: info.pid,
+                point: (sx, sy),
+                window_local: (x, y),
+                wid,
+                count,
+            },
+            assist,
+            &believes_frontmost,
+        )
+        .map_err(|e| refuse(e.to_string()))?;
+
+        Ok(ActionResult {
+            verb: format!("SkyLight pid-routed {count}-click at window-local ({x:.0}, {y:.0})"),
+            target: format!(
+                "window {wid} of {} at no element — the caller aimed this",
+                info.name
+            ),
+            ui_changed: self.changed_since(info.pid, before),
+            delivery: Delivery::PidNoElement,
+            point: Some((sx, sy)),
             overlay_target: Some((wid, info.pid)),
             state: None,
         })
@@ -2084,34 +2293,62 @@ fn current_window_for_pid_click(
     x: f64,
     y: f64,
 ) -> std::result::Result<WindowInfo, String> {
-    let live = windows
+    let live = live_window_for_pid_click(windows, snapshot.id, pid)?;
+    screen_point_inside(&live, x, y).map_err(|frame| {
+        format!(
+            "target point ({x:.0}, {y:.0}) is outside the current frame of window {} ({frame}); the AX element and window snapshot drifted apart. Call get_app_state again",
+            live.id
+        )
+    })?;
+    Ok(live)
+}
+
+/// Find the one live window a pid-routed event may be stamped with.
+///
+/// Split out of [`current_window_for_pid_click`] because the elementless path
+/// needs the live *frame* before it has a screen point at all: its coordinates
+/// arrive window-local, so the origin this returns is what turns them into a
+/// point to check. The identity rules are the same either way — matching by id
+/// *and* pid rejects both a closed window and a recycled CGWindowID, and
+/// `is_plausible_target` keeps the event off the menu bar and other system
+/// layers.
+fn live_window_for_pid_click(
+    windows: &[WindowInfo],
+    wid: u32,
+    pid: libc::pid_t,
+) -> std::result::Result<WindowInfo, String> {
+    windows
         .iter()
-        .find(|w| w.id == snapshot.id && w.pid == pid && w.is_plausible_target())
+        .find(|w| w.id == wid && w.pid == pid && w.is_plausible_target())
+        .cloned()
         .ok_or_else(|| {
             format!(
-                "window {} no longer belongs to pid {pid}; it was closed, replaced, or its id was recycled. Call get_app_state again",
-                snapshot.id
+                "window {wid} does not currently belong to pid {pid}; it was closed, replaced, its id was recycled, or it is not an ordinary application window. Call get_app_state again and use the window_id it reports"
             )
-        })?;
+        })
+}
 
-    let f = live.frame;
+/// Whether a screen point lies within a window, to within a point of its edge.
+///
+/// The tolerance exists because AX frames and CGWindow frames disagree by
+/// fractions of a point, so an activation point on a window's own border would
+/// otherwise fail a strict comparison. On failure returns the frame, rendered,
+/// so each caller can phrase its own diagnosis around it.
+fn screen_point_inside(w: &WindowInfo, x: f64, y: f64) -> std::result::Result<(), String> {
     const EDGE_TOLERANCE: f64 = 1.0;
+    let f = w.frame;
     let inside = x >= f.origin.x - EDGE_TOLERANCE
         && y >= f.origin.y - EDGE_TOLERANCE
         && x <= f.origin.x + f.size.width + EDGE_TOLERANCE
         && y <= f.origin.y + f.size.height + EDGE_TOLERANCE;
-    if !inside {
-        return Err(format!(
-            "target point ({x:.0}, {y:.0}) is outside the current frame of window {} ({:.0},{:.0} {:.0}x{:.0}); the AX element and window snapshot drifted apart. Call get_app_state again",
-            live.id,
-            f.origin.x,
-            f.origin.y,
-            f.size.width,
-            f.size.height
-        ));
+    if inside {
+        Ok(())
+    } else {
+        Err(format!(
+            "{:.0},{:.0} {:.0}x{:.0}",
+            f.origin.x, f.origin.y, f.size.width, f.size.height
+        ))
     }
-
-    Ok(live.clone())
 }
 
 /// Pick the element a coordinate names, from a snapshot's frames.
@@ -2400,7 +2637,10 @@ mod tests {
         let recycled = win(7, 99, 0.0, 0.0, 800.0, 600.0);
         let err = current_window_for_pid_click(&[recycled], &snapshot, 42, 100.0, 100.0)
             .expect_err("same window id owned by another pid must fail closed");
-        assert!(err.contains("no longer belongs to pid 42"), "got {err}");
+        assert!(
+            err.contains("does not currently belong to pid 42"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2541,6 +2781,49 @@ mod tests {
     fn delivery_labels_are_stable() {
         assert_eq!(Delivery::Ax.as_str(), "ax");
         assert_eq!(Delivery::Pid.as_str(), "pid");
+        // The parenthetical is the load-bearing part of this label, not
+        // decoration: it is the only place a caller learns that this result
+        // confirms delivery and not that anything was hit.
+        assert_eq!(Delivery::PidNoElement.as_str(), "pid (no element)");
+    }
+
+    #[test]
+    fn a_window_local_click_is_re_anchored_to_the_window_that_moved() {
+        // The whole reason `click_in_window` takes window-local coordinates: the
+        // caller read a screenshot of a window at one place, the user dragged the
+        // window, and the click must still land on the same pixel of the same
+        // content rather than on whatever now occupies the old screen point.
+        let live = win(7, 42, 500.0, 300.0, 800.0, 600.0);
+        let resolved = live_window_for_pid_click(std::slice::from_ref(&live), 7, 42)
+            .expect("the window is present and owned by this pid");
+        let (x, y) = (120.0, 40.0);
+        let screen = (resolved.frame.origin.x + x, resolved.frame.origin.y + y);
+        assert_eq!(screen, (620.0, 340.0));
+        assert!(screen_point_inside(&resolved, screen.0, screen.1).is_ok());
+    }
+
+    #[test]
+    fn a_window_local_click_past_the_windows_size_is_refused() {
+        let live = win(7, 42, 500.0, 300.0, 800.0, 600.0);
+        // 900 points across an 800-point-wide window. Adding the origin makes
+        // this a perfectly valid *screen* point that happens to be over the
+        // window next door, which is precisely the mistake to refuse.
+        let err = screen_point_inside(&live, 500.0 + 900.0, 300.0 + 40.0)
+            .expect_err("a point past the window's width must not be posted");
+        assert!(err.contains("500,300 800x600"), "got {err}");
+    }
+
+    #[test]
+    fn a_window_local_click_will_not_borrow_another_apps_window_id() {
+        // A pid-addressed event stamped with a window id belonging to someone
+        // else is the one outcome this tier must make impossible.
+        let other_app = win(7, 99, 0.0, 0.0, 800.0, 600.0);
+        let err = live_window_for_pid_click(&[other_app], 7, 42)
+            .expect_err("a window owned by another pid must fail closed");
+        assert!(
+            err.contains("does not currently belong to pid 42"),
+            "got {err}"
+        );
     }
 
     #[test]

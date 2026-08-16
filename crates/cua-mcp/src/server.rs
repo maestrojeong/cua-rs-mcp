@@ -203,6 +203,36 @@ struct ClickArgs {
     count: Option<u8>,
 }
 
+/// Arguments for the elementless click.
+///
+/// Deliberately does not reuse `ActionArgs`: every field it carries is about
+/// naming an element, and offering `element_index` here would blur the one
+/// distinction this tool exists to make. There is no target to pin, only a
+/// window and a pixel.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClickInWindowArgs {
+    /// App name, bundle id or pid, as for `get_app_state`.
+    app: String,
+    /// The `window_id` reported by the most recent `get_app_state` of this app.
+    /// Any other id is refused: without an element, this is the only thing the
+    /// click is anchored to.
+    window_id: u32,
+    /// Horizontal offset in POINTS from the window's top-left corner — not
+    /// screen coordinates, and not screenshot pixels. Divide a screenshot pixel
+    /// by the `px per point` scale that `get_app_state` reports.
+    x: f64,
+    /// Vertical offset in POINTS from the window's top-left corner, measured
+    /// downward. Same scale conversion as `x`.
+    y: f64,
+    /// Click count. 2 for a double-click.
+    #[serde(default)]
+    count: Option<u8>,
+    /// Re-read the window afterwards and attach what changed. On a canvas the
+    /// delta is usually empty, which is not evidence either way.
+    #[serde(default)]
+    return_state: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetValueArgs {
     #[serde(flatten)]
@@ -418,7 +448,19 @@ impl CuaServer {
             state.app.pid,
             state.snapshot_id,
             state.snapshot_id,
-            state.window_title.as_deref().unwrap_or("(untitled)"),
+            match state.window_id {
+                // Printed rather than kept internal because it is the only
+                // handle `click_in_window` accepts, and that tool refuses an id
+                // this app's latest read did not produce.
+                Some(id) => format!(
+                    "{}  (window_id={id})",
+                    state.window_title.as_deref().unwrap_or("(untitled)")
+                ),
+                None => format!(
+                    "{}  (no verified window id)",
+                    state.window_title.as_deref().unwrap_or("(untitled)")
+                ),
+            },
             state.node_count,
             state.actionable_count,
         );
@@ -456,6 +498,26 @@ impl CuaServer {
         let count = a.count.unwrap_or(1).clamp(1, 3);
         match self
             .native(move |c| c.click(&app, target, count, want_state))
+            .await
+        {
+            Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "LAST RESORT: click a bare point inside a window, with no element behind it. Use this ONLY for custom-drawn surfaces that genuinely publish no children — maps, charts, canvases, game views — after `click` and `find` have shown there is no element to address. It is not a retry for a `click` that failed and it is never chosen automatically, because a point that covers nothing is indistinguishable from a typo. x and y are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), NOT screen coordinates: they are re-anchored to the window's live position just before the event is sent, so moving the window between the read and the click is harmless. Delivery is the same pid-routed SkyLight path as `click` — the cursor, keyboard focus, frontmost app and Space are untouched — but the result is labelled `pid (no element)` because NOTHING WAS VERIFIED. There is no element to inspect afterwards, so a success means only that the events were delivered to that pixel of that window; whether anything was there, and whether it was the right thing, is entirely the caller's aim. Requires that the most recent get_app_state of this app read this same window_id."
+    )]
+    async fn click_in_window(
+        &self,
+        Parameters(a): Parameters<ClickInWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let (wid, x, y) = (a.window_id, a.x, a.y);
+        let want_state = a.return_state.unwrap_or(true);
+        let count = a.count.unwrap_or(1).clamp(1, 3);
+        match self
+            .native(move |c| c.click_in_window(&app, wid, x, y, count, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -711,6 +773,9 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         match r.delivery {
             cua_core::Delivery::Pid => {
                 "  (input synthesized and routed to the target process via the private SkyLight SPI: cursor, keyboard focus and frontmost app untouched)"
+            }
+            cua_core::Delivery::PidNoElement => {
+                "  (same pid-routed SkyLight delivery, but aimed at a pixel rather than an element: NOTHING was verified to be there, and there is no element to re-read. This confirms delivery only)"
             }
             cua_core::Delivery::Ax => {
                 "  (accessibility action: cursor, focus and frontmost app untouched)"

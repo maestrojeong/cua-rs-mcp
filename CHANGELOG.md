@@ -5,6 +5,76 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.5.0
+
+### `click_in_window`: a click with no element behind it
+
+The gap this closes is a canvas. A custom-drawn map, chart, or game view
+genuinely publishes no children, so `click` has nothing to resolve and no better
+tree walk would help. An agent reading the screenshot has a pixel, and until now
+that was a dead end — by *policy*, it turns out, not by capability. `PidClick` is
+`{pid, point, window_local, wid, count}` and never contained an `Element`.
+Accessibility is how cua-rs decides *where* to click; it was never how the click
+is delivered.
+
+It is a separate tool and never a fallback from `click`, because "this point
+covers nothing" is exactly the shape of a typo and blind-clicking a typo is the
+worst outcome available here. Callers have to ask for it by name.
+
+Coordinates are **window-local points** — from the window's top-left corner,
+which is the screenshot's own space divided by the `px per point` scale
+`get_app_state` reports. Screen coordinates would have made the caller add the
+window origin itself and would silently address the wrong pixel the moment the
+user moved the window between the read and the click. These are re-anchored to
+the live origin just before posting, so a window move is harmless.
+
+Three gates, none advisory: the `window_id` must be the one this app's most
+recent `get_app_state` read (`get_app_state` now prints `window_id=` for exactly
+this purpose); that window must still exist, still belong to this pid, and still
+be an ordinary window, re-enumerated rather than trusted from the snapshot; and
+the offset must land inside the window's live frame, with negatives refused
+outright.
+
+The result is labelled `delivery: pid (no element)` — a distinct label, not a
+footnote on `pid`. Every other delivery mode resolved an element first and so
+names something accessibility agreed was there; this one names a pixel the caller
+chose. **It confirms delivery and nothing else.** There is no element to inspect
+afterwards, so the post-action delta is the only feedback, and on a canvas even
+that is empty.
+
+Delivery is unchanged: the same pid-routed SkyLight path, the same synthesized
+activation notice. The cursor, keyboard focus, frontmost app and Space are still
+untouched.
+
+Measured on KakaoTalk's chat-list filter chips with the app in the background and
+Terminal frontmost throughout: all three gates refused as specified, and the
+accepted click switched the filter and switched it back.
+
+### The pointer warp is gone
+
+`cua_hid::click_by_moving_pointer` warped the real cursor to a screen point,
+clicked through the shared HID stream, and warped back. It existed for
+custom-drawn controls that advertise no `AXPress` and only respond to a real
+click — and every one of those is now reachable through the pid tier instead.
+Nothing called it; keeping a working pointer warp in the tree once its
+justification had evaporated was leaving a temptation, not a fallback.
+
+Deleting it took the last `CGWarpMouseCursorPosition` reference in the workspace
+with it, so the absence is now checkable rather than merely documented: no edit
+can reintroduce a cursor warp without adding that import back first. The
+`menu_probe` example loses its `warp` arm, whose conclusion — that the real
+pointer under the control is *not* what a stubborn menu is waiting for — had
+already been drawn.
+
+`post_chord` stays, still unreachable from the server, until chords land in the
+pid tier.
+
+### Other
+
+- `AppState` gains `window_id`, printed in the `get_app_state` header.
+- `Delivery` gains `PidNoElement`. Callers matching on it exhaustively will need
+  the new arm.
+
 ## 0.4.2
 
 ### The drawn cursor no longer floats over another app

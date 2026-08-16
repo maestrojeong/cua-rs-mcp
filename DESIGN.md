@@ -58,18 +58,21 @@ AX cannot express everything:
 | context menu | `AXShowMenu` | works |
 | page a scroll area | `AXScroll*ByPage` | works |
 | set text | `AXValue` write | works, but *replaces* |
-| **arbitrary chord** (`⌘⇧P`) | — | **no verb exists** |
-| **drag** | — | **no verb exists** |
-| **pixel-only surfaces** | — | nothing to address |
+| **arbitrary chord** (`⌘⇧P`) | — | **no verb exists**, still refused |
+| **drag** | — | **no verb exists**, still refused |
+| pixel-only surfaces | — | nothing to address — reachable anyway, see below |
 
-So the honest ceiling is: cua-rs drives *structured* UI extremely well and
-cannot drive canvas. That is an acceptable trade for the coexistence property,
-and it is written into the README rather than hidden.
+Those rows are softer than they look. "No verb exists" is a statement about
+accessibility, not about delivery, and the pid tier delivers events without
+consulting accessibility at all.
 
-Three of those rows are softer than they look. "No verb exists" is a statement
-about accessibility, not about delivery, and the pid tier delivers events without
-consulting accessibility at all — see §11 for what that makes reachable without
-reopening shared input.
+The last row has since moved. `click_in_window` clicks a bare window-local point
+with no element behind it, which makes a canvas reachable — deliberately opt-in,
+labelled `delivery: pid (no element)`, and explicitly unverified, because there
+is no element to read back. §11 has the gates and the measurement. The two rows
+above it are still open, and the honest ceiling is now: cua-rs drives
+*structured* UI extremely well, can be aimed at an unstructured surface when the
+caller accepts responsibility for the aim, and still cannot drag or chord.
 
 ### `press_key`: decided
 
@@ -665,7 +668,7 @@ the honest, focus-stealing fallback.
 
 ---
 
-## 11. Planned: widen the pid tier, never the shared tier
+## 11. Widening the pid tier, never the shared tier
 
 The gaps in §1's capability table — no chords, no drag, no canvas — read like
 consequences of choosing accessibility. Most of them are not. They are
@@ -681,36 +684,73 @@ to exist.
 
 ### The tiers
 
-| | today | planned |
+| | before | now |
 |---|:--|:--|
 | element with an AX action | `AXPress`/`AXPick`/`AXConfirm` | unchanged |
 | element with a frame, no action | pid click at its point | unchanged |
-| **point with no element** | refused (`NoElementAtPoint`) | pid click, window-scoped and opt-in |
-| **drag** | refused | pid down / moves / up within one window |
-| **chords** | refused | `press_chord_background_pid`, already written |
-| **pixel-precise scroll** | `AXScroll*ByPage` only | pid wheel events |
+| **point with no element** | refused (`NoElementAtPoint`) | **`click_in_window`, window-scoped and opt-in** |
+| drag | refused | still refused — planned |
+| chords | refused | still refused — `press_chord_background_pid` written, unwired |
+| pixel-precise scroll | `AXScroll*ByPage` only | still page-only — planned |
 
-### Point with no element — the one that unlocks canvas
+Shipped in tiers rather than at once. The elementless click was ready — only the
+policy gate stood in the way — while a drag needs a story for the mouse-up that
+must be sent even when a move fails partway, and a chord needs one for a
+keystroke that lands in the wrong process. Bundling them would have delayed the
+finished piece and made each one's safety review harder to read.
 
-An agent that reads a screenshot has a pixel, not an element. Today that is a
-dead end by policy, not by capability. The plan is a distinct opt-in — a
-`click_in_window` tool, or an explicit `require_element: false` — never a silent
-fallback from `click`, because "the point covers nothing" is exactly the shape of
-a typo and blind-clicking a typo is the worst outcome in this project.
+### Point with no element — the one that unlocked canvas
 
-Gates, all of which already exist in some form:
+An agent that reads a screenshot has a pixel, not an element. That was a dead
+end by policy, not by capability. `click_in_window` is the distinct opt-in, never
+a silent fallback from `click`, because "the point covers nothing" is exactly the
+shape of a typo and blind-clicking a typo is the worst outcome in this project.
 
-1. the caller names a window id from a snapshot, since without an element the
-   window is the only thing left to anchor to;
-2. the point lies inside that window's *live* frame, re-read immediately before
-   posting, which is the check `current_window_for_pid_click` already performs;
-3. the result says `delivery: pid (no element)`, so a caller can never mistake an
-   unverified click for a verified one.
+Coordinates are **window-local points**, measured from the window's top-left
+corner — the screenshot's own space, divided by the `px per point` scale
+`get_app_state` reports. Screen coordinates were the obvious alternative and are
+worse in the way that matters: the caller would have to add the window origin
+itself, and the sum would silently address the wrong pixel the moment the user
+moved the window between the read and the click. Window-local coordinates are
+re-anchored to the live origin immediately before posting, so a window move
+between the two calls is harmless instead of invisible. It also means this path
+consults no snapshot geometry, and so has no reason to reject an `acted_on`
+snapshot: there is no element whose position could have gone stale.
 
-What this cannot do is verify. There is no element to inspect afterwards, so the
+Three gates, checked in order, none of them advisory:
+
+1. the caller names a `window_id`, and it must be the one this app's most recent
+   `get_app_state` read. Without an element the window is the whole of the
+   addressing, and an id from anywhere else is an id whose contents the caller
+   has never seen. `get_app_state` now prints `window_id=` in its header for
+   exactly this purpose;
+2. that window still exists, still belongs to this pid, and is still an ordinary
+   application window — re-enumerated here rather than trusted from the
+   snapshot, because a pid-addressed event carrying a stale or recycled window id
+   is precisely the thing that must not be sent;
+3. the offset lands inside the window's *live* frame. Negative offsets are
+   refused outright, since window-local coordinates cannot be negative, and an
+   offset past the window's width would otherwise be a perfectly valid screen
+   point over the window next door.
+
+The result is labelled `delivery: pid (no element)` — a distinct label, not a
+footnote on `pid`, because the difference is not the mechanism but what the
+result can be trusted to mean. Every other delivery mode resolved an element
+first and so names something accessibility agreed was there. This one names a
+pixel the caller chose.
+
+What it cannot do is verify. There is no element to inspect afterwards, so the
 post-action delta is the only feedback, and on a canvas even that is empty. The
-tool description has to say that plainly: aiming is the caller's job, and cua-rs
-is only promising the event reached that pixel of that window.
+tool description says so plainly: aiming is the caller's job, and cua-rs is only
+promising the event reached that pixel of that window.
+
+Measured on KakaoTalk's chat-list filter chips, background, with Terminal
+frontmost throughout: all three gates refused as specified, and the accepted
+click switched the filter to 안읽음 and back. The window's traffic lights went
+from grey to coloured across the click, which is the app agreeing it became key.
+`ui_changed` reported `no` both times — the fingerprint heuristic sees neither a
+title nor a focus change here — which is the §10 false negative doing exactly
+what §10 says it does, and the reason `return_state` exists.
 
 ### Drag
 
@@ -732,9 +772,18 @@ text can be read back, so a miss is provable rather than assumed.
 
 ### What stays closed
 
-`post_chord` and `click_by_moving_pointer` remain unreachable from the server.
-They exist so the shared-input path is visible in one file and can be reasoned
-about; if the pid tier above lands, they should be deleted rather than left as a
-temptation. Global HID delivery and cursor warping are not planned, not gated
-behind a flag, and not a future option: they are the thing this project exists
-to not do.
+`post_chord` remains unreachable from the server. It exists so the shared-input
+keyboard path is visible in one file and can be reasoned about, and it should be
+deleted once chords land in the pid tier.
+
+Its mouse counterpart is already gone. `click_by_moving_pointer` warped the real
+pointer, clicked through the shared HID stream, and warped back; every control it
+existed for is now reachable by the elementless pid click, so keeping a working
+pointer warp in the tree was leaving a temptation rather than a fallback. Its
+deletion took the last `CGWarpMouseCursorPosition` reference with it, and that
+absence is now the check: nothing in the workspace imports the only API that can
+move the user's cursor, so no edit elsewhere can reintroduce a warp without
+adding the import back first.
+
+Global HID delivery and cursor warping are not planned, not gated behind a flag,
+and not a future option: they are the thing this project exists to not do.
