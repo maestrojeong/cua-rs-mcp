@@ -193,9 +193,18 @@ and still have no key window at all.
 
 The AX path leaves nothing on screen — which also means you cannot see the agent
 working. `cua-overlay` is a separate binary that draws a click-through arrow where
-an action landed, never focused, never your real cursor. `cua-rs` spawns it if it
-sits next to the binary; **the prebuilt release ships `cua-rs` alone**, so build
-the workspace to get both.
+an action landed, never focused, never your real cursor.
+
+**The installer ships it, so this is on by default.** From the first action, an
+arrow appears over the window being driven and follows each `click`, `press_key`
+or `scroll` to the element it landed on, with a ring flashed on a click. It is
+click-through, so it never intercepts anything you do, and it hides itself when
+the driven app is not frontmost — you see the agent when you are looking at its
+window, and nothing when you are not.
+
+`cua-rs` spawns it as a sibling of its own binary, so keep the two together;
+`cargo build --workspace` and `install.sh` both produce that layout. Delete
+`cua-overlay` and the server carries on silently.
 
 <p align="center"><img src="assets/cursor-demo.png" width="640" alt="A mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
 

@@ -12,7 +12,7 @@ ARCH="$(uname -m)"
 # macOS only, by construction: this server is a wrapper around the macOS
 # Accessibility API and ScreenCaptureKit. There is nothing to port.
 case "$OS-$ARCH" in
-  Darwin-arm64)  ASSET="cua-rs-macos-arm64" ;;
+  Darwin-arm64)  ASSET="cua-rs-macos-arm64"; OVERLAY_ASSET="cua-overlay-macos-arm64" ;;
   Darwin-x86_64) echo "No prebuilt Intel-mac yet."; NEED_SRC=1 ;;
   *)             echo "cua-rs is macOS-only (got $OS-$ARCH)."; exit 1 ;;
 esac
@@ -23,10 +23,12 @@ if [ "${NEED_SRC:-0}" = "1" ]; then
 fi
 
 if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  BASE_URL="https://github.com/$REPO/releases/latest/download"
 else
-  URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+  BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 fi
+URL="$BASE_URL/$ASSET"
+OVERLAY_URL="$BASE_URL/$OVERLAY_ASSET"
 
 if [ -n "${CUA_BIN_DIR:-}" ]; then
   DEST="$CUA_BIN_DIR"
@@ -50,6 +52,27 @@ chmod +x "$DEST/cua-rs"
 xattr -d com.apple.quarantine "$DEST/cua-rs" 2>/dev/null || true
 
 echo "Installed: $DEST/cua-rs"
+
+# The drawn cursor. `cua-rs` resolves it as a sibling of its own canonicalized
+# executable path, so it has to land in the same directory under the exact name
+# `cua-overlay` -- not on PATH, not in a subdirectory.
+#
+# Optional on purpose: a pinned CUA_VERSION older than the first release that
+# carried this asset returns 404, and that is not an install failure. The server
+# treats a missing overlay as "draw nothing", so skipping leaves a working
+# install with no on-screen feedback rather than no install at all. Downloaded
+# to a temp path first so a 404 cannot leave a truncated file where the server
+# will later try to exec it.
+OVERLAY_TMP="$DEST/.cua-overlay.$$"
+if curl -fsSL "$OVERLAY_URL" -o "$OVERLAY_TMP" 2>/dev/null; then
+  mv -f "$OVERLAY_TMP" "$DEST/cua-overlay"
+  chmod +x "$DEST/cua-overlay"
+  xattr -d com.apple.quarantine "$DEST/cua-overlay" 2>/dev/null || true
+  echo "Installed: $DEST/cua-overlay  (the drawn cursor)"
+else
+  rm -f "$OVERLAY_TMP"
+  echo "Note: this release has no $OVERLAY_ASSET -- skipping the drawn cursor."
+fi
 
 # TCC grants attach to the launching process, so the install path alone is not
 # enough -- tell the user what actually has to be approved.
