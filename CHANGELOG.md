@@ -7,6 +7,26 @@ caller.
 
 ## Unreleased
 
+### An `AXMenuItem` does act on the first `AXPress`
+
+DESIGN.md §10 carried, from one observation, that it does not — that the first
+press only selects the item and a second is needed to make it act. Characterized
+now with `cargo run -p cua-ax --example menu_item_press`, a new probe: six arms ×
+10 trials × 3 menu-bar toggles in two apps, **180 presses, all 180 acting on the
+first press**. No trial in any arm was ever rescued by a second press.
+
+What the original observation saw was the read. Polling the pressed item every
+50 ms, the change takes 50 ms to 1.7 s to become readable — up to fourteen times
+the 120 ms settle `ui_changed` uses. A read at a fixed short delay reports a
+press that worked as having done nothing, and pressing again then undoes it on a
+toggle or looks like success on a dialog. `AXSelected` on a menu item is settable
+and inert: the write never reads back, and it changes nothing about whether the
+press works.
+
+Nothing in the shipped code changed. The practical note for callers is in §10:
+after acting on a menu item, re-read that element rather than trusting the
+returned diff.
+
 ### CI notices a directory under `crates/` that is not a crate
 
 `crates/cua-sky/examples/` sat in the working tree as debris from an abandoned

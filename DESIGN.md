@@ -1273,6 +1273,95 @@ against the pixel count and keeping the one whose horizontal and vertical
 px-per-point agree, and both the covered rect and the window's own frame are
 reported.
 
+**An `AXMenuItem` does act on the first `AXPress`. The old claim that it does
+not was a read taken too early.** This section carried, from a single
+observation, that "an `AXMenuItem` does not reliably act on the first `AXPress`
+— the first press selected it and the second opened the dialog", with the
+`return_state` diff reporting exactly one changed line, `(selected)`. That has
+now been characterized, and it does not reproduce.
+
+The target has to be a menu that publishes accessibility at all, so this is not
+about the pop-up above: a menu opened by a click is a `CGWindow` with no AX
+representation and has no `AXMenuItem` to press. It is about the menu-bar
+hierarchy every app here publishes — `AXMenuBar` → `AXMenuBarItem` → `AXMenu` →
+`AXMenuItem`, each item advertising `AXCancel`, `AXPress`, `AXPick`. Three
+harmless, reversible toggles were used, deliberately across both ways an app
+writes one: Calculator's View → RPN mode and TextEdit's View → Use Dark
+Background for Windows carry a checkmark, and Calculator's View → Show/Hide
+Thousands Separators flips its own title instead. The read-back is the pressed
+element's own title and `AXMenuItemMarkChar`, so nothing is inferred from a
+window diff. `cargo run -p cua-ax --example menu_item_press` is the probe.
+
+**Six arms × 10 trials × 3 items: 180 presses, 180 acted on the first press.**
+
+| arm | result |
+|---|:--|
+| menu never opened, one `AXPress` on the item | 10/10 on each item |
+| menu opened first by `AXPress` on its `AXMenuBarItem` | 10/10 on each item |
+| `AXSelected` written `true`, then one `AXPress` | 10/10 on each item |
+| press again if the first press appeared not to act | the second press never fired |
+| alternating, no state restored between trials, so consecutive presses toggle in opposite directions — run both with the menu opened and with it closed | 10/10 on each item, both directions |
+
+Not one trial in any run was rescued by a second press: the "acted within two
+presses" count equalled the "acted on one press" count in every arm of every
+run, including the arms scored before the probe was finished.
+
+**What the original observation actually saw is the read latency.** Polling the
+item every 50 ms after the press, the time until the change became *readable*:
+
+| item | menu closed | menu opened first |
+|---|---|---|
+| TextEdit, Use Dark Background | 50–56 ms | 370–386 ms |
+| Calculator, RPN mode | 803–1033 ms | 1358–1437 ms |
+| Calculator, Thousands Separators | 821–1042 ms | 1371–1708 ms |
+
+Up to 1.7 s, against the 120 ms settle `ui_changed` uses — fourteen times it. A
+read at any fixed short delay reports a press that worked as having done
+nothing, and the natural response is to press again. On a toggle that undoes the
+first press; on an item that opens a dialog it looks exactly like "the second one
+worked". That is the whole of the original finding, and it is a bug in the
+observation rather than in `AXPress`.
+
+Two things fall out of it that were not the question:
+
+- **Opening the menu first makes it slower, and is not needed.** Every item acted
+  with the menu never opened, and the latency was consistently *lower* that way.
+  There is no first-press-selects step to get past.
+- **`AXSelected` is settable and means nothing here.** `is_settable("AXSelected")`
+  is true on every item tried, the write returns success, and it never read back
+  `true` — 0/180 in the arms that write it — nor did it change whether the press
+  worked. The one place `AXSelected` did read `true` after a press was an early
+  run against TextEdit's Show/Hide Tab Bar item with the menu opened first, 10/10.
+  That is the menu's own highlight while it is on screen, which is what the
+  original `(selected)` diff line was: the menu was open, so one row was
+  highlighted, and the diff attributed the highlight to the press.
+
+The probe recorded the frontmost pid before and after, because pressing a
+*background* app's `AXMenuBarItem` is the obvious way this could have cheated —
+the menu bar only ever shows the frontmost app's menus. It never changed: 60
+presses against TextEdit with a terminal frontmost throughout, and the Calculator
+runs with Finder or a terminal frontmost.
+
+Two smaller measurements from the same sessions, recorded because they will
+otherwise be rediscovered:
+
+- **A menu item's `AXEnabled` is not a static property.** TextEdit's View items
+  read `enabled=false` before that menu had ever been opened and `true`
+  afterwards; Finder's window-scoped View items (Show Path Bar, Hide Sidebar)
+  read `false` with no Finder window open. AppKit validates a menu item when the
+  menu is about to be shown, so "disabled" can equally mean "not yet validated",
+  and a caller must not read it as a refusal.
+- **Calculator quit on its own** partway through one run, after roughly 120
+  presses in that session. Not reproduced across four later runs of the same
+  length. Recorded, not explained.
+
+The consequence for cua-rs is not about `AXPress`. It is that the 120 ms
+`ui_changed` settle cannot see a menu item's effect on two of the three items
+here, so a caller acting on a menu item should re-read that element rather than
+trust the returned diff — which is what the first paragraph of this section says
+about `ui_changed` generally, now with a number attached. `AXObserver`
+notifications remain the real fix.
+
 **Both per-pid keyboard functions are wired in now.**
 `press_chord_background_pid` and `type_text_background_pid` are built the same
 way — `CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
