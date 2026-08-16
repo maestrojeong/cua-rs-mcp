@@ -1621,13 +1621,22 @@ synthesized from scratch has no AppKit identity, a click can be given one by
 building the `NSEvent` first, and `NSEvent` offers no scroll-wheel factory to
 build from.
 
-So the tier stays in the tree — the mechanism is right even where the result is
-not, and a future measurement on an app that reads the CG record directly may
-find it lands — but nothing in the docs or the tool descriptions may say it
-scrolls, and `scroll` on an element with no AX scroll verb should be treated as
-**expected to fail**. The working alternative is a keystroke: `press_key
-pagedown` / `up` / `down` reaches a scroller that publishes no scroll action,
-which is measured above.
+So the tier **refuses by default**. Documenting a tier as unreliable and then
+delivering it anyway is the worst of the options: the caller is told
+`delivery: pid`, concludes the scroll happened, and reads a stale tree as the new
+state — a wrong belief is more expensive than an error, which is the same
+reasoning `ui_changed` is reported honestly for in §10. `scroll` now returns a
+refusal that names the measurement and points at `press_key` with `pagedown` /
+`pageup` / `down` / `up`, which is measured above to reach a scroller that
+publishes no scroll action.
+
+The mechanism stays in the tree rather than being deleted, because it is
+*correctly built* — the failure is in what macOS does with a scroll event that
+has no AppKit identity, not in the construction — and an app that reads the event
+record directly may yet accept it. `CUA_WHEEL_SCROLL=1` re-enables delivery so
+the next person can re-run the experiment without reverting a commit. It is the
+only switch in this file that turns on something known not to work, and it is
+named for what it does rather than for a policy.
 
 ### Chromium's activation point is a lie, and it aimed every event at a corner
 

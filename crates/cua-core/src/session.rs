@@ -571,6 +571,29 @@ fn strict_focus() -> bool {
     *STRICT.get_or_init(|| env_flag("CUA_KEY_STRICT_FOCUS"))
 }
 
+/// Whether to deliver a wheel event that has been measured not to scroll.
+///
+/// Off by default, which is unusual for this file: every other switch here
+/// gates a capability that *works*. This one gates a capability that does not.
+///
+/// The measurement is in DESIGN §11 — a pid-routed `scrollWheel` is delivered
+/// and moves nothing, on a native `AXScrollArea` and on Chromium web content, in
+/// both units, while a pid-routed `pagedown` keystroke scrolls the same window in
+/// the same run. Given that, delivering it is worse than refusing: the caller is
+/// told `delivery: pid`, concludes the scroll happened, and reads a stale tree
+/// as the new state. A refusal that names `press_key` costs one round trip and
+/// gets the caller somewhere.
+///
+/// The mechanism stays in the tree rather than being deleted, because it is
+/// *correctly built* — the failure is in what macOS does with a scroll event
+/// that has no AppKit identity, not in the code — and an app that reads the
+/// event record directly may yet accept it. `CUA_WHEEL_SCROLL=1` is how the next
+/// person re-runs the experiment without reverting a commit.
+fn wheel_scroll_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("CUA_WHEEL_SCROLL"))
+}
+
 impl Default for StateOptions {
     fn default() -> Self {
         Self {
@@ -3404,6 +3427,23 @@ impl Inner {
             what: "scroll wheel event",
             reason,
         };
+        if !wheel_scroll_enabled() {
+            return Err(refuse(format!(
+                "cua-rs refuses this rather than pretending: a pid-routed scrollWheel event is \
+                 delivered and scrolls nothing. Measured against the window's own pixels on a \
+                 native AXScrollArea and on Chromium web content, in both pixel and line units, \
+                 while a pid-routed `pagedown` keystroke scrolled the same window in the same run \
+                 — so the scroll event is what fails, not the routing. Use press_key with \
+                 `pagedown`, `pageup`, `down` or `up` on this element instead{}. Set \
+                 CUA_WHEEL_SCROLL=1 to deliver it anyway and re-run the experiment",
+                if advertises {
+                    ", or ask in pages rather than points so the accessibility scroll action this \
+                     element does advertise is used"
+                } else {
+                    ""
+                }
+            )));
+        }
         if !cua_hid::skylight_available() {
             return Err(refuse(
                 "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
