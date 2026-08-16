@@ -161,6 +161,15 @@ pub type Result<T> = std::result::Result<T, HidError>;
 pub struct Chord {
     pub key: u16,
     pub flags: CGEventFlags,
+    /// The literal character the caller asked for, when they asked for one.
+    ///
+    /// `Some('x')` for `"x"`, `None` for `"escape"`, `"f5"` or anything with a
+    /// modifier. It exists because a keycode is not a character: a keycode is an
+    /// instruction to the *input method*, which is free to turn it into
+    /// something else. Under a Korean 2-set source, keycode 7 arrives as `ㅌ`,
+    /// which is the correct behaviour for a person typing and the wrong one for
+    /// a caller who asked for `x`. See [`press_chord_background_pid`].
+    pub literal: Option<char>,
 }
 
 /// Which physical button a synthesized mouse event carries.
@@ -305,6 +314,7 @@ pub fn parse_chord(chord: &str) -> Result<Chord> {
     let table = key_table();
     let mut flags = CGEventFlags::empty();
     let mut key: Option<u16> = None;
+    let mut literal: Option<char> = None;
 
     for raw in chord_tokens(chord) {
         let token = raw.to_lowercase();
@@ -313,7 +323,16 @@ pub fn parse_chord(chord: &str) -> Result<Chord> {
             continue;
         }
         match table.get(token.as_str()) {
-            Some(&code) => key = Some(code),
+            Some(&code) => {
+                key = Some(code);
+                // Remembered only for a single-character token: `"x"` names a
+                // character, `"escape"` and `"f5"` name a key that has none.
+                let mut chars = token.chars();
+                literal = match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                };
+            }
             None => {
                 return Err(HidError::UnknownToken {
                     chord: chord.to_string(),
@@ -324,9 +343,29 @@ pub fn parse_chord(chord: &str) -> Result<Chord> {
     }
 
     match key {
-        Some(key) => Ok(Chord { key, flags }),
+        Some(key) => Ok(Chord {
+            key,
+            flags,
+            // A modifier changes what the keystroke *means*, so the literal is
+            // dropped: `cmd+x` is Cut, not the letter x, and forcing a character
+            // onto it would be a different event.
+            literal: literal.filter(|_| !flags.intersects(modifier_mask())),
+        }),
         None => Err(HidError::NoKey(chord.to_string())),
     }
+}
+
+/// Every flag [`modifier_flag`] can produce, as one mask.
+///
+/// Used to ask "did the caller name a modifier at all", which is a different
+/// question from "is this flag set" — a synthesized event can carry incidental
+/// bits, and only the ones a caller asked for should change the recipe.
+fn modifier_mask() -> CGEventFlags {
+    CGEventFlags::MaskCommand
+        | CGEventFlags::MaskShift
+        | CGEventFlags::MaskAlternate
+        | CGEventFlags::MaskControl
+        | CGEventFlags::MaskSecondaryFn
 }
 
 /// Post a chord as a real key press to whatever currently has focus.
@@ -619,6 +658,34 @@ pub fn press_chord_background_pid(pid: i32, chord: &Chord) -> Result<()> {
         let event = CGEvent::new_keyboard_event(Some(&source), chord.key, down)
             .ok_or(HidError::NoSource)?;
         CGEvent::set_flags(Some(&event), chord.flags);
+        // Say the character as well as the key, when the caller named one.
+        //
+        // A keycode is an instruction to the input method, not a character.
+        // Measured on this machine under a Korean 2-set source: `press_key x`
+        // with the keycode alone arrives as `ㅌ`, which is exactly right for a
+        // person typing and exactly wrong for a caller who asked for `x`. The
+        // event keeps its real keycode — so an app that reads `keyCode` for a
+        // shortcut or a game control still sees the physical key it expects —
+        // and carries the literal character alongside it, which is what AppKit
+        // hands to a text view. Both candidate recipes were measured; this one
+        // was chosen over a keycode-0 event because it is the one that does not
+        // lie about which key was pressed.
+        //
+        // Only for an unmodified single character: `chord.literal` is already
+        // `None` for `escape`, `f5` and anything with a modifier, because
+        // `cmd+x` means Cut rather than the letter x.
+        if let Some(c) = chord.literal {
+            let encoded: Vec<u16> = c.to_string().encode_utf16().collect();
+            // SAFETY: `encoded` outlives the call and its length is the number
+            // of initialized code units.
+            unsafe {
+                CGEvent::keyboard_set_unicode_string(
+                    Some(&event),
+                    encoded.len() as u64,
+                    encoded.as_ptr(),
+                );
+            }
+        }
         post_keyboard_event(pid, &event)?;
         std::thread::sleep(std::time::Duration::from_millis(12));
     }
@@ -1877,5 +1944,46 @@ mod tests {
         let dashed = parse_chord("cmd-shift-p").unwrap();
         let plussed = parse_chord("cmd+shift+p").unwrap();
         assert_eq!(dashed, plussed);
+    }
+
+    // ── the literal character, and when it is not one ────────────────────────
+
+    #[test]
+    fn a_bare_character_key_remembers_its_character() {
+        // The whole point: under a Korean source the keycode alone arrives as a
+        // different letter, so the character has to travel with the event.
+        assert_eq!(parse_chord("x").unwrap().literal, Some('x'));
+        assert_eq!(parse_chord("X").unwrap().literal, Some('x'));
+        assert_eq!(parse_chord("7").unwrap().literal, Some('7'));
+        // A bare `-` is a separator, not a key — pre-existing, and why the
+        // spelled name exists. Its keycode form still carries no literal,
+        // because `minus` names a key rather than a character.
+        assert!(parse_chord("-").is_err());
+        assert_eq!(parse_chord("cmd+-").unwrap().literal, None);
+    }
+
+    #[test]
+    fn a_named_key_has_no_character_to_force() {
+        // `escape` and `f5` produce no character at all; claiming one would put
+        // a literal "e" on the event.
+        assert_eq!(parse_chord("escape").unwrap().literal, None);
+        assert_eq!(parse_chord("return").unwrap().literal, None);
+        assert_eq!(parse_chord("f5").unwrap().literal, None);
+        assert_eq!(parse_chord("tab").unwrap().literal, None);
+        assert_eq!(parse_chord("minus").unwrap().literal, None);
+    }
+
+    #[test]
+    fn a_modifier_drops_the_character() {
+        // `cmd+x` is Cut, not the letter x. Forcing a character onto a chord
+        // would change what the keystroke means.
+        assert_eq!(parse_chord("cmd+x").unwrap().literal, None);
+        assert_eq!(parse_chord("shift+a").unwrap().literal, None);
+        assert_eq!(parse_chord("ctrl+alt+delete").unwrap().literal, None);
+        // ...but the keycode is still the one the letter names.
+        assert_eq!(
+            parse_chord("cmd+x").unwrap().key,
+            parse_chord("x").unwrap().key
+        );
     }
 }
