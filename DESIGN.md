@@ -1724,11 +1724,34 @@ The control arm is what makes that mean something. A pid-routed `pagedown`
 *keystroke* scrolls the same window in the same run, so the failure is not pid
 routing, not the window number, not the aim point, and not the instrument — it is
 the scroll event itself. Also measured and also negative: Chromium web content,
-and both `ScrollUnit::Pixel` and `ScrollUnit::Line` on both apps. The most likely
-explanation is §6's finding applied to a different event family: a `CGEvent`
-synthesized from scratch has no AppKit identity, a click can be given one by
-building the `NSEvent` first, and `NSEvent` offers no scroll-wheel factory to
-build from.
+and both `ScrollUnit::Pixel` and `ScrollUnit::Line` on both apps.
+
+**The obvious explanation was tested and is wrong.** §6's finding is that a
+`CGEvent` synthesized from scratch has no AppKit identity, and that a click only
+lands once the `NSEvent` is built first. Applying that to scrolls is the natural
+guess, and `NSEvent` publishes no scroll-wheel factory to build from — so the
+guess is also the convenient one. `ScrollRecipe` exists to falsify it. Four
+constructions, selectable with `CUA_WHEEL_RECIPE`, measured against a native
+`AXScrollArea` holding a 400-line document:
+
+| recipe | what it adds | scrolled |
+|---|:--|:-:|
+| `plain` | `CGEventCreateScrollWheelEvent2`, as shipped | no |
+| `nsevent` | round-tripped through `+[NSEvent eventWithCGEvent:]` and back, so AppKit has seen it | no |
+| `phased` | `ScrollPhase` began → changed → ended, which a phaseless receiver may require | no |
+| `gesture` | phases plus the momentum and continuous fields a trackpad carries | no |
+
+Then the same four over the **public** `CGEventPostToPid` instead of the private
+SkyLight route (`CUA_PUBLIC_POST=1`): also no. Six constructions across two
+routes, every one delivered, none moving a pixel — `260063 bytes -> 260063
+bytes`, byte-identical — while the `key` control arm scrolled the same document
+immediately before and after, and `idle` confirmed the image is stable at rest.
+
+So it is not the AppKit header, not the phase fields, and not the post route. What
+remains untested is whether a per-pid scroll is honoured *at all* by anything
+outside the window server's own dispatch, which is not a question this codebase
+can answer from the sending side. Recorded as unexplained rather than guessed at
+again.
 
 So the tier **refuses by default**. Documenting a tier as unreliable and then
 delivering it anyway is the worst of the options: the caller is told
