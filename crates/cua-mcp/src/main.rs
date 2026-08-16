@@ -4,10 +4,12 @@
 //! Transports mirror the sibling projects: no argument means stdio (what an MCP
 //! client spawns), an address means Streamable HTTP.
 
+mod auth;
 mod server;
 
 use std::sync::Arc;
 
+use auth::{Token, TokenSource};
 use cua_core::Cua;
 use server::CuaServer;
 
@@ -55,6 +57,38 @@ async fn serve_stdio(cua: Arc<Cua>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reject anything reaching `/mcp` without the bearer token.
+///
+/// A flat 401 with `WWW-Authenticate: Bearer` and a body that says which header
+/// is missing — enough for a human debugging their client config, and nothing
+/// that distinguishes "wrong token" from "no token", which would turn the
+/// endpoint into a guessing aid.
+async fn require_bearer(
+    axum::extract::State(token): axum::extract::State<Arc<Token>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    if token.authorizes(presented) {
+        return next.run(request).await;
+    }
+
+    tracing::warn!("rejected an unauthenticated request to /mcp");
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+        "cua-rs requires `Authorization: Bearer <token>` on /mcp. The token is printed on \
+         stderr at startup, or set by CUA_HTTP_TOKEN.\n",
+    )
+        .into_response()
+}
+
 async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -66,14 +100,34 @@ async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
         format!("127.0.0.1:{addr}")
     };
 
-    // This server can read any window and press any button on the machine. It
-    // has no authentication of its own, so binding it anywhere reachable would
-    // hand the desktop to the network.
+    // This server can read any window and press any button on the machine.
+    // Loopback keeps the network out; it does not keep out another process on
+    // this machine, or a web page whose JavaScript can reach 127.0.0.1. Both
+    // boundaries are needed, and neither substitutes for the other.
     if !bind_address_is_loopback(&bind) {
         anyhow::bail!(
-            "refusing to bind {bind}: cua-rs exposes full desktop control and has no auth, \
+            "refusing to bind {bind}: cua-rs exposes full desktop control, \
              so it may only listen on loopback"
         );
+    }
+
+    let token = Token::resolve()?;
+    match token.source {
+        TokenSource::Environment => {
+            tracing::info!("using the bearer token from {}", auth::TOKEN_ENV);
+        }
+        // stderr, at startup, once. There is nowhere else to put it: the token
+        // is generated after the process starts and is gone when it stops, and
+        // a human copying it out of the log is the intended flow. Set
+        // CUA_HTTP_TOKEN to keep a stable one instead.
+        TokenSource::Generated => {
+            tracing::info!(
+                "generated a bearer token for this run. Clients must send \
+                 `Authorization: Bearer {}` to /mcp. Set {} to pin your own.",
+                token.value(),
+                auth::TOKEN_ENV
+            );
+        }
     }
 
     let config = StreamableHttpServerConfig::default().with_stateful_mode(false);
@@ -82,6 +136,14 @@ async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
         move || Ok(CuaServer::new(factory_cua.clone())),
         Arc::new(NeverSessionManager::default()),
         config,
+    );
+
+    // Two routers merged rather than one with a selective middleware, so the
+    // set of authenticated paths is a structural fact rather than a condition
+    // inside a filter that a later edit could get wrong. `/health` is outside
+    // the guarded router; everything under `/mcp` is inside it.
+    let guarded = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(Arc::new(token), require_bearer),
     );
 
     let router = axum::Router::new()
@@ -95,7 +157,7 @@ async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
                 }))
             }),
         )
-        .nest_service("/mcp", service);
+        .merge(guarded);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("cua-rs MCP server on http://{bind}/mcp");

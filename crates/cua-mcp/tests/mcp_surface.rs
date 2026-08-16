@@ -340,3 +340,79 @@ fn the_acting_tools_advertise_the_destructive_confirmation() {
         "click_in_window has no label to classify, so it must not offer a confirmation"
     );
 }
+
+#[test]
+#[ignore = "binds a loopback port and starts a real HTTP server"]
+fn http_mode_requires_the_bearer_token() {
+    let port = "39331";
+    let token = "test-token-not-a-secret";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cua-rs"))
+        .arg(port)
+        .env("CUA_HTTP_TOKEN", token)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cua-rs in HTTP mode");
+    // Poll rather than sleep a guessed interval: startup does a permission
+    // check and spawns the native worker, and a fixed wait either flakes or
+    // wastes time on every run.
+    let health_code = || -> String {
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("http://127.0.0.1:{port}/health"),
+            ])
+            .output()
+            .expect("curl");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    for _ in 0..100 {
+        if health_code() == "200" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let get = |path: &str, auth: Option<&str>| -> String {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-s")
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-w")
+            .arg("%{http_code}");
+        if let Some(a) = auth {
+            cmd.arg("-H").arg(format!("Authorization: {a}"));
+        }
+        cmd.arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("-H")
+            .arg("Accept: application/json, text/event-stream")
+            .arg("--data")
+            .arg(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .arg(format!("http://127.0.0.1:{port}{path}"));
+        let out = cmd.output().expect("curl");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let unauthenticated = get("/mcp", None);
+    let wrong = get("/mcp", Some("Bearer wrong"));
+    let right = get("/mcp", Some(&format!("Bearer {token}")));
+
+    // /health stays open so a supervisor can probe a server it has no
+    // credential for.
+    let health = health_code();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(unauthenticated, "401", "no header must be refused");
+    assert_eq!(wrong, "401", "a wrong token must be refused");
+    assert_ne!(right, "401", "the right token must get through");
+    assert_eq!(health, "200", "/health must stay open");
+}
