@@ -4858,29 +4858,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_coordinate_is_refused_on_the_generation_number() {
-        // The whole argument for this guard: nothing about a stale pixel looks
-        // wrong. It still lands inside the window, it still names a real
-        // place, and the place is simply covering something else now — so the
-        // only thing that can catch it is the generation it cites.
-        let cua = Cua::new();
-        // No grants and no snapshot, so this can only get as far as the
-        // pre-flight checks; that is exactly the layer under test.
-        let stale = cua.click_in_window(
-            "cua-rs-no-such-app-for-tests",
-            WindowPixel {
-                window_id: 1,
-                x: 10.0,
-                y: 10.0,
-                snapshot_id: Some(3),
-            },
-            MouseOptions::default(),
-            false,
-        );
-        assert!(stale.is_err(), "an unresolvable app cannot succeed");
-    }
-
-    #[test]
     fn the_coordinate_guard_passes_when_the_generation_matches_and_fails_when_it_does_not() {
         let mut inner = Inner::default();
         let info = AppInfo {

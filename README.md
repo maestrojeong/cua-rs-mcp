@@ -94,7 +94,7 @@ it in one round trip. [DESIGN.md §7a](DESIGN.md) has the reasoning.
 
 | | default | how to change it |
 |---|:--|:--|
-| **Scope this run to the apps you actually want driven.** Unset, every app is actionable. Set, acting on anything else is refused — reading still works. Bundle identifiers, comma-separated; `list_apps` prints them. | unscoped | `CUA_ALLOWED_APPS=com.kakao.KakaoTalkMac,com.apple.TextEdit` |
+| **Scope this run to the apps you actually want driven.** Unset, every app is actionable. Set, acting on anything else is refused — reading still works. Bundle identifiers, comma-separated; `list_apps` prints them. Setting it to an *empty* value refuses everything rather than reopening the scope, so a typo cannot quietly disarm it. | unscoped | `CUA_ALLOWED_APPS=com.kakao.KakaoTalkMac,com.apple.TextEdit` |
 | **Credential and security apps are never driven.** Keychain Access, the Passwords app, 1Password / Bitwarden / LastPass / Dashlane / KeePass and friends, System Settings, login and unlock prompts. Matched on bundle identifier, not display name. | on | `CUA_ALLOW_FORBIDDEN_TARGETS=1` |
 | **Reading them is still allowed** — `get_app_state`, `find`, `list_apps` — because a blocked app you cannot even look at is one you cannot explain. The screenshot is withheld, though: pixels reproduce the secret rather than describing it. | on | same flag |
 | **Destructive controls need confirming.** A target whose label reads as Delete / Remove / Erase / Reset / Move to Trash / Don't Save / 삭제 / 제거 / 초기화 / 나가기 is refused, as is `cmd+delete` and a bare `delete` outside a text field. | on | pass `confirm_destructive: true` on that call |

@@ -700,10 +700,14 @@ open, and the only escape used to be `CUA_ALLOW_FORBIDDEN_TARGETS=1`, which lift
 *everything*. With a scope you can hand one app the permission it needs without
 disarming the floor for the rest.
 
-**An empty value means unscoped, not "refuse everything".** A run that can act on
-no app at all is indistinguishable from a broken install, and a typo in a shell
-export should not present as one. `CUA_ALLOWED_APPS=` and `CUA_ALLOWED_APPS=,,`
-log a warning and leave the run unscoped.
+**An empty value is an empty scope, not an absent one.** `CUA_ALLOWED_APPS=""`
+refuses every action rather than running unscoped, and the deciding case is
+`CUA_ALLOWED_APPS=$TYPO`, which expands to exactly that. A scope that opens
+itself when its value fails to arrive is a gate that fails open on a
+misspelling — the wrong direction for the one gate here whose whole job is to
+fail closed. Refusing everything is loud, immediate, and names what to fix;
+silently permitting everything looks like success until it is not. Unsetting the
+variable is how a caller asks for unscoped.
 
 Two smaller rules, both tested. Matching is exact on the whole identifier, never
 a prefix, so `com.apple.Safari` does not admit Safari Technology Preview and
@@ -850,6 +854,29 @@ which is what the window server means by it.
 Reads continue while locked. They return whatever the app still publishes, which
 may be a lock screen or nothing; refusing them would break polling loops for no
 gain, since a read cannot change anything a human will later be surprised by.
+
+**What the screen-lock check does not cover, stated plainly.** It is the cheap
+90%, and the gap is a race rather than a hole in the API:
+
+- **The window between "lock requested" and "screen locked".**
+  `CGSSessionScreenIsLocked` flips when the lock takes effect, not when the user
+  hits the hot corner or closes the lid. An action already in flight — or one
+  that read the flag a moment before it flipped — proceeds. The exposure is
+  bounded by one action, and by an action cua-rs was authorized to take a second
+  earlier, but it is real.
+- **The same race on the way out.** Nothing re-checks mid-action, so a long
+  action that begins unlocked finishes unlocked as far as this gate is concerned.
+- **Display sleep, and a locked *other* session.** A dark screen with no lock is
+  not detected, and neither is fast user switching to another console, where the
+  driven app's session is no longer the one on screen.
+- **"Require password after N minutes".** A screen saver inside its grace period
+  is caught by the saver check but is not, strictly, a locked session — the check
+  is deliberately broader than the lock flag, and will refuse where a purist
+  would allow.
+
+Closing the race properly means being *notified* rather than polling, and by
+something whose lifetime does not depend on this process. That is a separate
+helper, not a flag.
 
 ### HTTP: loopback is not authorization
 

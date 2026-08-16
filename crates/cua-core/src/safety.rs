@@ -245,19 +245,21 @@ pub fn allowed_apps() -> Option<&'static [String]> {
     static ALLOWED: OnceLock<Option<Vec<String>>> = OnceLock::new();
     ALLOWED
         .get_or_init(|| {
-            let parsed = parse_allowlist(&std::env::var("CUA_ALLOWED_APPS").ok()?);
-            match &parsed {
-                None => tracing::warn!(
-                    "CUA_ALLOWED_APPS is set but lists no bundle identifier; ignoring it and \
-                     leaving this run unscoped"
-                ),
-                Some(list) => tracing::info!(
+            let list = parse_allowlist(&std::env::var("CUA_ALLOWED_APPS").ok()?);
+            if list.is_empty() {
+                tracing::warn!(
+                    "CUA_ALLOWED_APPS is set but names no bundle identifier, so this run may act \
+                     on nothing. That is what an empty scope means; unset the variable to run \
+                     unscoped"
+                );
+            } else {
+                tracing::info!(
                     "scoped to {} app(s) for actions: {}",
                     list.len(),
                     list.join(", ")
-                ),
+                );
             }
-            parsed
+            Some(list)
         })
         .as_deref()
 }
@@ -266,17 +268,20 @@ pub fn allowed_apps() -> Option<&'static [String]> {
 /// rules are testable without a process-wide environment or a `OnceLock` that
 /// can only be initialized once per test binary.
 ///
-/// `None` for a value that names nothing. An empty or whitespace-only
-/// `CUA_ALLOWED_APPS` is a mistake, not "allow nothing": a run that can act on
-/// no app at all is indistinguishable from a broken install, and a typo in a
-/// shell export should not present as one.
-fn parse_allowlist(raw: &str) -> Option<Vec<String>> {
-    let list: Vec<String> = raw
-        .split(',')
+/// # An empty value is an empty scope, not an absent one
+///
+/// `CUA_ALLOWED_APPS=""` refuses every action rather than running unscoped, and
+/// the deciding case is `CUA_ALLOWED_APPS=$TYPO`, which expands to exactly that.
+/// A scope that opens itself when its value fails to arrive is a gate that fails
+/// open on a misspelling, which is the wrong direction for the one gate here
+/// whose whole job is to fail closed. Refusing everything is loud, immediate, and
+/// says exactly what to fix; silently permitting everything looks like success
+/// until it is not. Unsetting the variable is how a caller asks for unscoped.
+fn parse_allowlist(raw: &str) -> Vec<String> {
+    raw.split(',')
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
-        .collect();
-    (!list.is_empty()).then_some(list)
+        .collect()
 }
 
 /// Whether a normalized scope admits a bundle identifier.
@@ -1482,30 +1487,36 @@ mod tests {
     fn an_allowlist_is_split_trimmed_and_lowercased() {
         assert_eq!(
             parse_allowlist("com.kakao.KakaoTalkMac , com.apple.TextEdit"),
-            Some(vec![
+            vec![
                 "com.kakao.kakaotalkmac".to_string(),
                 "com.apple.textedit".to_string()
-            ])
+            ]
         );
         assert_eq!(
             parse_allowlist("  com.apple.Safari  "),
-            Some(vec!["com.apple.safari".to_string()])
+            vec!["com.apple.safari".to_string()]
         );
     }
 
     #[test]
-    fn a_scope_that_names_nothing_is_no_scope_at_all() {
-        // A run scoped to nothing looks exactly like a broken install, so an
-        // empty value is read as "unscoped" rather than "refuse everything".
-        assert_eq!(parse_allowlist(""), None);
-        assert_eq!(parse_allowlist("   "), None);
-        assert_eq!(parse_allowlist(",,"), None);
-        assert_eq!(parse_allowlist(" , , "), None);
+    fn a_scope_that_names_nothing_admits_nothing() {
+        // `CUA_ALLOWED_APPS=$TYPO` expands to an empty value, and a gate that
+        // opens itself on a misspelling fails in the wrong direction. So an
+        // empty scope is an empty scope: everything is refused, loudly and
+        // immediately. Unsetting the variable is how to ask for unscoped.
+        for raw in ["", "   ", ",,", " , , "] {
+            let list = parse_allowlist(raw);
+            assert!(list.is_empty(), "{raw:?} should name no app");
+            assert!(
+                !in_scope(&list, "com.apple.TextEdit"),
+                "{raw:?} must not admit anything"
+            );
+        }
     }
 
     #[test]
     fn scope_matching_ignores_case_and_surrounding_space() {
-        let list = parse_allowlist("com.kakao.KakaoTalkMac").unwrap();
+        let list = parse_allowlist("com.kakao.KakaoTalkMac");
         assert!(in_scope(&list, "com.kakao.KakaoTalkMac"));
         assert!(in_scope(&list, "com.kakao.kakaotalkmac"));
         assert!(in_scope(&list, "  com.kakao.KakaoTalkMac  "));
@@ -1517,10 +1528,10 @@ mod tests {
         // The failure this rules out is a scope of `com.apple.Safari` silently
         // admitting Safari Technology Preview, and a scope of `com.apple`
         // admitting every Apple app on the machine.
-        let one = parse_allowlist("com.apple.Safari").unwrap();
+        let one = parse_allowlist("com.apple.Safari");
         assert!(!in_scope(&one, "com.apple.SafariTechnologyPreview"));
 
-        let vendor = parse_allowlist("com.apple").unwrap();
+        let vendor = parse_allowlist("com.apple");
         assert!(!in_scope(&vendor, "com.apple.Safari"));
         assert!(!in_scope(&vendor, "com.apple.TextEdit"));
     }
@@ -1530,7 +1541,7 @@ mod tests {
         // Scoping a run to a password manager must not lift the floor: the
         // allowlist widens nothing, it only narrows. `guard` checks the floor
         // first for exactly this reason.
-        let list = parse_allowlist("com.1password.1password").unwrap();
+        let list = parse_allowlist("com.1password.1password");
         assert!(in_scope(&list, "com.1password.1password"));
         assert!(forbidden_bundle("com.1password.1password").is_some());
     }
