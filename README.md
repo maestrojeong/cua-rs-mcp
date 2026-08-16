@@ -236,7 +236,7 @@ window, and nothing when you are not.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 248 tests, no permissions needed
+cargo test --workspace          # 249 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 
 # read-back tests for the keyboard path: needs an Accessibility grant,
