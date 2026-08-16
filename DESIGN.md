@@ -59,23 +59,41 @@ AX cannot express everything:
 | page a scroll area | `AXScroll*ByPage` | works |
 | set text | `AXValue` write | works — still the *only* mechanism `set_value`/`type_text` use, see below |
 | **arbitrary chord** (`⌘⇧P`) | — | no verb exists, but reachable since the pid-only change below via the pid tier (not a fallback — the only tier) |
-| **drag** | — | **no verb exists**, still refused — the pid tier has no drag primitive wired in yet |
+| **drag** | — | no verb exists; delivered as a real down/drag/up gesture by the pid tier (§11). Not yet verified against a real drag source |
+| **right click where the element advertises nothing** | `AXShowMenu` | works *where the element advertises it*; where it does not, a real `rightMouseDown`/`rightMouseUp` pair by the pid tier |
+| **modifier click** (⌘-click, ⇧-click) | — | no verb exists — `AXPress` is "activate this", with no room for a held key. Pid tier only |
+| **hover** | — | no verb exists; a synthesized `mouseMoved` by the pid tier. Cannot reach an app that polls the real cursor (§11) |
+| **scroll by a distance** | — | `AXScroll*ByPage` is whole pages only; a `scrollWheel` event covers the rest, and covers elements that advertise no scroll action at all |
 | pixel-only surfaces | — | nothing to address — reachable anyway, see below |
 
 Those rows are softer than they look. "No verb exists" is a statement about
 accessibility, not about delivery, and the pid tier delivers events without
 consulting accessibility at all.
 
-Two of these rows have since moved. `click_in_window` clicks a bare
-window-local point with no element behind it, which makes a canvas reachable —
-deliberately opt-in, labelled `delivery: pid (no element)`, and explicitly
-unverified, because there is no element to read back. §11 has the gates and
-the measurement. Chords moved too: `press_key` routes every chord through the
-pid tier unconditionally (§1a), so "no verb exists" no longer means "refused"
-for a key press the way it still does for a drag. The honest ceiling is now:
-cua-rs drives *structured* UI extremely well, can be aimed at an unstructured
-surface when the caller accepts responsibility for the aim, can send any key
-or chord, and still cannot drag.
+Most of these rows have since moved, always for the same reason: "no verb
+exists" is a statement about the *vocabulary* of accessibility, not about what
+can be delivered, and the pid tier delivers events without asking accessibility
+anything. `click_in_window` clicks a bare window-local point with no element
+behind it, which makes a canvas reachable — deliberately opt-in, labelled
+`delivery: pid (no element)`, and explicitly unverified, because there is no
+element to read back. §11 has the gates and the measurement. Chords moved too:
+`press_key` routes every chord through the pid tier unconditionally (§1a).
+
+Then the mouse model itself widened from "a left click with a count" to
+`{origin, destination, button, modifiers, click_count}`, which is what the four
+new rows above are: a right or middle button, held modifier keys, a drag with
+interpolated intermediate moves, a hover, and a wheel scroll. §11 has the
+design and the verification status, which is worth stating here too rather than
+burying: the parsing, geometry, interpolation and tier selection are
+unit-tested without any grant, and the gestures themselves have **not** been
+walked against a real drag source, a real hover-revealed control, or a real
+Electron list. They are built, they are reachable, and they are unmeasured.
+
+The honest ceiling is now: cua-rs drives *structured* UI extremely well, can be
+aimed at an unstructured surface when the caller accepts responsibility for the
+aim, and can express every ordinary mouse and keyboard gesture — with one
+permanent exception, that it cannot make an app believe the *real* pointer
+moved, because it will not move it.
 
 ### `press_key`: decided, then reconsidered
 
@@ -634,6 +652,20 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 - [ ] active Space is unchanged
 - [ ] target window on another Space still captures
 
+**The widened mouse model (§11)** — all unrun
+- [ ] `drag` reorders a row in a real list (Finder, Mail, a Kanban board)
+- [ ] `drag` with one end a bare pixel draws a selection rectangle on a canvas
+- [ ] a drag whose ends are in two different windows is refused, not delivered
+- [ ] a `drag` interrupted mid-move still releases the button (no stuck gesture)
+- [ ] `hover` reveals a tooltip or a hover-only button, and it is in the diff
+- [ ] `hover` on an app that polls `NSEvent.mouseLocation` does nothing — confirm
+      the failure is the documented one and not a delivery bug
+- [ ] `button: right` opens a context menu on a control advertising no AX actions
+- [ ] `modifiers: cmd` on a link opens a new tab; `shift` extends a selection
+- [ ] `scroll` on an Electron list moves it, and reports `delivery: pid`
+- [ ] `scroll` on a native `AXScrollArea` still reports `delivery: ax`
+- [ ] cursor is byte-identical before and after each of the above
+
 **Tree**
 - [x] native app: Finder 4 elements, Chrome 413 — labeled, actionable elements present
 - [x] Electron: Slack 367 elements including an `AXWebArea`, **but not on the
@@ -663,7 +695,9 @@ or verified live
 
 | | Why |
 |---|:--|
-| `drag` | no AX verb; would need HID pointer synthesis, which `cua-hid` does not do yet |
+| **pointer-position spoofing** | an app that reads `NSEvent.mouseLocation` rather than the event it was handed cannot be reached by a synthesized `mouseMoved`, and the only fix is warping the real cursor. Permanently out — §11 |
+| **press-and-hold gestures** (a drag that pauses to let a spring-loaded folder open; click-and-hold) | the primitives are there — a drag *is* a down, a run of moves and an up — but holding means owning a mouse-down that outlives one tool call, and a release that never arrives leaves the target mid-gesture |
+| **wheel momentum and rubber-banding** | a trackpad fling is a phase-tagged stream of events, not a delta. Nothing has needed it |
 | AX notification streams (`AXObserver`) | would replace the fingerprint heuristic in §10 |
 | menu invocation | needs temporary activation + focus restore; easy to get wrong |
 | Spaces handling | off-Space windows are observation-only, matching prior art |
@@ -760,17 +794,20 @@ terminal or canvas that ignores `AXValue`.
 
 ## 11. Widening the pid tier, never the shared tier
 
-The gaps in §1's capability table — no chords, no drag, no canvas — read like
-consequences of choosing accessibility. Most of them are not. They are
-consequences of `Target::Point` requiring an element, and of two written-but-
-unused functions in `cua-hid`. The shared-input tier stays permanently closed;
-what follows widens the *pid* tier instead, and none of it needs the cursor, the
-global HID queue, or `NSRunningApplication.activate`.
+The gaps in §1's capability table — no chords, no drag, no canvas, one button,
+no modifiers, no hover, no scrolling anything Chromium draws — read like
+consequences of choosing accessibility. Almost none of them are. They were
+consequences of `Target::Point` requiring an element, of two written-but-unused
+functions in `cua-hid`, and of one primitive that happened to hard-code a left
+click. The shared-input tier stays permanently closed; what follows widens the
+*pid* tier instead, and none of it needs the cursor, the global HID queue, or
+`NSRunningApplication.activate`.
 
-The enabling fact: `PidClick` is `{pid, point, window_local, wid, count}`. There
-is no `Element` in it. Accessibility is how cua-rs *decides where* to click; it
-is not how the click is delivered, and the delivery path never needed an element
-to exist.
+The enabling fact: `PidClick` was `{pid, point, window_local, wid, count}` and
+is now `{…, button, modifiers}`, with a sibling `PidDrag`, `PidMouseMove` and
+`PidScroll`. There is no `Element` in any of them. Accessibility is how cua-rs
+*decides where* to click; it is not how the click is delivered, and the delivery
+path never needed an element to exist.
 
 ### The tiers
 
@@ -779,22 +816,28 @@ to exist.
 | element with an AX action | `AXPress`/`AXPick`/`AXConfirm` | **pid click at its point — see §1a; `CUA_AX_FIRST=1` restores this row** |
 | element with a frame, no action | pid click at its point | unchanged |
 | **point with no element** | refused (`NoElementAtPoint`) | **`click_in_window`, window-scoped and opt-in** |
-| drag | refused | still refused — planned |
+| drag | refused | **`drag`: a down, interpolated `mouseDragged` moves, and an up, all pinned to one window** |
 | chords | refused | **pid-routed via `press_chord_background_pid` — see §1a; `CUA_KEY_AX_ONLY=1` restores the refusal** |
-| pixel-precise scroll | `AXScroll*ByPage` only | still page-only — planned |
+| right / middle button | left only | **`button` on `click`, `click_in_window` and `drag`** |
+| modifier click (⌘, ⇧, ⌥, ⌃) | not expressible | **`modifiers` on the same three tools, in the vocabulary `press_key` already used** |
+| hover | not expressible | **`hover`: one synthesized `mouseMoved`, nothing pressed** |
+| pixel-precise scroll | `AXScroll*ByPage` only | **`scroll` keeps the AX page verb where the element advertises one, and sends a `scrollWheel` event where it does not** |
 
-The first and fifth rows moved after this section was originally written —
+The bottom half of that table is new, and the first row moved after this
+section was originally written —
 §1a has the reasoning (accessibility cannot express a click count or a chord, so
 events are the only mechanism that could serve either) and the environment
 variables that undo it per action. The rest of this section's argument (pid delivery needs a point, not
 an element) is unaffected: it explains *why* the pid tier could reach further
 than accessibility-only, not which actions choose it by default.
 
-Shipped in tiers rather than at once. The elementless click was ready — only the
-policy gate stood in the way — while a drag needs a story for the mouse-up that
-must be sent even when a move fails partway, and a chord needs one for a
-keystroke that lands in the wrong process. Bundling them would have delayed the
-finished piece and made each one's safety review harder to read.
+Shipped in tiers rather than at once. The elementless click went first — only a
+policy gate stood in its way — then chords, then the widened mouse model, each
+because the earlier one's safety question was answerable on its own: a drag
+needed a story for the mouse-up that must be sent even when a move fails
+partway, and a chord needed one for a keystroke that lands in the wrong process.
+Bundling them would have delayed the finished piece and made each one's review
+harder to read.
 
 ### Point with no element — the one that unlocked canvas
 
@@ -849,13 +892,130 @@ from grey to coloured across the click, which is the app agreeing it became key.
 title nor a focus change here — which is the §10 false negative doing exactly
 what §10 says it does, and the reason `return_state` exists.
 
-### Drag
+### The mouse model, widened
 
-`CGEventSetWindowLocation` is already stamped per event, so a drag is a down, a
-run of moves, and an up, all window-local against one window id. Refuse a drag
-whose endpoints resolve to different windows rather than interpolating across a
-boundary. This is strictly more delicate than a click — a lost mouse-up leaves
-the target mid-drag — so the up must be sent even when a move fails partway.
+`click_background_pid` used to take a point and a count and always send a left
+click. The primitive now takes `{origin, destination, button, modifiers,
+click_count}`, and the four capabilities below are what falls out of that one
+generalization rather than four separate mechanisms. All of them go out through
+the same recipe §6 describes — `NSEvent` factory first, `CGEvent` taken from it,
+stamped, posted once by pid — so none of them widens *how* input is delivered.
+
+**Button.** Three `NSEventType` families, selected by button:
+`leftMouseDown`/`Dragged`/`Up`, the `right` equivalents, and `otherMouse*` for
+middle. The type is what selects the handler — a view implementing
+`rightMouseDown:` will never see a `leftMouseDown` however the button-number
+field is stamped — so the type comes from the button and the stamped
+`kCGMouseEventButtonNumber` merely agrees with it.
+
+A right click is *not* routed to `AXShowMenu`. Where an element advertises that
+action, `perform_secondary_action` already reaches it and is the better call:
+no coordinate, no window pinning, no aim to get wrong. The controls that need a
+real right click are precisely the ones that advertise no actions at all, which
+is the same population `click` needed the pid tier for in the first place.
+
+**Modifiers.** `parse_modifiers` shares its table with `parse_chord`, so `cmd`,
+`command`, `meta` and `super` mean the same thing on a click as they do in
+`press_key` and neither can grow an alias the other lacks. The flags go into the
+`NSEvent` factory *and* onto the `CGEvent` afterwards, because
+`-[NSEvent modifierFlags]` reads the AppKit header while anything Chromium-based
+reads `CGEventGetFlags`; the two enums share their bit values, so one set
+satisfies both. Accessibility has nothing to say here at all: `AXPress` means
+"activate this" and has no room for a held key, which is why ⌘-click was
+unreachable rather than merely awkward.
+
+**Drag.** A down, a run of `mouseDragged`, an up, all carrying one event number
+— AppKit correlates a tracking session by that field, so allocating a fresh one
+per move would hand a view a stream of unrelated single events instead of one
+gesture. Both endpoints are checked against the *live* frame of the one window
+the app's last `get_app_state` read; a request whose ends fall in different
+windows is refused rather than interpolated across the boundary, because every
+event of a gesture has to carry the same window number and a drag whose up
+lands elsewhere is not a drag anywhere. The release is sent even when a move
+fails partway, and the first error is what surfaces: a lost mouse-up leaves the
+target mid-drag, which is worse than the failure that caused it.
+
+Either end may be an element or a bare window-local pixel, and they may be
+different elements of the same app. That is a deliberate softening of the rule
+`click` follows — `click` keeps its elementless form in a separate opt-in tool
+because "the point covers nothing" is the shape of a typo and blind-clicking a
+typo is the worst outcome available. A drag frequently has one end on a real row
+and the other on empty space by design: a reorder into a gap, a rectangle drawn
+across background. Where either end is a pixel the whole result is labelled
+`pid (no element)`.
+
+*The interpolation, and the numbers.* A down at A followed immediately by an up
+at B is not a drag to anything that implements one: AppKit drag sources arm on a
+`mouseDragged` that exceeds a small threshold and then track each subsequent
+move, and a web view reconstructs the gesture from `mousemove` events it never
+receives. So the moves are interpolated, and two constants say how:
+
+- **24 points per step**, roughly one list row, so no ordinarily-sized drop
+  target is stepped clean over without a move landing inside it. The step
+  *length* is what is held constant; the step *count* falls out of the distance,
+  floored at 6 so a short drag does not degenerate back into a single jump and
+  capped at 32 so a long one cannot run for seconds.
+- **16 ms between steps**, one display frame at 60 Hz. A target redraws at most
+  once per frame, so moves sent faster are moves it cannot act on separately and
+  may coalesce; moves sent slower make an ordinary drag take visibly longer than
+  a human one, which is what starts a list's drag-autoscroll timer.
+
+Both are reasoned rather than measured, and both are one constant each in
+`cua-hid` if a real app disagrees.
+
+**Hover.** One `mouseMoved` at a point, no press, and — unlike a click — no
+activation-assist click on the window's own activation point, because a caller
+asking to hover has not asked to press anything. The activation *notices* are
+still sent.
+
+This is the one capability with a limit that is not a missing feature. The event
+says the pointer arrived; the pointer did not. An app reading
+`NSEvent.mouseLocation`, `-[NSWindow mouseLocationOutsideOfEventStream]`, or
+polling the cursor gets the truth — the human's pointer, wherever they left it —
+and does not respond. Anything driven by the event (`NSTrackingArea`, every web
+view) does. The only fix would be moving the real cursor, which is the thing
+this project exists not to do, so the tool description says so plainly instead.
+
+**Scroll.** Two tiers, and the older one is kept because it is genuinely better
+where it applies. `AXScroll*ByPage` needs no coordinate, lets the app decide what
+a page of its own content is, and cannot be swallowed by whatever subview
+happens to sit under a point. But it only exists on elements that advertise it,
+and the elements an agent most often needs to scroll advertise nothing at all —
+an Electron list, a canvas, a web area inside a native shell — which was a
+refusal rather than a mechanism. So: a page request on an element that
+advertises the verb uses it and reports `delivery: ax`; anything else is a
+`scrollWheel` event at the element's point and reports `delivery: pid`, with the
+verb line naming which and why.
+
+A request in *points* always takes the event tier, because accessibility cannot
+express a distance — it has whole pages and nothing else. On the event tier a
+"page" is 90% of the element's own height, which keeps about a line of overlap
+across the boundary the way a real page-down does, clamped at both ends so an
+element that reports no frame still scrolls by something usable.
+
+*Unlike a mouse event, a scroll event is not built through AppKit* — there is no
+`NSEvent` scroll-wheel factory to build it with. That costs nothing: the AppKit
+header the mouse path goes out of its way to obtain (event number, click count,
+window number) is what a view validates a *click* against, while
+`-[NSEvent scrollingDeltaY]` reads the CG record's own wheel fields, which
+`CGEventCreateScrollWheelEvent2` fills correctly. The window routing, the pid
+stamp and the fresh timestamp are applied exactly as they are to a mouse event.
+
+### What the widened model has not been shown to do
+
+Everything above is reachable and none of it is measured. The permission-free
+tests cover what can be tested without a grant — the modifier and button
+vocabularies, the interpolation's endpoints and monotonicity, the step-count
+bounds, the wheel-delta signs, the scroll tier choice, the page sizing, and
+every argument-validation refusal — and that is a statement about the logic, not
+about whether a real app accepts the events.
+
+Specifically **unverified**: that a Finder or Mail list reorders under `drag`;
+that a hover-revealed control appears under `hover` on any app; that an Electron
+list scrolls under the wheel tier; that a right click opens a context menu on a
+control with no AX actions; that ⌘-click opens a link in a new tab. Each is one
+manual run away and none of them has been run. §8's checklist is where they
+belong once they have been.
 
 ### Chords
 

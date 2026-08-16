@@ -100,11 +100,12 @@ mis-clicking. `x`/`y` also works, resolved against the snapshot's geometry.
 |---|:--|
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
 | `find` · `wait_for` | search the snapshot; poll until text appears or goes |
-| `click` | a pid-routed event; no `AXPress`/`AXPick`/`AXConfirm` attempt |
+| `click` | a pid-routed event; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count` |
+| `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
 | `click_in_window` | last resort: a bare point, no element, nothing verified |
 | `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call |
 | `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
-| `scroll` · `perform_secondary_action` | page a scroll area; any AX verb |
+| `scroll` · `perform_secondary_action` | pages through AX, or a wheel event where there is no AX verb; any AX verb |
 | `list_apps` · `check_permissions` | running apps; grant status |
 
 Actions re-read the window and return a delta by default, so acting and looking
@@ -119,9 +120,17 @@ one of them.
 |---|:--|
 | buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
 | any key or chord | yes, pid-routed |
-| drag | **no** — no AX verb, and the pid tier has no drag primitive yet |
-| canvas apps, games | clickable, but you supply the coordinate and the confidence |
+| right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed — **built, not yet verified on a real app** |
+| drag | yes: a real down, interpolated moves and an up, both ends in one window — **built, not yet verified on a real drag source** |
+| hover | yes, a synthesized `mouseMoved` — but your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react |
+| scrolling something with no AX scroll verb (Electron list, canvas, web content) | yes, a wheel event at the element's point — **built, not yet verified** |
+| canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
 | terminals | reading yes; typing no — `set_value`/`type_text` write `AXValue`, which terminals ignore; `press_key` reaches them but one key or chord at a time |
+
+"Built, not yet verified" means the events are constructed and delivered on the
+same pid route `click` uses, the logic behind them is unit-tested without any
+grant, and nobody has yet watched a real app accept one. [DESIGN.md](DESIGN.md)
+§11 lists exactly which runs are owed.
 
 `set_value` replaces and `type_text` appends via one atomic `AXValue` write; an
 app that only reacts to real key events ignores both. `click` and `press_key`
@@ -143,7 +152,7 @@ the workspace to get both.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 98 tests, no permissions needed
+cargo test --workspace          # 128 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

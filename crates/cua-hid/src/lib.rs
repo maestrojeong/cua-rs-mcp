@@ -809,16 +809,15 @@ impl ScrollUnit {
 /// Everything needed to send the *localized* form of an activation notice, rather
 /// than the bare one.
 ///
-/// `SynthesizedEvent.notifyAppActivated(windowID:windowBounds:activationPoint:)`
-/// behaves differently depending on whether the last two arguments are present.
-/// With them absent it emits only the `ApplicationActivated` event — which is all
-/// cua-rs used to send. With them present it emits that event *plus a mouse
-/// down/up pair* aimed at the window's own activation point and pinned to the
-/// window with `CGEventSetWindowLocation(point - bounds.origin)`. That pair is
-/// the canonical "click a window
-/// to make it key" gesture, and skipping it is why an activation notice alone
-/// left some controls — a chat app's header menu button, measured — still
-/// refusing the click that followed.
+/// The bare notice is just the `ApplicationActivated` event — which is all
+/// cua-rs used to send. The localized form is that event *plus a mouse down/up
+/// pair* aimed at the window's own activation point and pinned to the window
+/// with `CGEventSetWindowLocation(point - frame.origin)`. That pair is the
+/// canonical "click a window to make it key" gesture, and skipping it is why an
+/// activation notice alone left some controls — a chat app's header menu
+/// button, measured — still refusing the click that followed. Telling the
+/// *application* it is active and giving one of its *windows* key status are
+/// two different statements, and only the second one is a click.
 ///
 /// The activation point must be the *window's*, not the target element's, and the
 /// caller is expected to have confirmed that the point really belongs to the
