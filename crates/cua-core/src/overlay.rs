@@ -60,15 +60,8 @@ impl Overlay {
         }
     }
 
-    /// The overlay binary ships next to this one — same `cargo build`, same
-    /// install step — so the running executable's own directory is the one
-    /// place that is guaranteed to be right regardless of PATH or install
-    /// layout. `current_exe` can return a symlink (e.g. `~/.local/bin/cua-rs`
-    /// pointing into `target/release`); canonicalize so the sibling lookup
-    /// follows it to where `cua-overlay` actually was built.
     fn spawn() -> Option<Child> {
-        let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-        let sibling = exe.parent()?.join("cua-overlay");
+        let sibling = sibling_overlay(&std::env::current_exe().ok()?)?;
         Command::new(sibling)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -78,8 +71,69 @@ impl Overlay {
     }
 }
 
+/// The overlay binary ships next to this one — same `cargo build`, same
+/// `install.sh`, same release — so the running executable's own directory is
+/// the one place that is guaranteed to be right regardless of PATH or install
+/// layout. Nothing here consults PATH on purpose: a `cua-overlay` from some
+/// other install is a worse answer than no overlay at all.
+///
+/// `exe` can be a symlink — `~/bin/cua-rs` pointing at `~/.local/bin/cua-rs`,
+/// or a dev symlink into `target/release` — so canonicalize before taking the
+/// parent. Without that the sibling lookup would search the *link's*
+/// directory, which is exactly the directory that does not contain the
+/// overlay.
+fn sibling_overlay(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    Some(exe.canonicalize().ok()?.parent()?.join("cua-overlay"))
+}
+
 // No `Drop` impl: `cua-overlay` already exits on stdin EOF (see
 // `crates/cua-overlay/src/main.rs`), which is exactly what closing `Child`'s
 // stdin produces when this value is dropped. A bespoke quit message plus a
 // blocking `wait()` would just be two ways to say the same thing, with the
 // added risk of hanging server shutdown on a wedged child.
+
+#[cfg(test)]
+mod tests {
+    use super::sibling_overlay;
+
+    /// The installed layout is the one that used to be broken: `install.sh`
+    /// puts both binaries in `~/.local/bin`, but a user (or Homebrew, or a
+    /// dotfiles repo) may well reach `cua-rs` through a symlink from
+    /// somewhere else on PATH. Resolve to the real file first, or the overlay
+    /// is looked for beside the link and silently never spawns.
+    #[test]
+    fn the_overlay_is_looked_for_beside_the_real_binary_not_beside_a_symlink_to_it() {
+        let root = std::env::temp_dir().join(format!("cua-overlay-lookup-{}", std::process::id()));
+        let installed = root.join("installed");
+        let on_path = root.join("on-path");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::create_dir_all(&on_path).unwrap();
+        std::fs::write(installed.join("cua-rs"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(installed.join("cua-overlay"), b"#!/bin/sh\n").unwrap();
+
+        let link = on_path.join("cua-rs");
+        std::os::unix::fs::symlink(installed.join("cua-rs"), &link).unwrap();
+
+        let found = sibling_overlay(&link).expect("a resolvable symlink has a sibling");
+        assert_eq!(
+            found,
+            installed.canonicalize().unwrap().join("cua-overlay"),
+            "lookup followed the link's own directory instead of the target's"
+        );
+        assert!(
+            found.exists(),
+            "the overlay next to the real binary is there"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A path that does not resolve yields no overlay rather than a guess:
+    /// `Command::new` on a bogus path would fail anyway, but returning `None`
+    /// keeps the "best effort, never an error" contract at the top of this
+    /// file explicit.
+    #[test]
+    fn an_unresolvable_executable_path_yields_no_overlay() {
+        assert!(sibling_overlay(std::path::Path::new("/nope/cua-rs")).is_none());
+    }
+}
