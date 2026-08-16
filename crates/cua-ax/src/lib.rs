@@ -424,6 +424,31 @@ impl Element {
         self.string(attr::ROLE)
     }
 
+    /// Best available human-readable label, resolved from the attributes apps
+    /// actually populate, in descending order of intent.
+    ///
+    /// `AXTitle` is the label a developer chose; `AXDescription` is what
+    /// VoiceOver reads; `AXPlaceholderValue` is the only hint an empty search
+    /// field ever gives; `AXIdentifier` is at least stable. Falling all the way
+    /// through to a linked title element follows the one hop some apps use to
+    /// put a label in a separate node.
+    ///
+    /// Public, and used by both the tree walk and any live re-read, because the
+    /// two must agree on what an element is *called*. When they did not — the
+    /// walk resolving a label the re-read never looked for — a target that had
+    /// not changed at all was reported as stale.
+    pub fn label(&self) -> Option<String> {
+        self.string(attr::TITLE)
+            .or_else(|| self.string(attr::DESCRIPTION))
+            .or_else(|| self.string(attr::PLACEHOLDER))
+            .or_else(|| self.string(attr::IDENTIFIER))
+            .or_else(|| {
+                self.element(attr::TITLE_UI_ELEMENT)
+                    .and_then(|t| t.string(attr::VALUE).or_else(|| t.string(attr::TITLE)))
+            })
+            .filter(|s| !s.trim().is_empty())
+    }
+
     /// Screen position of the element's top-left corner, in points, in the
     /// global (top-left origin) coordinate space AX reports.
     pub fn position(&self) -> Option<CGPoint> {
@@ -951,18 +976,7 @@ impl AxNode {
         // AXDescription is what VoiceOver reads; AXPlaceholderValue is the only
         // hint an empty search field ever gives. Falling all the way through to
         // AXRoleDescription ("button") is still better than an unlabeled node.
-        let label = el
-            .string(attr::TITLE)
-            .or_else(|| el.string(attr::DESCRIPTION))
-            .or_else(|| el.string(attr::PLACEHOLDER))
-            .or_else(|| el.string(attr::IDENTIFIER))
-            .or_else(|| {
-                // Some apps put the label in a *separate* element and only
-                // cross-reference it. Follow that one hop.
-                el.element(attr::TITLE_UI_ELEMENT)
-                    .and_then(|t| t.string(attr::VALUE).or_else(|| t.string(attr::TITLE)))
-            })
-            .filter(|s| !s.trim().is_empty());
+        let label = el.label();
 
         let value = el
             .value_string(attr::VALUE)

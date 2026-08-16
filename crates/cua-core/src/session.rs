@@ -975,6 +975,15 @@ fn live_tokens(el: &Element) -> HashSet<String> {
     let mut out = HashSet::new();
     push_token(el.string(cua_ax::attr::TITLE), &mut out);
     push_token(el.string(cua_ax::attr::VALUE), &mut out);
+    // Whatever the snapshot would have called this element, resolved the same
+    // way the walk resolves it. Without this the guard compares two different
+    // questions and refuses a target that has not changed at all: measured on
+    // TextEdit, whose document view publishes an empty `AXTitle` and is
+    // labelled "First Text View" further down the chain, so the snapshot held
+    // a token the live read could never produce and every click on it was
+    // rejected as stale. The child walk below already read `AXDescription`;
+    // the element itself read only title and value.
+    push_token(el.label(), &mut out);
     walk(el, 3, &mut out);
     out
 }
