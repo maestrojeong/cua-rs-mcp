@@ -290,6 +290,13 @@ pub struct Snapshot {
     /// snapshot is kept rather than dropped because a run of actions with
     /// `return_state: false` is exactly the flow that still needs its indices.
     acted_on: bool,
+    /// Transient UI this app had up when the walk was taken.
+    ///
+    /// Kept so an action that does not enumerate windows of its own still has
+    /// *something* to compare against, and can therefore say a menu appeared
+    /// rather than only that one is present. See [`TransientWindow::appeared`]
+    /// for what that claim is worth.
+    popups: Vec<TransientWindow>,
 }
 
 /// What the agent gets back from `get_app_state`.
@@ -313,9 +320,44 @@ pub struct AppState {
     /// safe to click blindly either.
     pub window_id: Option<u32>,
     pub screenshot: Option<Screenshot>,
+    /// Transient UI this app currently has up above its own content — an open
+    /// menu, a context menu, a popover — topmost first.
+    ///
+    /// Reported because the tree cannot report it. A walk describes one window,
+    /// and a pop-up is a *different* window that accessibility does not describe
+    /// at all (§10), so without this line an open menu is invisible in a read
+    /// that otherwise looks complete. Costs nothing: the window list this comes
+    /// from is the same one already enumerated to identify the window to
+    /// capture.
+    pub popups: Vec<TransientWindow>,
     /// Non-fatal problems worth telling the agent about, e.g. a missing screen
     /// recording grant when the tree itself came back fine.
     pub warnings: Vec<String>,
+}
+
+/// A window of the target app that sits above ordinary content: a menu, a
+/// context menu, a popover.
+///
+/// Deliberately carries geometry and nothing else. There is no label, no item
+/// list and no text, because there is nothing to read them from — see
+/// [`Inner::transient_popups`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransientWindow {
+    pub id: u32,
+    /// `NSWindow` level. 101 is `kCGPopUpMenuWindowLevel`, the level a menu
+    /// opened by a control lands on.
+    pub layer: i64,
+    /// Position and size in global points.
+    pub frame: CGRect,
+    /// Whether this window was absent the last time cua-rs looked at this app's
+    /// windows, and so appeared while the action was running.
+    ///
+    /// `None` means nobody looked before, which is a different claim from "it
+    /// was already there". The comparison point is the enumeration each action
+    /// makes to revalidate its target window immediately before posting, or
+    /// failing that the last `get_app_state` — so `Some(true)` means "not
+    /// present at that moment", not "nothing else could have opened it".
+    pub appeared: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +367,12 @@ pub struct Screenshot {
     pub height: u32,
     /// Pixels per point. See [`cua_capture::WindowShot::scale`].
     pub scale: f64,
+    /// The screen rect these pixels cover. Normally the window's own frame, and
+    /// larger than it when a pop-up was open — see
+    /// [`cua_capture::WindowShot::frame`].
+    pub frame: CGRect,
+    /// The requested window's own frame, for comparison with `frame`.
+    pub window_frame: CGRect,
 }
 
 /// Options for one `get_app_state` call.
@@ -711,6 +759,15 @@ pub struct ActionResult {
     pub target: String,
     /// True when the target's window changed in a way we could observe.
     pub ui_changed: Observed,
+    /// Transient UI the app has up now that the action has run, topmost first.
+    ///
+    /// In the action's own response, and that is the point. A menu opened by a
+    /// click lives in a window of its own that the click's target window knows
+    /// nothing about, so a caller that only reads the diff is told the control
+    /// did nothing — which is exactly what users reported about KakaoTalk's
+    /// hamburger, and exactly what was untrue. Telling them one round trip later
+    /// is too late: by then the caller has already concluded the click failed.
+    pub popups: Vec<TransientWindow>,
     /// Which mechanism carried the action.
     ///
     /// Present on every result, not just the interesting ones, so an agent never
@@ -775,19 +832,48 @@ pub struct PostActionState {
     pub node_count: usize,
 }
 
+/// What cua-rs knew about an app immediately *before* an action, so the settle
+/// afterwards has something to subtract.
+///
+/// The pop-up half is an `Option` on purpose. Enumerating windows costs p50
+/// ~28 ms with a couple of hundred of them live, and the budget for this feature
+/// is one new enumeration per action — the one after. So the before-set is only
+/// ever taken from a list the action was going to fetch anyway, and when there
+/// is no such list the honest answer is that nobody looked.
+#[derive(Debug, Clone, Default)]
+struct Watch {
+    fingerprint: Option<String>,
+    popups: Option<Vec<u32>>,
+}
+
+impl Watch {
+    /// Record the pop-ups visible in a window list the caller already had.
+    fn with_windows(mut self, windows: &[WindowInfo], pid: libc::pid_t) -> Self {
+        self.popups = Some(popup_ids(windows, pid));
+        self
+    }
+}
+
+/// What the settle after an action observed.
+struct Settled {
+    changed: Observed,
+    popups: Vec<TransientWindow>,
+}
+
 impl ActionResult {
     /// An action that went through the accessibility API, plus the screen point
     /// the overlay should point at (`None` when nothing could be resolved).
     fn ax_at(
         verb: impl Into<String>,
         target: String,
-        ui_changed: Observed,
+        settled: Settled,
         point: Option<(f64, f64)>,
     ) -> Self {
         Self {
             verb: verb.into(),
             target,
-            ui_changed,
+            ui_changed: settled.changed,
+            popups: settled.popups,
             delivery: Delivery::Ax,
             point,
             overlay_target: None,
@@ -1939,15 +2025,34 @@ impl Inner {
         // synthesis's quiet tier does use SkyLight SPI, but that lives in
         // cua-hid, not in this matching path.)
         let ax_frame = window_el.frame();
-        let window = match cua_capture::list_windows() {
-            Ok(list) => best_window_match(&list, info.pid, ax_frame),
+        // One enumeration, two answers. It costs p50 ~28 ms with a couple of
+        // hundred windows live, so the pop-up list is mined from the same call
+        // that identifies the window to capture rather than fetched again.
+        let (window, popups) = match cua_capture::list_windows() {
+            Ok(list) => (
+                best_window_match(&list, info.pid, ax_frame),
+                transient_popups(&list, info.pid, None),
+            ),
             Err(e) => {
                 // The tree is still useful without pixels, so this is a warning
                 // and not a failure.
                 warnings.push(e.to_string());
-                None
+                (None, Vec::new())
             }
         };
+        if !popups.is_empty() {
+            // Said out loud because the tree below cannot say it. A pop-up is a
+            // separate window with no accessibility representation, so a walk of
+            // the target window is complete and still describes none of what the
+            // user is actually looking at.
+            warnings.push(format!(
+                "this app has {} window(s) open above its content that the tree below does not \
+                 describe and accessibility cannot see into — see the `transient UI` section. A \
+                 menu item is reached with click_in_window against the pop-up's own window_id, or \
+                 more cheaply with press_key if it shows a keyboard shortcut",
+                popups.len()
+            ));
+        }
 
         let screenshot = match (opts.include_screenshot, &window) {
             (true, Some(w)) => match cua_capture::capture_window(w.id, opts.max_image_dim) {
@@ -1956,6 +2061,8 @@ impl Inner {
                     width: shot.width,
                     height: shot.height,
                     scale: shot.scale,
+                    frame: shot.frame,
+                    window_frame: shot.window_frame,
                 }),
                 Err(e) => {
                     warnings.push(capture_failure_warning(&e.to_string(), &nodes));
@@ -1987,10 +2094,12 @@ impl Inner {
                 limits: opts.limits,
                 complete,
                 acted_on: false,
+                popups: popups.clone(),
             },
         );
 
         Ok(AppState {
+            popups,
             app: info,
             snapshot_id: id,
             tree,
@@ -2302,7 +2411,7 @@ impl Inner {
         let count = mouse.count;
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         let expected = match &target {
             Target::Index { index, .. } => self
                 .snapshots
@@ -2380,7 +2489,7 @@ impl Inner {
         desc: String,
         mouse: MouseOptions,
         expected: Option<(usize, HashSet<String>)>,
-        before: Option<String>,
+        before: Watch,
     ) -> std::result::Result<ActionResult, PidFailure> {
         let count = mouse.count;
         // `AXActivationPoint` is the app's answer to "where is this element
@@ -2447,6 +2556,10 @@ impl Inner {
                 "could not revalidate the target window immediately before input: {e}"
             ))
         })?;
+        // Free: this list was fetched to check the window id, and it is also the
+        // sharpest possible answer to "what was already open before the click",
+        // taken microseconds before the event rather than at the last read.
+        let before = before.with_windows(&live_windows, info.pid);
         let live_window =
             current_window_for_pid_click(&live_windows, &snapshot_window, info.pid, x, y)
                 .map_err(PidFailure::Retryable)?;
@@ -2488,7 +2601,8 @@ impl Inner {
                 mouse.describe()
             ),
             target: desc,
-            ui_changed: changed,
+            ui_changed: changed.changed,
+            popups: changed.popups,
             delivery: Delivery::Pid,
             point: Some((x, y)),
             overlay_target: Some((wid, info.pid)),
@@ -2513,6 +2627,31 @@ impl Inner {
     /// "The point covers nothing" is exactly the shape of a typo, and clicking a
     /// typo blindly is the worst outcome available here, so the caller has to
     /// ask for this by name.
+    ///
+    /// # One case where this is the first choice, not the last
+    ///
+    /// Everything above describes a canvas, where accessibility publishes no
+    /// children and a coordinate is a concession. Transient UI is not that case,
+    /// and calling this a last resort there would be false advice.
+    ///
+    /// A pop-up menu — measured on KakaoTalk's chat-room hamburger — is a
+    /// window of the app's own process at level 101 that accessibility does not
+    /// describe *at all*: the application element has only its two `AXMenuBar`
+    /// children, and `AXUIElementCopyElementAtPosition` inside the menu's frame
+    /// returns the menu bar as a fallback. There is no element to find, no
+    /// better walk to make, and no AX verb to send. The window server can see
+    /// the menu, `screencapture` can photograph it, and a window-local
+    /// coordinate can reach it. That is the entire toolset, so this is the
+    /// primary path there rather than the desperate one.
+    ///
+    /// Two honest qualifications. First, it is still unverified in the same way:
+    /// the caller supplies the aim, and cua-rs confirms delivery and nothing
+    /// else. Second, it is not always the cheapest route in. Menu items usually
+    /// draw a keyboard shortcut next to them — ⌘I, ⌘Y, ⌥⌘, — and where one
+    /// exists, `press_key` addresses the app's own key handling instead of a
+    /// pixel, so it cannot land one row off. cua-rs does not read those
+    /// shortcuts out of the image and does not try to; deciding between the two
+    /// is the caller's, made from the screenshot.
     ///
     /// # Coordinates are window-local
     ///
@@ -2576,16 +2715,35 @@ impl Inner {
         // an element, the window id is the whole of the addressing, and an id
         // taken from anywhere else is an id whose contents the caller has never
         // seen.
+        //
+        // A pop-up satisfies it differently, and has to. Transient UI is not in
+        // any snapshot's tree — accessibility does not describe it — so
+        // "the window this app's last read was of" can never be the menu. What
+        // stands in for it is that the window is a live pop-up *of the same
+        // process the caller has read*: cua-rs reported that pop-up's id in the
+        // state and in the result of the action that opened it, which is the same
+        // evidence, arriving by the only route available.
+        //
+        // Re-enumerated once here rather than trusted from the snapshot, because
+        // a pid-addressed event carrying a stale window id is exactly the thing
+        // that must not be sent. p50 ~28 ms with a couple of hundred windows
+        // live; it is the only enumeration this path makes before the event.
+        let live_windows = cua_capture::list_windows()
+            .map_err(|e| refuse(format!("could not revalidate the window before input: {e}")))?;
         let snapshot_wid = self
             .snapshots
             .get(&info.pid)
             .and_then(|snap| snap.window.as_ref())
             .map(|w| w.id);
+        let is_live_popup = live_windows
+            .iter()
+            .any(|w| w.id == wid && w.pid == info.pid && w.is_transient_popup());
         match snapshot_wid {
             Some(seen) if seen == wid => {}
+            _ if is_live_popup && snapshot_wid.is_some() => {}
             Some(seen) => {
                 return Err(refuse(format!(
-                    "the last get_app_state of this app read window {seen}, not {wid}. Read the window you mean to click first"
+                    "the last get_app_state of this app read window {seen}, not {wid}, and {wid} is not a pop-up this app currently has open. Read the window you mean to click first"
                 )));
             }
             None => {
@@ -2596,11 +2754,8 @@ impl Inner {
         }
 
         // Gate 2: the window still exists, still belongs to this pid, and is
-        // still an ordinary window. Re-enumerated here rather than trusted from
-        // the snapshot, because a pid-addressed event carrying a stale window id
-        // is exactly the thing that must not be sent.
-        let live_windows = cua_capture::list_windows()
-            .map_err(|e| refuse(format!("could not revalidate the window before input: {e}")))?;
+        // either ordinary content or transient UI this app put up — never the
+        // desktop, the menu bar, cua-rs's own overlay or a 1x1 tracking window.
         let live_window =
             live_window_for_pid_click(&live_windows, wid, info.pid).map_err(refuse)?;
 
@@ -2617,7 +2772,7 @@ impl Inner {
             ))
         })?;
 
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid).with_windows(&live_windows, info.pid);
         let believes_frontmost = {
             let app_el = Element::for_pid(info.pid);
             move || app_el.bool("AXFrontmost").unwrap_or(false)
@@ -2638,16 +2793,23 @@ impl Inner {
         )
         .map_err(|e| refuse(e.to_string()))?;
 
+        let settled = self.changed_since(info.pid, before);
         Ok(ActionResult {
             verb: format!(
                 "SkyLight pid-routed {count}-click ({}) at window-local ({x:.0}, {y:.0})",
                 mouse.describe()
             ),
             target: format!(
-                "window {wid} of {} at no element — the caller aimed this",
-                info.name
+                "window {wid} of {}{} at no element — the caller aimed this",
+                info.name,
+                if is_live_popup {
+                    ", a pop-up accessibility cannot see into"
+                } else {
+                    ""
+                }
             ),
-            ui_changed: self.changed_since(info.pid, before),
+            ui_changed: settled.changed,
+            popups: settled.popups,
             delivery: Delivery::PidNoElement,
             point: Some((sx, sy)),
             overlay_target: Some((wid, info.pid)),
@@ -2659,7 +2821,7 @@ impl Inner {
     fn set_value(&mut self, query: &str, target: Target, value: &str) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         // `AXValue=` stays the whole mechanism, on purpose. This is the one
         // operation accessibility expresses better than events can: a single
         // write replaces the whole string atomically and is addressed at *this*
@@ -2689,7 +2851,7 @@ impl Inner {
         }
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         let write = el.append_text(text)?;
         let changed = self.changed_since(info.pid, before);
         // Name the mechanism, not just the intent. "typed" would imply
@@ -2730,7 +2892,7 @@ impl Inner {
         }
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
 
         if !cua_hid::skylight_available() {
             return Err(CoreError::PidKeyUnavailable {
@@ -2759,7 +2921,8 @@ impl Inner {
                 text.chars().count()
             ),
             target: desc,
-            ui_changed: changed,
+            ui_changed: changed.changed,
+            popups: changed.popups,
             delivery: Delivery::PidKey,
             point: element_point(&el),
             overlay_target: self.overlay_target(info.pid),
@@ -2844,8 +3007,12 @@ impl Inner {
             ),
             desc,
             // Selection changes no window state the fingerprint can see, so
-            // there is nothing to observe here either way.
-            Observed::Unknown,
+            // there is nothing to observe here either way — and no reason to
+            // spend an enumeration finding out that no menu opened.
+            Settled {
+                changed: Observed::Unknown,
+                popups: Vec::new(),
+            },
             element_point(&el),
         )
         .with_overlay_target(self.overlay_target(info.pid)))
@@ -2877,7 +3044,7 @@ impl Inner {
 
             cua_ax::require_trusted()?;
             let (info, el, desc) = self.resolve(query, &target)?;
-            let before = self.window_fingerprint(info.pid);
+            let before = self.watch(info.pid);
 
             if !cua_hid::skylight_available() {
                 return Err(CoreError::PidKeyUnavailable {
@@ -2900,7 +3067,8 @@ impl Inner {
             return Ok(ActionResult {
                 verb: format!("pid-routed key `{key}`"),
                 target: desc,
-                ui_changed: changed,
+                ui_changed: changed.changed,
+                popups: changed.popups,
                 delivery: Delivery::PidKey,
                 point: element_point(&el),
                 overlay_target: self.overlay_target(info.pid),
@@ -2920,7 +3088,7 @@ impl Inner {
 
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
 
         let available = el.actions();
         if !available.iter().any(|a| a == ax_verb) {
@@ -2959,7 +3127,7 @@ impl Inner {
                 name: format!("{action} (this element supports {available:?})"),
             }));
         }
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         el.perform(action)?;
         let changed = self.changed_since(info.pid, before);
         Ok(
@@ -3077,7 +3245,7 @@ impl Inner {
 
         match scroll_tier(amount, advertises) {
             ScrollTier::Ax => {
-                let before = self.window_fingerprint(info.pid);
+                let before = self.watch(info.pid);
                 let ScrollAmount::Pages(pages) = amount else {
                     unreachable!("scroll_tier only chooses Ax for a page request")
                 };
@@ -3134,7 +3302,7 @@ impl Inner {
             }
         };
         let (delta_y, delta_x) = dir.wheel_delta(points);
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         let believes_frontmost = {
             let app_el = Element::for_pid(info.pid);
             move || app_el.bool("AXFrontmost").unwrap_or(false)
@@ -3166,7 +3334,8 @@ impl Inner {
                 }
             ),
             target: desc,
-            ui_changed: changed,
+            ui_changed: changed.changed,
+            popups: changed.popups,
             delivery: Delivery::Pid,
             point: Some((x, y)),
             overlay_target: Some((live.id, info.pid)),
@@ -3241,7 +3410,7 @@ impl Inner {
             )));
         }
 
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         let believes_frontmost = {
             let app_el = Element::for_pid(info.pid);
             move || app_el.bool("AXFrontmost").unwrap_or(false)
@@ -3276,7 +3445,8 @@ impl Inner {
                 destination.point.1,
             ),
             target: format!("{} → {}", origin.desc, destination.desc),
-            ui_changed: changed,
+            ui_changed: changed.changed,
+            popups: changed.popups,
             delivery: if verified {
                 Delivery::Pid
             } else {
@@ -3331,7 +3501,7 @@ impl Inner {
             .aim(query, &info, &live, &at, snapshot_id)
             .map_err(&refuse)?;
 
-        let before = self.window_fingerprint(info.pid);
+        let before = self.watch(info.pid);
         let believes_frontmost = {
             let app_el = Element::for_pid(info.pid);
             move || app_el.bool("AXFrontmost").unwrap_or(false)
@@ -3355,7 +3525,8 @@ impl Inner {
                 aim.point.0, aim.point.1
             ),
             target: aim.desc,
-            ui_changed: changed,
+            ui_changed: changed.changed,
+            popups: changed.popups,
             delivery: if aim.from_element {
                 Delivery::Pid
             } else {
@@ -3502,6 +3673,21 @@ impl Inner {
         self.focus_probe(pid).fingerprint
     }
 
+    /// The state an action will be measured against.
+    ///
+    /// The pop-up set is seeded from the last `get_app_state`, which is free —
+    /// that read already enumerated windows. Paths that re-enumerate just before
+    /// posting overwrite it with something fresher via [`Watch::with_windows`].
+    fn watch(&self, pid: libc::pid_t) -> Watch {
+        Watch {
+            fingerprint: self.window_fingerprint(pid),
+            popups: self
+                .snapshots
+                .get(&pid)
+                .map(|snap| snap.popups.iter().map(|p| p.id).collect()),
+        }
+    }
+
     /// One read of the app's focus state, serving both the `ui_changed`
     /// fingerprint and the focus check.
     ///
@@ -3564,19 +3750,102 @@ impl Inner {
         }
     }
 
-    fn changed_since(&self, pid: libc::pid_t, before: Option<String>) -> Observed {
+    /// Wait for the app to settle, then say what moved.
+    ///
+    /// Two observations, not one. The fingerprint answers "did the window this
+    /// action addressed change", and the window list answers "did the app put
+    /// something new on screen that is not in that window at all" — which is the
+    /// question the fingerprint has never been able to answer, because a menu
+    /// opening changes neither the focused element nor the window title.
+    ///
+    /// The enumeration is deliberately after the settle rather than immediately
+    /// after the event: KakaoTalk's menu window appeared ~50 ms after the click,
+    /// so an enumeration racing the event would have missed it and reported the
+    /// same "nothing happened" this is here to stop. It costs p50 ~28 ms on top
+    /// of the 120 ms, and it is the only window enumeration this adds per
+    /// action.
+    fn changed_since(&self, pid: libc::pid_t, before: Watch) -> Settled {
         // A short settle window: AX reflects most changes within a frame or two,
         // and waiting longer would add latency to every single action.
         std::thread::sleep(std::time::Duration::from_millis(120));
         let after = self.window_fingerprint(pid);
-        match (before, after) {
+        let focus_verdict = match (before.fingerprint, after) {
             // Either end unreadable and the comparison is meaningless. Say so
             // instead of picking the answer that happens to be shorter.
             (None, _) | (_, None) => Observed::Unknown,
             (Some(a), Some(b)) if a == b => Observed::Unchanged,
             _ => Observed::Changed,
+        };
+
+        let windows = cua_capture::list_windows().unwrap_or_default();
+        let popups = transient_popups(&windows, pid, before.popups.as_deref());
+        // A window appearing or vanishing above the app's content is an
+        // observable change by itself, whatever the fingerprint says. Both
+        // directions count: a menu that closed is as much of an event as one
+        // that opened, and reporting only the first would make `escape` look
+        // like a no-op.
+        let popups_moved = match &before.popups {
+            Some(ids) => {
+                let now: Vec<u32> = popups.iter().map(|p| p.id).collect();
+                let mut before_ids = ids.clone();
+                before_ids.sort_unstable();
+                let mut now = now;
+                now.sort_unstable();
+                before_ids != now
+            }
+            None => false,
+        };
+
+        Settled {
+            changed: if popups_moved {
+                Observed::Changed
+            } else {
+                focus_verdict
+            },
+            popups,
         }
     }
+}
+
+/// Window ids of the transient UI one process currently has up.
+fn popup_ids(windows: &[WindowInfo], pid: libc::pid_t) -> Vec<u32> {
+    windows
+        .iter()
+        .filter(|w| w.pid == pid && w.is_transient_popup())
+        .map(|w| w.id)
+        .collect()
+}
+
+/// The transient UI one process currently has up, topmost first.
+///
+/// Ordering is the whole reason this is a function and not a filter written
+/// inline. A caller looking at a stack of menus — a submenu over its parent —
+/// has to know which one is in front, because that is the one a coordinate will
+/// reach; so they are sorted by level and then by window number, newest first,
+/// which is the order the window server stacks them in. The first entry is the
+/// one on top.
+///
+/// `before` is the set of ids seen the last time anyone looked, used only to
+/// fill in [`TransientWindow::appeared`].
+fn transient_popups(
+    windows: &[WindowInfo],
+    pid: libc::pid_t,
+    before: Option<&[u32]>,
+) -> Vec<TransientWindow> {
+    let mut popups: Vec<&WindowInfo> = windows
+        .iter()
+        .filter(|w| w.pid == pid && w.is_transient_popup())
+        .collect();
+    popups.sort_by(|a, b| b.layer.cmp(&a.layer).then_with(|| b.id.cmp(&a.id)));
+    popups
+        .into_iter()
+        .map(|w| TransientWindow {
+            id: w.id,
+            layer: w.layer,
+            frame: w.frame,
+            appeared: before.map(|ids| !ids.contains(&w.id)),
+        })
+        .collect()
 }
 
 /// The AX verb that expresses a key, when one exists.
@@ -3725,6 +3994,11 @@ fn best_window_match(
     pid: libc::pid_t,
     ax_frame: Option<CGRect>,
 ) -> Option<WindowInfo> {
+    // `is_plausible_target`, deliberately, and never the wider
+    // `is_addressable_target`: this chooses the window a snapshot is *of*, and a
+    // pop-up must not be choosable here. Matching a menu to the AX window's
+    // frame would stamp the menu's number onto clicks meant for content, which
+    // is the failure §6 records. A caller reaches a pop-up by naming it.
     let mut candidates: Vec<&WindowInfo> = windows
         .iter()
         .filter(|w| w.pid == pid && w.is_plausible_target())
@@ -3805,8 +4079,15 @@ fn current_window_for_pid_click(
 /// arrive window-local, so the origin this returns is what turns them into a
 /// point to check. The identity rules are the same either way — matching by id
 /// *and* pid rejects both a closed window and a recycled CGWindowID, and
-/// `is_plausible_target` keeps the event off the menu bar and other system
-/// layers.
+/// `is_addressable_target` keeps the event off the desktop, the menu bar,
+/// cua-rs's own overlay and anything too small to hold a control.
+///
+/// That predicate is the wide one on purpose. It used to be
+/// `is_plausible_target`, which caps at level 3, and the consequence was that a
+/// pop-up menu's window number could never be stamped on an event — so the one
+/// kind of UI accessibility cannot describe was also the one kind cua-rs could
+/// not click. Widening it here and nowhere else keeps a menu addressable
+/// without making it selectable as a snapshot's window.
 fn live_window_for_pid_click(
     windows: &[WindowInfo],
     wid: u32,
@@ -3814,7 +4095,7 @@ fn live_window_for_pid_click(
 ) -> std::result::Result<WindowInfo, String> {
     windows
         .iter()
-        .find(|w| w.id == wid && w.pid == pid && w.is_plausible_target())
+        .find(|w| w.id == wid && w.pid == pid && w.is_addressable_target())
         .cloned()
         .ok_or_else(|| {
             format!(
@@ -4003,6 +4284,7 @@ mod tests {
             limits,
             complete,
             acted_on,
+            popups: Vec::new(),
         }
     }
 
@@ -4441,6 +4723,7 @@ mod tests {
                 scoped: false,
                 acted_on: false,
                 taken_at: Instant::now(),
+                popups: Vec::new(),
             },
         );
 
@@ -4729,5 +5012,117 @@ mod tests {
         let mut overlay = win(1, 7, 0.0, 0.0, 800.0, 600.0);
         overlay.layer = 25;
         assert!(best_window_match(&[overlay], 7, None).is_none());
+    }
+
+    /// The measured KakaoTalk arrangement: a chat window with its hamburger
+    /// menu open, plus the app's main window and cua-rs's own overlay.
+    fn kakao_windows() -> Vec<WindowInfo> {
+        let chat = win(43899, 34667, 46.0, 86.0, 924.0, 770.0);
+        let main = win(42510, 34667, 273.0, 33.0, 599.0, 771.0);
+        let menu = WindowInfo {
+            layer: 101,
+            ..win(44501, 34667, 938.0, 599.0, 202.0, 318.0)
+        };
+        let overlay = WindowInfo {
+            layer: 25,
+            ..win(50000, 34667, 0.0, 0.0, 400.0, 400.0)
+        };
+        let other_app_menu = WindowInfo {
+            layer: 101,
+            ..win(60000, 999, 10.0, 10.0, 300.0, 300.0)
+        };
+        vec![chat, main, menu, overlay, other_app_menu]
+    }
+
+    #[test]
+    fn an_open_menu_is_reported_and_the_ordinary_windows_are_not() {
+        let popups = transient_popups(&kakao_windows(), 34667, None);
+        assert_eq!(popups.len(), 1, "got {popups:?}");
+        assert_eq!(popups[0].id, 44501);
+        assert_eq!(popups[0].layer, 101);
+        assert_eq!(popups[0].frame.size.width, 202.0);
+        assert_eq!(
+            popups[0].appeared, None,
+            "with nothing to compare against, whether it just opened is unknown, \
+             not false"
+        );
+    }
+
+    #[test]
+    fn the_menu_does_not_become_the_window_the_snapshot_is_of() {
+        // The whole reason the widened rule is a second predicate. The chat
+        // window's AX frame must still pick the chat window with a menu open.
+        let matched = best_window_match(
+            &kakao_windows(),
+            34667,
+            Some(rect(46.0, 86.0, 924.0, 770.0)),
+        )
+        .expect("a window");
+        assert_eq!(matched.id, 43899);
+    }
+
+    #[test]
+    fn a_menu_opened_by_the_action_is_marked_as_appeared() {
+        let before = [42510_u32];
+        let popups = transient_popups(&kakao_windows(), 34667, Some(&before));
+        assert_eq!(popups[0].appeared, Some(true));
+
+        let before = [44501_u32];
+        let popups = transient_popups(&kakao_windows(), 34667, Some(&before));
+        assert_eq!(
+            popups[0].appeared,
+            Some(false),
+            "a menu that was already up was not opened by this action"
+        );
+    }
+
+    #[test]
+    fn stacked_popups_are_reported_topmost_first() {
+        let mut windows = kakao_windows();
+        // A submenu: same level, opened later, therefore in front.
+        windows.push(WindowInfo {
+            layer: 101,
+            ..win(44900, 34667, 1100.0, 640.0, 180.0, 200.0)
+        });
+        // And a higher-level sheet above both.
+        windows.push(WindowInfo {
+            layer: 200,
+            ..win(44100, 34667, 400.0, 400.0, 300.0, 300.0)
+        });
+        let ids: Vec<u32> = transient_popups(&windows, 34667, None)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![44100, 44900, 44501],
+            "level first, then window number newest-first: the head of the list is \
+             the one a coordinate will reach"
+        );
+    }
+
+    #[test]
+    fn a_popup_may_be_stamped_on_an_event_but_the_overlay_and_desktop_may_not() {
+        let windows = kakao_windows();
+        assert_eq!(
+            live_window_for_pid_click(&windows, 44501, 34667)
+                .expect("the menu is addressable")
+                .id,
+            44501
+        );
+        assert!(
+            live_window_for_pid_click(&windows, 50000, 34667).is_err(),
+            "cua-rs must never route a click into its own overlay"
+        );
+        assert!(
+            live_window_for_pid_click(&windows, 44501, 999).is_err(),
+            "another process's menu is not this app's to click"
+        );
+
+        let desktop = WindowInfo {
+            layer: -2147483623,
+            ..win(70000, 34667, 0.0, 0.0, 1512.0, 982.0)
+        };
+        assert!(live_window_for_pid_click(&[desktop], 70000, 34667).is_err());
     }
 }

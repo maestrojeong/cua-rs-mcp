@@ -28,7 +28,8 @@ pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,
     Mechanism, MouseOptions, Observed, Permissions, PointerLocation, PostActionState, Presence,
-    Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, WaitOutcome, WindowPixel,
+    Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome,
+    WindowPixel,
 };
 
 /// Re-exported so a caller can name a mouse button or a modifier set without
