@@ -400,6 +400,66 @@ fn a_hover_with_no_destination_says_what_is_missing() {
 }
 
 #[test]
+fn every_coordinate_addressed_action_can_cite_the_snapshot_it_was_read_from() {
+    // `element_token` guards a stale INDEX. A stale COORDINATE has no such
+    // guard available — the pixel still exists on the new frame, it is just
+    // covering something else — so the generation number is the only thing
+    // that can catch it, and every tool that accepts a raw point has to accept
+    // one. `click_in_window`, `drag` and `hover` are all coordinate-first.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    for name in ["click", "click_in_window", "drag", "hover"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert!(
+            !tool["inputSchema"]["properties"]["snapshot_id"].is_null(),
+            "{name} takes a coordinate, so it must accept snapshot_id"
+        );
+    }
+}
+
+#[test]
+fn no_action_tool_is_fire_and_forget() {
+    // Every action reports what it did — the verb, what it hit, how it was
+    // delivered, and (by default) a diff of the window afterwards. A tool that
+    // returned nothing would push the caller back onto a blind retry loop, so
+    // the field that carries the post-action read has to be on all of them.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    for name in [
+        "click",
+        "click_in_window",
+        "drag",
+        "hover",
+        "scroll",
+        "set_value",
+        "type_text",
+        "select_text",
+        "press_key",
+        "perform_secondary_action",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert!(
+            !tool["inputSchema"]["properties"]["return_state"].is_null(),
+            "{name} must offer the post-action read"
+        );
+    }
+}
+
+#[test]
 fn instructions_tell_the_client_to_read_before_acting() {
     // The one invariant of this server. If the instructions stop saying it,
     // agents start calling click first and getting NoSnapshot errors.

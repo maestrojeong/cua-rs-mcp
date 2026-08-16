@@ -146,6 +146,25 @@ pub enum CoreError {
     #[error("an action has run on `{app}` since its last read, so the coordinates in this call would be resolved against stale geometry. Call get_app_state again, or address the element by element_index, which survives an action because it names the element rather than the place")]
     StalePointGeometry { app: String },
 
+    /// A raw coordinate cited a snapshot that is no longer the current one.
+    ///
+    /// The coordinate counterpart to [`CoreError::StaleSnapshot`], and needed
+    /// for the same reason with a sharper edge. An index at least names an
+    /// element, so a mismatch can sometimes be caught by the role or the text
+    /// it used to show. A pixel names a *place*, and every place still exists
+    /// after the window re-renders — it is simply covering something else now.
+    /// There is nothing about a stale point that looks wrong, which is exactly
+    /// why it has to be refused on the generation number rather than on
+    /// inspection.
+    #[error("({x:.0}, {y:.0}) was chosen from snapshot {given} of `{app}`, but its current snapshot is {current}. A coordinate is only meaningful against the window state it was read from, and nothing about a stale point looks wrong — call get_app_state again and re-pick the point from the fresh screenshot")]
+    StaleCoordinate {
+        app: String,
+        given: u64,
+        current: u64,
+        x: f64,
+        y: f64,
+    },
+
     /// A coordinate landed on nothing in the app's current snapshot.
     #[error("no element of `{app}` covers ({x}, {y}) in its current snapshot. Coordinates are resolved against the snapshot's geometry, so the point has to be inside the window get_app_state read; call it again and click the element_index you want")]
     NoElementAtPoint { app: String, x: f32, y: f32 },
@@ -487,7 +506,17 @@ pub enum Target {
     },
     /// By screen point, in AX global points. Hit-tested to an element, then
     /// acted on through AX — never by moving the pointer.
-    Point { x: f32, y: f32 },
+    Point {
+        x: f32,
+        y: f32,
+        /// The snapshot this point was chosen from, when the caller says.
+        ///
+        /// Honoured exactly as [`Target::Index`]'s is, and it was an omission
+        /// that it once was not: a caller could pass `snapshot_id` alongside
+        /// `x`/`y` and have it silently ignored, which is worse than not
+        /// offering the field at all — the guard reads as present and is not.
+        snapshot_id: Option<u64>,
+    },
 }
 
 /// The button and modifier keys a pointer action carries.
@@ -586,6 +615,28 @@ pub enum PointerLocation {
     /// `click_in_window` takes, and re-anchored to the window's live origin at
     /// delivery time for the same reason.
     WindowPoint { x: f64, y: f64 },
+}
+
+/// A pixel in a window the caller has read, together with the snapshot
+/// generation it was read from.
+///
+/// The four travel as one value because they are one claim: "I looked at this
+/// window in this state and chose this pixel." Splitting them across four
+/// parameters is how the snapshot half came to be omitted from `click_in_window`
+/// in the first place — the window id looked like enough addressing, and it is
+/// only enough to name the window, not the state.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowPixel {
+    /// The `window_id` this app's most recent `get_app_state` reported.
+    pub window_id: u32,
+    /// Horizontal offset from the window's top-left corner, in points.
+    pub x: f64,
+    /// Vertical offset from the window's top-left corner, in points.
+    pub y: f64,
+    /// The snapshot the pixel was chosen from, when the caller says. Optional
+    /// for the same reason every other staleness guard here is: the common
+    /// flow reads and acts in one turn.
+    pub snapshot_id: Option<u64>,
 }
 
 /// A pointer location resolved against a live window.
@@ -1165,12 +1216,13 @@ impl Cua {
         from: PointerLocation,
         to: PointerLocation,
         mouse: MouseOptions,
+        snapshot_id: Option<u64>,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
             inner.acting(&app, return_state, |i| {
-                i.drag(&app, from.clone(), to.clone(), mouse)
+                i.drag(&app, from.clone(), to.clone(), mouse, snapshot_id)
             })
         })
     }
@@ -1184,11 +1236,14 @@ impl Cua {
         app: &str,
         at: PointerLocation,
         modifiers: Modifiers,
+        snapshot_id: Option<u64>,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| i.hover(&app, at.clone(), modifiers))
+            inner.acting(&app, return_state, |i| {
+                i.hover(&app, at.clone(), modifiers, snapshot_id)
+            })
         })
     }
 
@@ -1202,17 +1257,13 @@ impl Cua {
     pub fn click_in_window(
         &self,
         app: &str,
-        window_id: u32,
-        x: f64,
-        y: f64,
+        at: WindowPixel,
         mouse: MouseOptions,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| {
-                i.click_in_window(&app, window_id, x, y, mouse)
-            })
+            inner.acting(&app, return_state, |i| i.click_in_window(&app, at, mouse))
         })
     }
 
@@ -1707,7 +1758,7 @@ impl Inner {
             // unrelated "the AX element and window snapshot drifted apart".
             // The snapshot already carries each element's frame, so the
             // hit-test needs no help from AX.
-            Target::Point { x, y } => {
+            Target::Point { x, y, snapshot_id } => {
                 let snap = self
                     .snapshots
                     .get(&info.pid)
@@ -1719,6 +1770,22 @@ impl Inner {
                     return Err(CoreError::ProcessReplaced {
                         app: info.name.clone(),
                     });
+                }
+
+                // Same opt-in generation guard `Target::Index` gets, and more
+                // load-bearing here: a stale index can be caught by the role
+                // or the text it used to carry, while a stale pixel looks
+                // exactly like a fresh one.
+                if let Some(given) = snapshot_id {
+                    if given != snap.id {
+                        return Err(CoreError::StaleCoordinate {
+                            app: info.name.clone(),
+                            given,
+                            current: snap.id,
+                            x: f64::from(x),
+                            y: f64::from(y),
+                        });
+                    }
                 }
 
                 // A coordinate is only meaningful against current geometry. An
@@ -2123,14 +2190,19 @@ impl Inner {
     fn click_in_window(
         &mut self,
         query: &str,
-        wid: u32,
-        x: f64,
-        y: f64,
+        at: WindowPixel,
         mouse: MouseOptions,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
+        let WindowPixel {
+            window_id: wid,
+            x,
+            y,
+            snapshot_id,
+        } = at;
         let count = mouse.count;
         let info = apps::resolve_app(query)?;
+        self.check_coordinate_generation(&info, snapshot_id, (x, y))?;
         let refuse = |reason: String| CoreError::WindowClickRefused {
             app: info.name.clone(),
             wid,
@@ -2672,6 +2744,7 @@ impl Inner {
         from: PointerLocation,
         to: PointerLocation,
         mouse: MouseOptions,
+        snapshot_id: Option<u64>,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
         let info = apps::resolve_app(query)?;
@@ -2689,8 +2762,12 @@ impl Inner {
             ));
         }
         let live = self.live_snapshot_window(&info).map_err(&refuse)?;
-        let origin = self.aim(query, &live, &from).map_err(&refuse)?;
-        let destination = self.aim(query, &live, &to).map_err(&refuse)?;
+        let origin = self
+            .aim(query, &info, &live, &from, snapshot_id)
+            .map_err(&refuse)?;
+        let destination = self
+            .aim(query, &info, &live, &to, snapshot_id)
+            .map_err(&refuse)?;
 
         // A drag onto its own origin is a click with extra steps, and almost
         // always a caller that resolved both ends to the same element by
@@ -2771,6 +2848,7 @@ impl Inner {
         query: &str,
         at: PointerLocation,
         modifiers: Modifiers,
+        snapshot_id: Option<u64>,
     ) -> Result<ActionResult> {
         cua_ax::require_trusted()?;
         let info = apps::resolve_app(query)?;
@@ -2785,7 +2863,9 @@ impl Inner {
             ));
         }
         let live = self.live_snapshot_window(&info).map_err(&refuse)?;
-        let aim = self.aim(query, &live, &at).map_err(&refuse)?;
+        let aim = self
+            .aim(query, &info, &live, &at, snapshot_id)
+            .map_err(&refuse)?;
 
         let before = self.window_fingerprint(info.pid);
         let believes_frontmost = {
@@ -2823,6 +2903,50 @@ impl Inner {
         })
     }
 
+    /// Refuse a window-local coordinate that was chosen from a snapshot this
+    /// app has since replaced.
+    ///
+    /// The window id already proves the caller is aiming at a window it has
+    /// *seen*; it does not prove the caller is aiming at the state it saw. A
+    /// window id outlives any number of re-reads, so without this a point
+    /// picked off screenshot 3 is accepted verbatim against the window as it
+    /// looks at snapshot 9 — same window, different contents, and a pixel that
+    /// now covers something else entirely. The snapshot id is the generation
+    /// number that distinguishes the two, and it is the same one
+    /// `element_token` pins an index with.
+    ///
+    /// Opt-in, for the same reason the index guard is: the common flow is
+    /// read-then-act inside one turn, and requiring the id would add a failure
+    /// mode where there is no risk. A caller that intends to act on a
+    /// coordinate it decided earlier is exactly the caller who should pass it.
+    fn check_coordinate_generation(
+        &self,
+        info: &AppInfo,
+        given: Option<u64>,
+        at: (f64, f64),
+    ) -> Result<()> {
+        let Some(given) = given else {
+            return Ok(());
+        };
+        let current = self
+            .snapshots
+            .get(&info.pid)
+            .ok_or_else(|| CoreError::NoSnapshot {
+                app: info.name.clone(),
+            })?
+            .id;
+        if given != current {
+            return Err(CoreError::StaleCoordinate {
+                app: info.name.clone(),
+                given,
+                current,
+                x: at.0,
+                y: at.1,
+            });
+        }
+        Ok(())
+    }
+
     /// The one live window a pointer gesture may be pinned to: the window this
     /// app's most recent `get_app_state` read, re-enumerated now.
     ///
@@ -2848,8 +2972,10 @@ impl Inner {
     fn aim(
         &self,
         query: &str,
+        info: &AppInfo,
         live: &WindowInfo,
         loc: &PointerLocation,
+        snapshot_id: Option<u64>,
     ) -> std::result::Result<PointerAim, String> {
         let (point, desc, from_element) = match loc {
             PointerLocation::Element(target) => {
@@ -2860,6 +2986,10 @@ impl Inner {
                 (point, desc, true)
             }
             PointerLocation::WindowPoint { x, y } => {
+                // The element form gets this check inside `resolve`; the raw
+                // form has no element to hang it on, so it happens here.
+                self.check_coordinate_generation(info, snapshot_id, (*x, *y))
+                    .map_err(|e| e.to_string())?;
                 if *x < 0.0 || *y < 0.0 {
                     return Err(format!(
                         "window-local coordinates are measured from the window's top-left corner, so neither of ({x:.0}, {y:.0}) can be negative"
@@ -3247,7 +3377,9 @@ fn hit_test(nodes: &[AxNode], x: f32, y: f32) -> Option<&AxNode> {
 fn describe_location(loc: &PointerLocation) -> String {
     match loc {
         PointerLocation::Element(Target::Index { index, .. }) => format!("element {index}"),
-        PointerLocation::Element(Target::Point { x, y }) => format!("the element at ({x}, {y})"),
+        PointerLocation::Element(Target::Point { x, y, .. }) => {
+            format!("the element at ({x}, {y})")
+        }
         PointerLocation::WindowPoint { x, y } => format!("window-local ({x:.0}, {y:.0})"),
     }
 }
@@ -3752,6 +3884,85 @@ mod tests {
         assert_eq!(
             describe_location(&PointerLocation::WindowPoint { x: 40.4, y: 12.0 }),
             "window-local (40, 12)"
+        );
+    }
+
+    #[test]
+    fn a_stale_coordinate_is_refused_on_the_generation_number() {
+        // The whole argument for this guard: nothing about a stale pixel looks
+        // wrong. It still lands inside the window, it still names a real
+        // place, and the place is simply covering something else now — so the
+        // only thing that can catch it is the generation it cites.
+        let cua = Cua::new();
+        // No grants and no snapshot, so this can only get as far as the
+        // pre-flight checks; that is exactly the layer under test.
+        let stale = cua.click_in_window(
+            "cua-rs-no-such-app-for-tests",
+            WindowPixel {
+                window_id: 1,
+                x: 10.0,
+                y: 10.0,
+                snapshot_id: Some(3),
+            },
+            MouseOptions::default(),
+            false,
+        );
+        assert!(stale.is_err(), "an unresolvable app cannot succeed");
+    }
+
+    #[test]
+    fn the_coordinate_guard_passes_when_the_generation_matches_and_fails_when_it_does_not() {
+        let mut inner = Inner::default();
+        let info = AppInfo {
+            name: "Test".into(),
+            bundle_id: None,
+            pid: 4242,
+            active: false,
+            regular: true,
+        };
+        inner.snapshots.insert(
+            info.pid,
+            Snapshot {
+                id: 7,
+                nodes: Vec::new(),
+                window: None,
+                process_key: ProcessKey::for_pid(info.pid),
+                limits: Limits::default(),
+                complete: true,
+                scoped: false,
+                acted_on: false,
+                taken_at: Instant::now(),
+            },
+        );
+
+        // Not citing a generation is allowed: the common flow reads and acts in
+        // one turn, and requiring the id would add a failure mode where there
+        // is no risk.
+        assert!(inner
+            .check_coordinate_generation(&info, None, (10.0, 10.0))
+            .is_ok());
+        assert!(inner
+            .check_coordinate_generation(&info, Some(7), (10.0, 10.0))
+            .is_ok());
+
+        let err = inner
+            .check_coordinate_generation(&info, Some(3), (10.0, 10.0))
+            .unwrap_err();
+        match err {
+            CoreError::StaleCoordinate { given, current, .. } => {
+                assert_eq!((given, current), (3, 7));
+            }
+            other => panic!("expected StaleCoordinate, got {other}"),
+        }
+        // The message has to say what to do, not just that something is wrong.
+        let text = inner
+            .check_coordinate_generation(&info, Some(3), (10.0, 10.0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("get_app_state")
+                && text.contains("nothing about a stale point looks wrong"),
+            "must explain why a coordinate needs this guard at all: {text}"
         );
     }
 

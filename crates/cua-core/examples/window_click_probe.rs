@@ -60,7 +60,17 @@ fn main() {
         ),
         ("a negative offset", wid, -5.0, y),
     ] {
-        match cua.click_in_window(&app, id, px, py, cua_core::MouseOptions::default(), false) {
+        match cua.click_in_window(
+            &app,
+            cua_core::WindowPixel {
+                window_id: id,
+                x: px,
+                y: py,
+                snapshot_id: None,
+            },
+            cua_core::MouseOptions::default(),
+            false,
+        ) {
             Ok(_) => println!("REFUSAL MISSING: {label} was accepted"),
             Err(e) => println!("refused {label}: {e}"),
         }
@@ -71,7 +81,17 @@ fn main() {
         frame.origin.x + x,
         frame.origin.y + y
     );
-    match cua.click_in_window(&app, wid, x, y, cua_core::MouseOptions::default(), true) {
+    match cua.click_in_window(
+        &app,
+        cua_core::WindowPixel {
+            window_id: wid,
+            x,
+            y,
+            snapshot_id: None,
+        },
+        cua_core::MouseOptions::default(),
+        true,
+    ) {
         Ok(r) => {
             println!("{} on {}", r.verb, r.target);
             println!("delivery: {}", r.delivery.as_str());

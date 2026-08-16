@@ -109,6 +109,9 @@ struct ActionArgs {
     /// Resolved to whichever element of the latest `get_app_state` snapshot
     /// covers the point, so a snapshot has to exist and the point has to be
     /// inside it. A point that covers nothing is an error, never a guess.
+    /// `snapshot_id` applies here too, and is worth passing: a stale index can
+    /// be caught by the role it used to have, while a stale coordinate looks
+    /// exactly like a fresh one.
     #[serde(default)]
     x: Option<f32>,
     /// Screen y, in points.
@@ -194,7 +197,11 @@ impl ActionArgs {
             });
         }
         match (self.x, self.y) {
-            (Some(x), Some(y)) => Ok(Target::Point { x, y }),
+            (Some(x), Some(y)) => Ok(Target::Point {
+                x,
+                y,
+                snapshot_id: self.snapshot_id,
+            }),
             _ => Err("pass element_token (preferred), element_index, or both x and y".to_string()),
         }
     }
@@ -352,7 +359,11 @@ struct DragArgs {
     #[serde(flatten)]
     mouse: MouseArgs,
     /// Pass the `snapshot_id` from get_app_state to make the call fail loudly
-    /// if the UI has been re-snapshotted since. Applies to both ends.
+    /// if the UI has been re-snapshotted since. Applies to both ends,
+    /// element-addressed and coordinate-addressed alike — and it is the only
+    /// guard a raw `window_x`/`window_y` end has, because a pixel picked off an
+    /// old screenshot still exists on the new one, just covering something
+    /// else.
     #[serde(default)]
     snapshot_id: Option<u64>,
     /// Re-read the window afterwards and report what changed. On by default.
@@ -394,7 +405,8 @@ struct HoverArgs {
     #[serde(default)]
     modifiers: Option<String>,
     /// Pass the `snapshot_id` from get_app_state to make the call fail loudly
-    /// if the UI has been re-snapshotted since.
+    /// if the UI has been re-snapshotted since. The only guard a raw
+    /// `window_x`/`window_y` destination has.
     #[serde(default)]
     snapshot_id: Option<u64>,
     /// Re-read the window afterwards and report what changed. Leave this on:
@@ -424,6 +436,14 @@ struct ClickInWindowArgs {
     /// Vertical offset in POINTS from the window's top-left corner, measured
     /// downward. Same scale conversion as `x`.
     y: f64,
+    /// The `snapshot_id` this coordinate was read off. Strongly recommended
+    /// here of all places: the window id proves you are aiming at a window you
+    /// have seen, but not at the state you saw it in, and a window id survives
+    /// any number of re-reads. Supply it and a point chosen from an older
+    /// screenshot is refused instead of landing on whatever now occupies that
+    /// pixel.
+    #[serde(default)]
+    snapshot_id: Option<u64>,
     /// Click count. 2 for a double-click.
     #[serde(default)]
     count: Option<u8>,
@@ -739,8 +759,9 @@ impl CuaServer {
         };
         let app = a.app.clone();
         let want_state = a.return_state.unwrap_or(true);
+        let snapshot_id = a.snapshot_id;
         match self
-            .native(move |c| c.drag(&app, from, to, mouse, want_state))
+            .native(move |c| c.drag(&app, from, to, mouse, snapshot_id, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -765,8 +786,9 @@ impl CuaServer {
         };
         let app = a.app.clone();
         let want_state = a.return_state.unwrap_or(true);
+        let snapshot_id = a.snapshot_id;
         match self
-            .native(move |c| c.hover(&app, at, modifiers, want_state))
+            .native(move |c| c.hover(&app, at, modifiers, snapshot_id, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -782,14 +804,19 @@ impl CuaServer {
         Parameters(a): Parameters<ClickInWindowArgs>,
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
-        let (wid, x, y) = (a.window_id, a.x, a.y);
+        let at = cua_core::WindowPixel {
+            window_id: a.window_id,
+            x: a.x,
+            y: a.y,
+            snapshot_id: a.snapshot_id,
+        };
         let want_state = a.return_state.unwrap_or(true);
         let mouse = match a.mouse.options() {
             Ok(m) => m.with_count(a.count.unwrap_or(1).clamp(1, 3)),
             Err(e) => return Ok(fail(e)),
         };
         match self
-            .native(move |c| c.click_in_window(&app, wid, x, y, mouse, want_state))
+            .native(move |c| c.click_in_window(&app, at, mouse, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
