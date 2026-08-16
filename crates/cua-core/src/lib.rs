@@ -6,6 +6,8 @@
 //!
 //! - [`apps::resolve_app`] turns whatever string a model produced into exactly
 //!   one running app, or an error — never a guess.
+//! - [`safety`] decides whether an action should happen at all, before
+//!   `session` works out how to deliver it.
 //! - [`session::Cua`] owns the one thread that may touch native handles, and
 //!   holds the latest snapshot per app.
 //! - [`snapshot::render_tree`] spends tokens only on elements worth seeing.
@@ -17,10 +19,12 @@
 
 pub mod apps;
 mod overlay;
+pub mod safety;
 pub mod session;
 pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
+pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, CoreError, Cua, Delivery, FindResult, Observed, Permissions,
     PostActionState, Presence, Screenshot, ScrollDir, StateOptions, Target, WaitOutcome,

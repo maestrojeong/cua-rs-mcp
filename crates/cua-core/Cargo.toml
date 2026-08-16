@@ -25,7 +25,24 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     "NSURL",
 ] }
-objc2-core-foundation.workspace = true
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFBase",
+    "CFCGTypes",
+    "CFDictionary",
+    "CFNumber",
+    "CFRunLoop",
+    "CFString",
+] }
+# Read-only. `cua-core` links CoreGraphics for one thing: the session
+# dictionary that reports a locked screen. It constructs no event and posts
+# none — `cua-hid` is still the only crate in this workspace that synthesizes
+# input, and `grep -r CGEvent crates/cua-core` is how a reader checks that.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGSession",
+] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "libc",

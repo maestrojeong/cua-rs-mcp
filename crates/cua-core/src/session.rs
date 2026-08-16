@@ -46,6 +46,13 @@ pub enum CoreError {
     #[error(transparent)]
     Capture(#[from] cua_capture::CaptureError),
 
+    /// A safety gate declined to let this action happen. See [`crate::safety`]
+    /// for what the gates are and how each one is cleared; the message always
+    /// names the way out, because a refusal an agent cannot resolve just
+    /// becomes a retry loop.
+    #[error(transparent)]
+    Refused(#[from] crate::safety::Refused),
+
     /// The agent acted on an index from a snapshot that has since been replaced.
     ///
     /// Reported loudly and specifically rather than being silently remapped:
@@ -1004,6 +1011,7 @@ impl Cua {
     ///
     /// `return_state` re-reads the window afterwards and attaches the result;
     /// see [`PostActionState`] for why that is worth a round trip.
+    ///
     pub fn click(
         &self,
         app: &str,
@@ -1012,8 +1020,9 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        let gate = crate::safety::Gate::at("click", &target);
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| i.click(&app, target, count))
+            inner.acting(&app, gate, return_state, |i| i.click(&app, target, count))
         })
     }
 
@@ -1034,8 +1043,12 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        // No element, so no label, so no destructive classification is possible
+        // here at all — see `safety::Gate::elementless`. The other three gates
+        // still apply.
+        let gate = crate::safety::Gate::elementless("click_in_window");
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.click_in_window(&app, window_id, x, y, count)
             })
         })
@@ -1051,8 +1064,11 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let value = value.to_string();
+        let gate = crate::safety::Gate::at("set_value", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.set_value(&app, target, &value))
+            inner.acting(&app, gate, return_state, |i| {
+                i.set_value(&app, target, &value)
+            })
         })
     }
 
@@ -1066,8 +1082,11 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        let gate = crate::safety::Gate::at("scroll", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.scroll(&app, target, dir, pages))
+            inner.acting(&app, gate, return_state, |i| {
+                i.scroll(&app, target, dir, pages)
+            })
         })
     }
 
@@ -1081,8 +1100,11 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        let gate = crate::safety::Gate::at("type_text", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.type_text(&app, target, &text))
+            inner.acting(&app, gate, return_state, |i| {
+                i.type_text(&app, target, &text)
+            })
         })
     }
 
@@ -1098,8 +1120,9 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        let gate = crate::safety::Gate::at("select_text", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
             })
         })
@@ -1115,8 +1138,11 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let key = key.to_string();
+        let gate = crate::safety::Gate::at("press_key", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.press_key(&app, target, &key))
+            inner.acting(&app, gate, return_state, |i| {
+                i.press_key(&app, target, &key)
+            })
         })
     }
 
@@ -1130,8 +1156,9 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let action = action.to_string();
+        let gate = crate::safety::Gate::at("perform_secondary_action", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.perform_action(&app, target, &action)
             })
         })
@@ -1196,7 +1223,7 @@ impl ScrollDir {
 // ── worker-side implementation ───────────────────────────────────────────────
 
 impl Inner {
-    fn get_app_state(&mut self, query: &str, opts: StateOptions) -> Result<AppState> {
+    fn get_app_state(&mut self, query: &str, mut opts: StateOptions) -> Result<AppState> {
         cua_ax::require_trusted()?;
         let info = apps::resolve_app(query)?;
         let app_el = Element::for_pid(info.pid);
@@ -1220,6 +1247,16 @@ impl Inner {
         }
 
         let mut warnings = Vec::new();
+
+        // Reading a forbidden app stays allowed; photographing one does not.
+        // The tree describes the UI holding a secret, while the pixels are the
+        // secret. See `crate::safety` for the whole read/act split.
+        if opts.include_screenshot {
+            if let Some(why) = crate::safety::screenshot_refusal(&info) {
+                opts.include_screenshot = false;
+                warnings.push(why);
+            }
+        }
 
         // Prefer the focused window, fall back to main, then to the first one.
         // A minimized-only app has none of these, which is a real state and not
@@ -1491,10 +1528,24 @@ impl Inner {
     /// Failing to re-read is not an error. The action already happened, and
     /// reporting it as a failure because the follow-up read did not work would
     /// invite a caller to retry something that already took effect.
-    fn acting<F>(&mut self, query: &str, return_state: bool, act: F) -> Result<ActionResult>
+    fn acting<F>(
+        &mut self,
+        query: &str,
+        gate: crate::safety::Gate,
+        return_state: bool,
+        act: F,
+    ) -> Result<ActionResult>
     where
         F: FnOnce(&mut Self) -> Result<ActionResult>,
     {
+        // Every gate, once, at the one place every action passes through.
+        // Putting it here rather than in each action means a tool added later
+        // is gated by default instead of by remembering. An app that will not
+        // resolve is left to the action, which reports that better.
+        if let Ok(info) = apps::resolve_app(query) {
+            crate::safety::guard(&info, &gate)?;
+        }
+
         let before = if return_state {
             Some(self.rendered_current_tree(query))
         } else {
