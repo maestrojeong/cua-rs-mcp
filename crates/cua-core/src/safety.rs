@@ -13,7 +13,7 @@
 //! |---|:--|:--|:--|
 //! | session scope | **off** | `CUA_ALLOWED_APPS=id,id` enables | actions |
 //! | forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` disables | actions + screenshots |
-//! | destructive label | **on** | none — per-call `confirm_destructive` | activation-shaped actions |
+//! | destructive label or question | **on** | none — per-call `confirm_destructive` | activation-shaped actions |
 //! | screen lock | **on** | none | actions |
 //! | yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` enables | actions |
 //!

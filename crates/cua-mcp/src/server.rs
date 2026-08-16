@@ -256,9 +256,13 @@ struct ClickArgs {
     mouse: MouseArgs,
     /// Set to true to proceed when the target's label reads as destructive
     /// (Delete, Remove, Erase, Reset, Move to Trash, Don't Save, 삭제, 제거,
-    /// 초기화, 나가기, …). Without it such a click is REFUSED and the error
-    /// names this field. The classifier deliberately over-reports — confirming
-    /// a false positive is the right answer and costs one round trip.
+    /// 초기화, 나가기, …), or when a terse button answers a sheet or dialog
+    /// that reads that way ("OK" under "Delete 4 items?", 확인 under
+    /// "4개 항목을 삭제할까요?"). Without it such a click is REFUSED and the
+    /// error names this field and quotes the question. The classifier
+    /// deliberately over-reports — confirming a false positive is the right
+    /// answer and costs one round trip. Cancel, No and 취소 are never refused
+    /// on the dialog's wording, so backing out never needs this.
     #[serde(default)]
     confirm_destructive: bool,
     /// Click count. `2` for a double-click, for targets that open on
@@ -771,7 +775,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. Pass button=right for a real rightMouseDown/rightMouseUp pair (a context menu on a control that advertises no AXShowMenu), button=middle for a middle click, and modifiers=\"cmd\" / \"shift\" / \"alt\" / \"ctrl\" (or a combination like \"cmd+shift\") to hold keys down for the press — that is how you open a link in a new tab, extend a selection to a row, or reach an app's alternate ⌥ action. There is no real-pointer fallback. SAFETY: a target whose label reads as destructive (Delete, Remove, Erase, Reset, Move to Trash, Don't Save, 삭제, 제거, 초기화, 나가기, …) is refused unless you also pass confirm_destructive=true; credential managers, Keychain Access, System Settings and login surfaces are refused outright; nothing is delivered while the screen is locked."
+        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. Pass button=right for a real rightMouseDown/rightMouseUp pair (a context menu on a control that advertises no AXShowMenu), button=middle for a middle click, and modifiers=\"cmd\" / \"shift\" / \"alt\" / \"ctrl\" (or a combination like \"cmd+shift\") to hold keys down for the press — that is how you open a link in a new tab, extend a selection to a row, or reach an app's alternate ⌥ action. There is no real-pointer fallback. SAFETY: a target whose label reads as destructive (Delete, Remove, Erase, Reset, Move to Trash, Don't Save, 삭제, 제거, 초기화, 나가기, …) is refused unless you also pass confirm_destructive=true, and so is a terse button answering a sheet or dialog that reads that way — \"OK\" under \"Delete 4 items?\" — while Cancel/No/취소 on that same dialog is never refused; credential managers, Keychain Access, System Settings and login surfaces are refused outright; nothing is delivered while the screen is locked."
     )]
     async fn click(
         &self,
@@ -1019,7 +1023,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions. SAFETY: as with `click`, a destructive-looking target needs confirm_destructive=true."
+        description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions. SAFETY: as with `click`, a destructive-looking target — or one answering a destructive-looking dialog — needs confirm_destructive=true."
     )]
     async fn perform_secondary_action(
         &self,
@@ -1370,8 +1374,8 @@ impl rmcp::ServerHandler for CuaServer {
              the next get_app_state for that app; pass snapshot_id to make staleness an error \
              instead of a mis-click. Actions pass through four safety gates: apps that hold \
              credentials or system security state are never driven (reading them is still \
-             allowed, minus screenshots), a target whose label reads as destructive needs \
-             confirm_destructive=true, nothing is delivered while the session is locked, and — \
+             allowed, minus screenshots), a target whose label reads as destructive — or that answers a dialog which \
+             does — needs confirm_destructive=true, nothing is delivered while the session is locked, and — \
              if the operator enabled it — cua-rs stands down on an app the human is using. \
              Every refusal names what to pass or change."
                 .to_string(),

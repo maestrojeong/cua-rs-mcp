@@ -661,7 +661,7 @@ with it.
 |---|:--|:--|:--|
 | session scope | **off** | `CUA_ALLOWED_APPS=id,id` | actions on any app outside the scope the launcher named |
 | forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots |
-| destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something |
+| destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something — or that answers a sheet or dialog which does, unless the answer is a Cancel |
 | screen lock | **on** | — | every action while the session is locked or the saver is up |
 | yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using |
 | HTTP bearer token | **on** | `CUA_HTTP_TOKEN` sets it | any `/mcp` request without `Authorization: Bearer` |
@@ -820,6 +820,92 @@ conversation. Two details fall out of that:
 A text field's own *contents* are never classified. Otherwise `set_value` on a
 note reading "remind me to delete the old files" would be refused, and no
 confirmation could make that sensible.
+
+One thing the label is allowed to come from besides an attribute: a child. A
+Chromium-shaped button publishes its caption as an `AXStaticText` inside itself,
+so a control reading "Delete" on screen arrives with no label at all. That prose
+is read for button-shaped roles only — never `AXRow` or `AXCell`, which also
+hold their text in children, except that their text is the user's mail.
+
+#### The question the dialog is asking
+
+Reading only the target misses the most common destructive arrangement on macOS
+entirely. "OK" under a sheet saying *Delete 4 items?* is not a labelling
+accident; it is what an alert *is* — the question is asked once at the top and
+the answers are terse by design. Same for 확인 under *4개 항목을 삭제할까요?*.
+
+§10 used to record this as a weak spot and named the blocker correctly:
+widening to the ancestor chain needs a rule first. Walking up and classifying
+everything on the way is easy and wrong. Every element in a mail window descends
+from a window whose title is a subject line; a chat window's ancestors contain
+the whole conversation. Done naively the gate refuses everything in any app
+whose content mentions deleting.
+
+**The rule is about kind of ancestor, not distance.**
+
+1. **Only a decision context is evidence.** An `AXSheet`, an `AXDialog`, or a
+   window whose subrole is `AXDialog`/`AXSystemDialog` — which is how AppKit
+   ships an `NSAlert` — exists for one purpose: to ask a question and collect an
+   answer. Its text *is* the question. An ordinary `AXWindow`, `AXGroup` or
+   `AXScrollArea` is layout, and its text is content. No amount of proximity
+   turns content into a question, and no amount of distance turns a question
+   into content, which is why kind carries the weight here and depth carries
+   none.
+2. **The nearest one, and no further.** The search walks up from the target,
+   stops at the first decision context, and gives up at the first ordinary
+   window. That bound is structural rather than numeric. An alert's message sits
+   one or two levels above its buttons in AppKit and rather deeper in a
+   cross-platform toolkit, so "N levels" would have to be tuned per toolkit and
+   would break silently in the next one. Stopping at the enclosing question also
+   gets nesting right for free: a confirmation raised on top of a disk-erase
+   dialog is answering *its own* question, and inheriting the one behind it
+   would make "OK" on *Rename this file?* a deletion.
+3. **Prose, not answers.** Inside the context, only its own title/description
+   and its static text count. Sibling controls are deliberately not read.
+   Otherwise an alert offering "Delete" and "Cancel" would make "Cancel"
+   destructive by association.
+4. **Content stays excluded, at every depth.** The walk does not descend into
+   scroll areas, tables, outlines, lists, rows, cells, web areas or text areas,
+   and never reads a writable value. A "Move to…" sheet listing a folder called
+   "delete me" is still listing the user's files. This is the same reasoning
+   that keeps a text field's own value out of the classification, applied one
+   level out.
+5. **Typing is not the decision.** A text field inside a destructive sheet is
+   still writable. The decision is the button underneath it; refusing the name
+   being typed into a rename field is the "note that says delete" mistake again.
+
+**Cancel is never refused, and that is a safety property rather than a
+convenience.** A dismissing answer — an exact match on `cancel`, `no`, `not
+now`, `later`, `dismiss`, `keep`, `back`, 취소, 아니오, 나중에, 유지 — is exempt
+from context evidence. Refusing it would leave an agent holding a modal sheet
+whose only exit is `confirm_destructive: true`, which teaches it to confirm its
+way out of alerts. Matching is against the whole normalized label and never a
+substring, because this list is the one place the gate deliberately stops
+refusing: "Close Account" must not be excused by containing "Close".
+
+**How the two failure costs were traded here.** The module's standing bias is to
+over-refuse, and this widening does refuse more — but "more" is not free in the
+direction it looks free. A gate that fires constantly gets `confirm_destructive:
+true` attached to every call reflexively, and then it is not a gate, it is a
+required parameter. So the widening buys precision with *scope* rather than with
+tuning: it fires only inside something that exists to ask a question, on
+something that is not the way out of it, on evidence that is the dialog's own
+prose. Inside that boundary it stays maximally suspicious — an unlabeled icon
+button in a delete sheet is refused, because failing closed on an unknown answer
+costs one round trip. Outside it, nothing changed: an ordinary window is exactly
+as permissive as before.
+
+None of this is tuned to the examples. Every clause above is pinned by a test
+that builds a snapshot-shaped tree and fails if the clause is deleted — the
+answer-pruning rule earned its test only after a mutation showed nothing caught
+its removal, which is also how the Chromium caption hole above was found.
+
+What this still does not see: a menu item whose destructive meaning lives in the
+row it was invoked from (menus have no accessibility representation at all —
+§10), a dialog that asks its question in an image, and a toolkit that publishes
+a modal as a plain `AXGroup` with no dialog subrole. The last is the honest
+limit of the rule: cua-rs would rather miss a question nobody marked as one than
+treat every window as an interrogation.
 
 `press_key` classifies the key as well, because a Delete carries its meaning in
 the key rather than in the element: any modified Delete or Backspace (`cmd+delete`
@@ -1159,16 +1245,17 @@ covers — it compares the *element*, not a string built from it.
 invalidates indices each time. Correct, but awkward; keying snapshots by window
 would fix it.
 
-**The approval gate is a heuristic, and heuristics on labels are shallow.**
-"Cancel" and "Delete All" are now distinguished (§7a), but only by what the
-control says about itself. A button labelled "OK" in a dialog whose *title* says
-"Delete 4 items?" is not caught, because the classifier reads the target and not
-its context; nor is a menu item whose destructive meaning lives in the row it
-was invoked from. Widening it to the ancestor chain is the obvious next step and
-would need a rule for how far up to look before every button in a settings
-window inherits the word "Reset" from a section header. Until then the gate
-stops the labelled cases, which are most of them, and `snapshot_id` plus
-`element_token` remain the defence against acting on the wrong element at all.
+**The approval gate is a heuristic, and it now reads two things rather than
+one.** The control's own words, and the question of the nearest enclosing sheet
+or dialog (§7a) — so "OK" under *Delete 4 items?* is caught, while "Cancel"
+under the same alert is deliberately not. What is still shallow is everything
+that is neither: a menu item whose destructive meaning lives in the row it was
+invoked from, which is doubly out of reach because a macOS menu has no
+accessibility representation at all (below); a dialog that puts its question in
+an image; and a toolkit that publishes a modal as an unmarked `AXGroup`, which
+the rule declines to guess at rather than treating every window as a question.
+`snapshot_id` and `element_token` remain the defence against acting on the wrong
+element in the first place.
 
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.

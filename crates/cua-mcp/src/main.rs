@@ -200,7 +200,8 @@ fn main() -> anyhow::Result<()> {
                      SAFETY GATES:\n  \
                        apps this run may act on                   all (CUA_ALLOWED_APPS=id,id)\n  \
                        credential managers and security surfaces  refused (CUA_ALLOW_FORBIDDEN_TARGETS=1)\n  \
-                       destructive-looking targets                need confirm_destructive on the call\n  \
+                       destructive-looking targets, and terse\n  \
+                       answers to destructive dialogs             need confirm_destructive on the call\n  \
                        locked screen or screen saver              refused\n  \
                        human using the driven app                 off (CUA_YIELD_TO_HUMAN=1)\n  \
                        HTTP mode                                  bearer token, printed at startup\n\n\
