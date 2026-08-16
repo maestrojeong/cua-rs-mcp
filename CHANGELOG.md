@@ -7,6 +7,23 @@ caller.
 
 ## Unreleased
 
+### CI notices a directory under `crates/` that is not a crate
+
+`crates/cua-sky/examples/` sat in the working tree as debris from an abandoned
+experiment. Git never carried it — it holds no files, and git does not track
+empty directories — so it was never in a commit, a release, or a clone. What let
+it linger is that nothing referenced it: `cua-sky` was not a workspace member, so
+no build, lint or test step had any reason to name it, and CI's per-crate build
+loop spelled its six crates out by hand.
+
+CI now derives that list from `cargo metadata` and asserts it matches `ls crates`
+in both directions. A directory that is not a member fails the job, and so does a
+member whose directory is gone. Checked against the case that motivated it:
+recreating `crates/cua-sky/examples/` makes the step fail with `> cua-sky`.
+
+No other reference to a crate that does not exist was found — not in
+`Cargo.toml`, `.github/workflows/`, `install.sh`, `README.md` or `DESIGN.md`.
+
 ### `cua_hid::post_chord` is deleted
 
 It posted a key or chord through `CGEventPost(kCGHIDEventTap)` — the session's
