@@ -156,11 +156,13 @@ pub enum Refused {
     /// a human reading the transcript can see the evidence rather than trusting
     /// a classifier they cannot inspect.
     #[error(
-        "refusing to {verb} {target}: it answers a {context} that reads as asking a destructive \
-         question — {question:?} (matched {matched:?}). The button is terse but the sheet it sits \
-         in is not, and cua-rs classifies the decision, not the wording of the answer. Pass \
-         confirm_destructive: true on this same call to proceed. Dismissing answers (Cancel, No, \
-         취소 …) are never refused here, so backing out of this dialog needs no confirmation"
+        "refusing to {verb} {target}: it answers a decision context ({context}) whose own text \
+         reads as a destructive question — {question:?} (matched {matched:?}). The answer is \
+         terse but the question is not, and cua-rs classifies the decision rather than the \
+         wording of the button. Pass confirm_destructive: true on this same call to proceed. \
+         An answer that names its own harmlessness (Cancel, No, Keep, Save, 취소, 저장 …) is \
+         never refused here, so backing out of this dialog — or saving instead of discarding — \
+         needs no confirmation"
     )]
     NeedsConfirmationInContext {
         verb: &'static str,
@@ -724,12 +726,16 @@ impl Candidate {
     /// Two exemptions, both narrow and both for the same reason — the gate has
     /// to stay rare enough that clearing it is a decision rather than a habit:
     ///
-    /// - **A dismissing answer.** Cancel is how a caller *avoids* the
-    ///   destruction the dialog is offering. Refusing it would leave an agent
-    ///   holding a modal sheet it cannot back out of, and the only way through
-    ///   would be to send `confirm_destructive: true` — teaching it to confirm
-    ///   its way out of alerts, which is precisely the habit that would make the
-    ///   gate useless when it matters.
+    /// - **An answer that names its own harmlessness** (see [`SAFE_ANSWERS`]).
+    ///   Cancel is how a caller *avoids* the destruction the dialog is
+    ///   offering. Refusing it would leave an agent holding a modal sheet it
+    ///   cannot back out of, and the only way through would be to send
+    ///   `confirm_destructive: true` — teaching it to confirm its way out of
+    ///   alerts, which is precisely the habit that would make the gate useless
+    ///   when it matters. Save and Keep are there for the same reason from the
+    ///   other side: a sheet offering "save or delete" is a destructive
+    ///   question, and gating the answer that preserves the work would put a
+    ///   confirmation on one of the most-used sheets on the system.
     /// - **Typing.** A text field inside a dialog is not the decision; the
     ///   button underneath it is. `set_value` into the name field of a sheet
     ///   that mentions deleting changes nothing on its own, and refusing it is
@@ -742,7 +748,7 @@ impl Candidate {
         // whose caption is a child still says "Cancel".
         let says = self.label.as_deref().or(self.caption.as_deref());
         match says {
-            Some(label) => !is_dismissing_answer(label),
+            Some(label) => !is_safe_answer(label),
             None => true,
         }
     }
@@ -857,33 +863,44 @@ const QUESTION_ROLES: &[&str] = &["AXStaticText", "AXHeading"];
 /// labels in it. A real alert uses two: a message and an informative text.
 const MAX_QUESTION_PARTS: usize = 24;
 
-/// Exact labels that mean "no".
+/// Exact labels for answers that name their own harmlessness.
 ///
-/// Matched against the whole normalized label, never as a substring, so
-/// "Close Account" is not excused by "Close". The exactness is the safety
-/// property: this list is the one place the gate deliberately *stops* refusing,
-/// so it has to be impossible for a destructive control to fall into it by
-/// containing a soft word.
+/// Two kinds, and the membership test is the same for both: does the word
+/// itself promise that nothing is lost? *Refusing* the offer — Cancel, No, Not
+/// now, 취소 — and *preserving* what is at stake — Keep, Save, 유지, 저장.
+/// Everything else, including OK, 확인, Continue and Yes, promises nothing and
+/// is judged by the question.
 ///
-/// Membership is judged on the answer alone. A dismissing answer in a
-/// destructive dialog is the safe outcome, and in a harmless one it is a no-op;
-/// there is no dialog in which pressing Cancel is the thing that needed
-/// confirming.
-const DISMISSING_ANSWERS: &[&str] = &[
+/// Matched against the whole normalized label, never as a substring, so "Close
+/// Account" is not excused by "Close" and "Don't Save" is not excused by
+/// "Save". The exactness is the safety property: this list is the one place the
+/// gate deliberately *stops* refusing, so it has to be impossible for a
+/// destructive control to fall into it by containing a soft word.
+///
+/// Save earned its place from a measurement rather than an argument. macOS's
+/// own close-without-saving sheet reads "…you can save it now, or delete it
+/// immediately", so the question is destructive and the Save button was being
+/// refused on one of the most-used sheets on the system. That is exactly the
+/// shape that trains a caller to attach `confirm_destructive: true` to
+/// everything, and the overwrite prompt it might otherwise have caught spells
+/// its button "Replace", which is not on this list.
+const SAFE_ANSWERS: &[&str] = &[
     "cancel",
     "no",
     "not now",
     "later",
     "dismiss",
-    "keep",
     "back",
     "go back",
+    "keep",
+    "save",
     "취소",
     "아니오",
     "아니요",
     "나중에",
-    "유지",
     "돌아가기",
+    "유지",
+    "저장",
 ];
 
 /// The question the nearest enclosing decision context is asking.
@@ -950,10 +967,12 @@ fn nearest_decision_context(nodes: &[ContextNode<'_>], target: usize) -> Option<
     None
 }
 
-/// The text `node` contributes to a question, under the same value rule the
-/// target itself is judged by: never a writable value, because that is the
-/// user's typing and not the dialog's prose.
-fn question_text_of(node: &ContextNode<'_>) -> Vec<String> {
+/// The text a decision context itself contributes: its title, its help, and its
+/// value when that value is not the user's to write.
+///
+/// Never a writable value, for the reason a text field's contents are never
+/// classified — that is typing, not prose.
+fn own_text_of(node: &ContextNode<'_>) -> Vec<String> {
     let mut parts = Vec::new();
     for part in [node.label, node.help] {
         if let Some(p) = part.map(str::trim).filter(|p| !p.is_empty()) {
@@ -966,6 +985,26 @@ fn question_text_of(node: &ContextNode<'_>) -> Vec<String> {
         }
     }
     parts
+}
+
+/// The sentence a piece of static text is displaying.
+///
+/// For a static text the *value* is the string on screen; its title is often an
+/// internal identifier — a real save sheet publishes `whereLabel`, `_NS:246`,
+/// `fileFormatLabel` — which is noise in a refusal a human has to read, and
+/// noise the matcher would otherwise have to be trusted not to trip over. So
+/// the value wins, and the label is a fallback for the toolkits that put the
+/// sentence in `AXTitle`/`AXDescription` instead.
+fn displayed_text_of(node: &ContextNode<'_>) -> Option<String> {
+    if !node.settable {
+        if let Some(v) = node.value.map(str::trim).filter(|v| !v.is_empty()) {
+            return Some(v.to_string());
+        }
+    }
+    node.label
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 /// The prose inside `root`, pruned at answers, at content and at any nested
@@ -987,7 +1026,7 @@ fn prose_in(nodes: &[ContextNode<'_>], root: usize, include_root: bool) -> Strin
     }
 
     let mut parts = if include_root {
-        question_text_of(&nodes[root])
+        own_text_of(&nodes[root])
     } else {
         Vec::new()
     };
@@ -1004,7 +1043,7 @@ fn prose_in(nodes: &[ContextNode<'_>], root: usize, include_root: bool) -> Strin
             continue;
         }
         if any_eq_ignore_case(QUESTION_ROLES, node.role) {
-            parts.extend(question_text_of(node));
+            parts.extend(displayed_text_of(node));
             // Static text has no children worth walking, and an accessible
             // label rendered as a child of one would be the same string twice.
             continue;
@@ -1070,15 +1109,15 @@ pub fn decision_context(nodes: &[ContextNode<'_>], target: usize) -> Option<Deci
     Some(DecisionContext { kind, question })
 }
 
-/// Whether a label is an exact "no".
+/// Whether a label is an exact promise that nothing is destroyed.
 ///
 /// Trailing punctuation and the ellipsis AppKit likes are stripped before the
 /// comparison, so "Cancel…" is still a cancel; nothing else about the string is
 /// allowed to vary.
-fn is_dismissing_answer(label: &str) -> bool {
+fn is_safe_answer(label: &str) -> bool {
     let norm = normalize(label);
     let trimmed = norm.trim_matches(|c: char| !c.is_alphanumeric());
-    !trimmed.is_empty() && DISMISSING_ANSWERS.contains(&trimmed)
+    !trimmed.is_empty() && SAFE_ANSWERS.contains(&trimmed)
 }
 
 /// Collapse whitespace and lowercase, so one label matches one way.
@@ -1913,20 +1952,86 @@ mod tests {
             "Not now",
             "취소",
             "유지",
+            "Keep",
+            "Save",
+            "저장",
         ] {
-            assert!(is_dismissing_answer(yes), "{yes:?} is a way out");
+            assert!(is_safe_answer(yes), "{yes:?} names its own harmlessness");
         }
         // The direction that matters: a destructive control must not be
-        // excused by containing a soft word.
+        // excused by containing a soft word, and an answer that promises
+        // nothing — OK, 확인, Continue — is not on the list at all.
         for no in [
             "Close Account",
             "No Backup, Delete",
             "Cancel Subscription",
             "Keep Nothing",
             "취소선 삭제",
+            "Don't Save",
+            "저장 안 함",
+            "Save and Delete",
+            "Replace",
+            "OK",
+            "확인",
+            "Continue",
             "",
         ] {
-            assert!(!is_dismissing_answer(no), "{no:?} is not a way out");
+            assert!(!is_safe_answer(no), "{no:?} promises nothing");
+        }
+    }
+
+    #[test]
+    fn the_save_sheet_macos_actually_ships_is_handled_end_to_end() {
+        // Transcribed from a live read of TextEdit's close-without-saving sheet
+        // on a Korean system, identifiers and all. Three things have to be true
+        // at once here, and only the middle one is obvious:
+        //
+        //   저장 (Save)  — allowed. The sheet is a destructive question, but
+        //                  the answer that preserves the work must not be
+        //                  gated, or every close-without-saving flow trains a
+        //                  caller to confirm reflexively.
+        //   삭제 (Delete)— refused, on its own label, before context is asked.
+        //   취소 (Cancel)— allowed, the way out.
+        let mut t = Tree::default();
+        let window = t.window("무제");
+        let sheet = t.sheet(window, Some("저장"));
+        // A real static text carries its sentence in the value and an internal
+        // identifier in the title.
+        for (identifier, sentence) in [
+            ("whereLabel", "위치:"),
+            ("_NS:246", "이 새로운 문서(‘무제’)를 유지하겠습니까?"),
+            (
+                "_NS:239",
+                "변경 사항을 저장하거나 이 문서를 즉시 삭제할 수도 있습니다. 이 동작은 취소할 수 \
+                 없습니다.",
+            ),
+            ("fileFormatLabel", "파일 포맷:"),
+        ] {
+            t.push(ContextNode {
+                parent: Some(sheet),
+                role: "AXStaticText",
+                label: Some(identifier),
+                value: Some(sentence),
+                ..ContextNode::default()
+            });
+        }
+        let delete = t.button(sheet, "삭제");
+        let cancel = t.button(sheet, "취소");
+        let save = t.button(sheet, "저장");
+
+        assert_eq!(t.verdict(delete).as_deref(), Some("삭제"));
+        assert_eq!(t.verdict(cancel), None);
+        assert_eq!(t.verdict(save), None);
+
+        // And the question a human would read in the refusal is the sentences,
+        // not the identifiers around them.
+        let question = t.candidate(delete).context.unwrap().question;
+        assert!(question.contains("유지하겠습니까?"), "{question}");
+        for identifier in ["whereLabel", "_NS:246", "fileFormatLabel"] {
+            assert!(
+                !question.contains(identifier),
+                "{identifier} is plumbing, not prose: {question}"
+            );
         }
     }
 

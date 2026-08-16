@@ -874,14 +874,54 @@ whose content mentions deleting.
    still writable. The decision is the button underneath it; refusing the name
    being typed into a rename field is the "note that says delete" mistake again.
 
-**Cancel is never refused, and that is a safety property rather than a
-convenience.** A dismissing answer — an exact match on `cancel`, `no`, `not
-now`, `later`, `dismiss`, `keep`, `back`, 취소, 아니오, 나중에, 유지 — is exempt
-from context evidence. Refusing it would leave an agent holding a modal sheet
-whose only exit is `confirm_destructive: true`, which teaches it to confirm its
-way out of alerts. Matching is against the whole normalized label and never a
-substring, because this list is the one place the gate deliberately stops
-refusing: "Close Account" must not be excused by containing "Close".
+**An answer that names its own harmlessness is never refused, and that is a
+safety property rather than a convenience.** Two kinds pass the same test —
+does the word itself promise nothing is lost? Refusing the offer (`cancel`,
+`no`, `not now`, `later`, `dismiss`, `back`, 취소, 아니오, 나중에, 돌아가기) and
+preserving what is at stake (`keep`, `save`, 유지, 저장). `OK`, `확인`, `Yes`
+and `Continue` promise nothing and stay gated. Refusing a Cancel would leave an
+agent holding a modal sheet whose only exit is `confirm_destructive: true`,
+which teaches it to confirm its way out of alerts. Matching is against the whole
+normalized label and never a substring, because this list is the one place the
+gate deliberately stops refusing: "Close Account" must not be excused by
+"Close", nor "Don't Save" by "Save".
+
+Save is on that list because of a measurement, not an argument — see the live
+check below.
+
+**Verified against real dialogs, and one of them changed the design.** Both
+shapes were driven end to end through the server, with grants, on a Korean
+system:
+
+- A `display dialog` alert (`AXWindow` + `AXDialog` subrole, an `AXStaticText`
+  and two buttons). "OK" under *Delete 4 items?* and 확인 under *4개 항목을
+  삭제할까요?* were both refused, quoting the question. The same click with
+  `confirm_destructive: true` pressed the button and osascript returned `OK`.
+  "Cancel" and 취소 on the identical dialog went through unconfirmed and
+  returned `Cancel`. "OK" on a *Save these settings?* dialog was never gated.
+- TextEdit's real close-without-saving sheet (`AXSheet`), reached on a scratch
+  document created for the test. 취소 went through unconfirmed; 삭제 was refused
+  on its own label and pressed once confirmed.
+- Nesting turned up on its own rather than being staged: pressing 저장 on that
+  sheet opened a save panel, which raised an overwrite prompt — an `AXSheet`
+  inside an `AXSheet` inside an `AXSheet`, offering 취소 and 대치. That is the
+  arrangement the nearest-context rule exists for, and it is also why "Replace"
+  is deliberately not an exempt answer.
+
+That sheet is what put Save on the exempt list. Its informative text reads *"…
+변경 사항을 저장하거나 이 문서를 즉시 삭제할 수도 있습니다"* — the question is
+genuinely destructive, so 저장 was being refused on one of the most-used sheets
+on the system. That is precisely the shape that trains a caller to attach
+`confirm_destructive: true` to every call, which would cost more safety than the
+refusal buys. The overwrite prompt this might otherwise catch spells its button
+"Replace", which is not exempt.
+
+The same sheet fixed a second thing. Its static texts publish their sentence in
+`AXValue` and an internal identifier — `whereLabel`, `_NS:246`,
+`fileFormatLabel` — in the title, and the first version of the refusal quoted
+all of it. For a static text the value is what is on screen, so that wins and
+the title is only a fallback for toolkits that put the sentence there. A refusal
+a human cannot read is a refusal they cannot check.
 
 **How the two failure costs were traded here.** The module's standing bias is to
 over-refuse, and this widening does refuse more — but "more" is not free in the
