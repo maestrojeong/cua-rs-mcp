@@ -254,6 +254,52 @@ window in the system including the visibly frontmost one. `killall replayd`
 restored it. Check that before concluding anything about a particular window —
 it nearly produced a bug report against this crate's own `on_screen` field.
 
+### One anomaly chased down: a shell capture that refused a pop-up id
+
+Filed during the pop-up work and left unexplained: a shell
+`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
+create image from window`, once, while every in-process `capture_window` around
+it returned an image. Two capture paths disagreeing about one window id in the
+same moment would be a real and worrying finding, so it was worth the bounded
+attempt. **It reproduces, and it is not that.**
+
+`cargo run -p cua-core --example popup_capture_probe` opens a pop-up with a
+pid-routed right-click, then alternates a shell capture and an in-process capture
+against that window's id, reading the window's liveness between every step —
+because macOS emits the same string for "this window refuses to be photographed"
+and for "this window does not exist", and without a liveness read between them
+the two are indistinguishable. That is the whole of the original mistake.
+
+Against a Calculator context menu (level 101, a new window of the app's own pid):
+
+- **Four runs of 30–40 rounds, 129 live rounds in total: both paths succeeded
+  every time.** Identical byte counts round to round, no refusal from either.
+- **On the pop-up's id after it had closed, the shell command fails with exactly
+  `could not create image from window`, 3 attempts out of 3.** That is the
+  original message, from a dead window id, with no window-server refusal
+  involved.
+- The in-process path usually does *not* produce that text for a dead id, which
+  is what made the two look like they disagreed: `capture_window` enumerates
+  windows first and returns `window <id> not found (it may have closed)`
+  instead. It produces the raw refusal only when the window dies inside the gap
+  between that enumeration and the capture, which one round against a TextEdit
+  context menu did: `live` before the shell capture, gone after it, and the
+  in-process call in between surfaced `could not create image from window`.
+
+So the asymmetry was never between two capture APIs. It was between a call with a
+preflight and a bare shell invocation without one, aimed at a pop-up id whose
+window had gone — and a pop-up is exactly the kind of window that goes away while
+you are looking at it. A pop-up id is not a durable handle, which is also why
+§10's conclusion (macOS photographs a window together with the pop-up attached to
+it, so ask for the *parent*) is the right way to get its pixels.
+
+**This changes nothing about `capture_failure_warning` and must not be read as
+weakening it.** That warning is about a *live* window of an app that has a menu
+open, and it already says the correlation is not established. Nothing here
+touched that case: every window in these runs was either alive and captured
+successfully by both paths, or gone. The hedge stands, and so does the reason for
+it.
+
 ### ScreenCaptureKit instead of `screencapture` buys nothing here
 
 The modern alternative is `SCScreenshotManager.captureImageWithFilter` over

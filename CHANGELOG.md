@@ -7,6 +7,28 @@ caller.
 
 ## Unreleased
 
+### The shell capture that refused a pop-up id was a dead window id
+
+An unexplained observation from the pop-up work: a shell
+`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
+create image from window` while every in-process `capture_window` around it
+succeeded. Chased with `cargo run -p cua-core --example popup_capture_probe`,
+which opens a pop-up and alternates both paths against its window id while
+reading the window's liveness between every step.
+
+129 live rounds across four runs: both paths succeeded every time. Asked for the
+same id *after* the pop-up closed, the shell command fails with exactly that
+message, 3 out of 3. The in-process path normally reports `window <id> not found
+(it may have closed)` instead, because it enumerates first — which is the whole of
+the apparent disagreement. One round caught the raw refusal in-process too, when
+the window died inside the gap between that enumeration and the capture.
+
+So a pop-up id is not a durable handle, and §10's answer — ask for the parent
+window, which macOS photographs with the pop-up attached — remains the way to get
+a pop-up's pixels. `capture_failure_warning` is unchanged and undiminished: it
+describes a *live* window of an app with a menu open, which is a different case
+and still an unestablished correlation.
+
 ### An `AXMenuItem` does act on the first `AXPress`
 
 DESIGN.md §10 carried, from one observation, that it does not — that the first
