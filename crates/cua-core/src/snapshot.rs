@@ -302,7 +302,8 @@ fn truncate(s: &str, max: usize) -> String {
 /// is a change it cannot act on.
 ///
 /// Indentation is kept in the reported lines, so a caller can still tell roughly
-/// where in the tree something appeared.
+/// where in the tree something appeared — but it is not part of what makes two
+/// lines equal, and neither is the `[N]` handle. See [`diff_key`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TreeDiff {
     pub added: Vec<String>,
@@ -328,36 +329,58 @@ impl TreeDiff {
 pub fn diff_trees(before: &str, after: &str) -> TreeDiff {
     use std::collections::HashMap;
 
-    let mut before_counts: HashMap<&str, i64> = HashMap::new();
+    let mut before_counts: HashMap<String, i64> = HashMap::new();
     for line in before.lines() {
-        *before_counts.entry(line).or_default() += 1;
+        *before_counts.entry(diff_key(line)).or_default() += 1;
     }
-    let mut after_counts: HashMap<&str, i64> = HashMap::new();
+    let mut after_counts: HashMap<String, i64> = HashMap::new();
     for line in after.lines() {
-        *after_counts.entry(line).or_default() += 1;
+        *after_counts.entry(diff_key(line)).or_default() += 1;
     }
 
     let mut added = Vec::new();
-    let mut seen: HashMap<&str, i64> = HashMap::new();
+    let mut seen: HashMap<String, i64> = HashMap::new();
     for line in after.lines() {
-        let n = seen.entry(line).or_default();
+        let key = diff_key(line);
+        let n = seen.entry(key.clone()).or_default();
         *n += 1;
-        if *n > before_counts.get(line).copied().unwrap_or(0) {
+        if *n > before_counts.get(&key).copied().unwrap_or(0) {
             added.push(line.to_string());
         }
     }
 
     let mut removed = Vec::new();
-    let mut seen: HashMap<&str, i64> = HashMap::new();
+    let mut seen: HashMap<String, i64> = HashMap::new();
     for line in before.lines() {
-        let n = seen.entry(line).or_default();
+        let key = diff_key(line);
+        let n = seen.entry(key.clone()).or_default();
         *n += 1;
-        if *n > after_counts.get(line).copied().unwrap_or(0) {
+        if *n > after_counts.get(&key).copied().unwrap_or(0) {
             removed.push(line.to_string());
         }
     }
 
     TreeDiff { added, removed }
+}
+
+/// What makes two outline lines "the same element" for diff purposes: the text,
+/// minus its indentation and its `[N]` handle.
+///
+/// Both of those move for reasons that are not UI changes. A walk that reorders
+/// renumbers every index after the insertion point, and apps regroup their own
+/// subtrees — KakaoTalk's message table re-parents every visible row's cells
+/// while the conversation sits still. Diffing raw lines reported ~200 changes
+/// for a click that opened one menu, and the menu was past the truncation
+/// cutoff, so the diff hid exactly the thing it existed to show.
+///
+/// The reported line is still the original, indentation and fresh index
+/// included, so nothing an agent needs in order to act is lost.
+fn diff_key(line: &str) -> String {
+    let line = line.trim_start();
+    match line.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+        Some((digits, rest)) if digits.chars().all(|c| c.is_ascii_digit()) => rest.to_string(),
+        _ => line.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -684,5 +707,41 @@ mod diff_tests {
         let d = diff_trees(before, after);
         assert_eq!(d.removed.len(), 1);
         assert_eq!(d.added.len(), 1);
+    }
+
+    #[test]
+    fn renumbering_alone_is_not_a_change() {
+        // An insertion anywhere shifts every later index. If that counted, one
+        // new menu item would report the whole rest of the window as churn.
+        let before = "[0] AXWindow\n  [5] AXButton \"Save\"\n";
+        let after = "[0] AXWindow\n  [9] AXButton \"Save\"\n";
+        assert!(diff_trees(before, after).is_empty());
+    }
+
+    #[test]
+    fn reparenting_alone_is_not_a_change() {
+        // KakaoTalk regroups its message rows on its own; the messages are the
+        // same messages at a different depth.
+        let before = "  [1] AXRow\n    [2] AXCell\n      [3] AXTextArea = \"hi\"\n";
+        let after = "  [1] AXRow\n    [3] AXTextArea = \"hi\"\n  [2] AXCell\n";
+        assert!(diff_trees(before, after).is_empty());
+    }
+
+    #[test]
+    fn a_menu_opening_survives_a_reshuffle_of_everything_else() {
+        let before = "[0] AXWindow\n  [1] AXButton\n    [2] AXCell\n      [3] AXTextArea = \"hi\"\n";
+        let after = "[0] AXWindow\n  [1] AXButton\n    [2] AXMenu \"_NS:244\"\n  [3] AXCell\n    [4] AXTextArea = \"hi\"\n";
+        let d = diff_trees(before, after);
+        assert_eq!(d.added, vec!["    [2] AXMenu \"_NS:244\"".to_string()]);
+        assert!(d.removed.is_empty(), "got {:?}", d.removed);
+    }
+
+    #[test]
+    fn an_unhandled_line_still_diffs_by_its_text() {
+        let before = "  AXStaticText = \"9:41\"\n";
+        let after = "  AXStaticText = \"9:42\"\n";
+        let d = diff_trees(before, after);
+        assert_eq!(d.added.len(), 1);
+        assert_eq!(d.removed.len(), 1);
     }
 }

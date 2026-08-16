@@ -759,9 +759,12 @@ impl Element {
 
     /// Hit-test a point, in AX global coordinates.
     ///
-    /// Used for the coordinate form of `click`. Note the result is still an
-    /// *element*, and we still act on it via [`Element::activate`] — taking
-    /// coordinates as input never means we start synthesizing mouse events.
+    /// **Not usable for targeting.** On a background app — which is every app
+    /// cua-rs drives — this was measured to answer `AXMenuBar` for every point,
+    /// including points inside the app's own window, so it cannot be trusted to
+    /// name what a coordinate covers. Resolve coordinates against a snapshot's
+    /// element frames instead; see `hit_test` in `cua-core`. Kept for the
+    /// `point_probe` example, which exists to demonstrate exactly this.
     pub fn element_at(&self, x: f32, y: f32) -> Result<Element> {
         let mut out: *const AXUIElement = std::ptr::null();
         check(

@@ -104,6 +104,10 @@ struct ActionArgs {
     #[serde(default)]
     snapshot_id: Option<u64>,
     /// Screen x, in points. Only used when `element_index` is absent.
+    ///
+    /// Resolved to whichever element of the latest `get_app_state` snapshot
+    /// covers the point, so a snapshot has to exist and the point has to be
+    /// inside it. A point that covers nothing is an error, never a guess.
     #[serde(default)]
     x: Option<f32>,
     /// Screen y, in points.

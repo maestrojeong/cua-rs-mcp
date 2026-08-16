@@ -114,6 +114,10 @@ pub enum CoreError {
         found: String,
     },
 
+    /// A coordinate landed on nothing in the app's current snapshot.
+    #[error("no element of `{app}` covers ({x}, {y}) in its current snapshot. Coordinates are resolved against the snapshot's geometry, so the point has to be inside the window get_app_state read; call it again and click the element_index you want")]
+    NoElementAtPoint { app: String, x: f32, y: f32 },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -1104,14 +1108,35 @@ impl Inner {
 
                 Ok((info, node.element.clone(), describe_node(node)))
             }
+            // Resolved against the snapshot's own geometry, not with
+            // `AXUIElementCopyElementAtPosition`. That API was measured to
+            // answer `AXMenuBar` for every point in a *background* app — which
+            // is every app cua-rs drives — so it silently retargeted every
+            // coordinate click at the menu bar, and the failure surfaced as an
+            // unrelated "the AX element and window snapshot drifted apart".
+            // The snapshot already carries each element's frame, so the
+            // hit-test needs no help from AX.
             Target::Point { x, y } => {
-                let app_el = Element::for_pid(info.pid);
-                let el = app_el.element_at(x, y)?;
-                let desc = format!(
-                    "{} at ({x}, {y})",
-                    el.role().unwrap_or_else(|| "AXUnknown".into())
-                );
-                Ok((info, el, desc))
+                let snap = self
+                    .snapshots
+                    .get(&info.pid)
+                    .ok_or_else(|| CoreError::NoSnapshot {
+                        app: info.name.clone(),
+                    })?;
+
+                if snap.process_key != ProcessKey::for_pid(info.pid) {
+                    return Err(CoreError::ProcessReplaced {
+                        app: info.name.clone(),
+                    });
+                }
+
+                let node = hit_test(&snap.nodes, x, y).ok_or(CoreError::NoElementAtPoint {
+                    app: info.name.clone(),
+                    x,
+                    y,
+                })?;
+                let desc = format!("{} at ({x}, {y})", describe_node(node));
+                Ok((info, node.element.clone(), desc))
             }
         }
     }
@@ -1856,6 +1881,33 @@ fn current_window_for_pid_click(
     Ok(live.clone())
 }
 
+/// Pick the element a coordinate names, from a snapshot's frames.
+///
+/// Actionable candidates win over context-only ones, because a coordinate in a
+/// `click` means "press whatever is here" and the static label drawn on top of a
+/// button is not a thing that can be pressed. Among equals the smallest frame
+/// wins: overlapping frames in an AX tree are almost always ancestor and
+/// descendant, and the descendant is the specific answer.
+fn hit_test(nodes: &[AxNode], x: f32, y: f32) -> Option<&AxNode> {
+    let (x, y) = (f64::from(x), f64::from(y));
+    nodes
+        .iter()
+        .filter(|n| {
+            n.frame.is_some_and(|f| {
+                x >= f.origin.x
+                    && y >= f.origin.y
+                    && x < f.origin.x + f.size.width
+                    && y < f.origin.y + f.size.height
+            })
+        })
+        .min_by(|a, b| {
+            let area = |n: &AxNode| n.frame.map_or(f64::MAX, |f| f.size.width * f.size.height);
+            b.is_actionable()
+                .cmp(&a.is_actionable())
+                .then(area(a).total_cmp(&area(b)))
+        })
+}
+
 fn describe_node(node: &AxNode) -> String {
     match (&node.label, &node.value) {
         (Some(l), _) => format!("[{}] {} {l:?}", node.index, node.role),
@@ -1927,6 +1979,46 @@ mod tests {
             settable: false,
             element: Element::system_wide(),
         }
+    }
+
+    fn placed(index: usize, role: &str, act: bool, f: CGRect) -> AxNode {
+        let mut n = tnode(index, role, None, None, act);
+        n.frame = Some(f);
+        n
+    }
+
+    #[test]
+    fn hit_test_prefers_the_actionable_element_over_the_label_drawn_on_it() {
+        let nodes = vec![
+            placed(0, "AXWindow", false, rect(0.0, 0.0, 500.0, 400.0)),
+            placed(1, "AXButton", true, rect(100.0, 100.0, 80.0, 30.0)),
+            placed(2, "AXStaticText", false, rect(110.0, 105.0, 40.0, 20.0)),
+        ];
+        let hit = hit_test(&nodes, 120.0, 110.0).expect("point is inside all three");
+        assert_eq!(hit.index, 1, "a static label is not a thing you can click");
+    }
+
+    #[test]
+    fn hit_test_prefers_the_smallest_of_nested_actionable_frames() {
+        let nodes = vec![
+            placed(0, "AXRow", true, rect(0.0, 0.0, 500.0, 50.0)),
+            placed(1, "AXButton", true, rect(400.0, 10.0, 40.0, 30.0)),
+        ];
+        assert_eq!(hit_test(&nodes, 410.0, 20.0).map(|n| n.index), Some(1));
+        assert_eq!(hit_test(&nodes, 10.0, 20.0).map(|n| n.index), Some(0));
+    }
+
+    #[test]
+    fn hit_test_answers_nothing_outside_every_frame() {
+        let nodes = vec![placed(0, "AXWindow", false, rect(0.0, 0.0, 100.0, 100.0))];
+        assert!(
+            hit_test(&nodes, 500.0, 500.0).is_none(),
+            "a miss has to be reportable, not silently retargeted at the menu bar"
+        );
+        assert!(
+            hit_test(&nodes, 100.0, 50.0).is_none(),
+            "the far edge is exclusive, so adjacent frames cannot both claim a point"
+        );
     }
 
     #[test]
