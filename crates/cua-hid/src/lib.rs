@@ -1150,9 +1150,19 @@ pub fn drag_background_pid(
 /// the real pointer.
 ///
 /// This is the whole of "hover": a `mouseMoved` event carrying the target
-/// point, delivered by pid. A view with an `NSTrackingArea`, a web page with a
-/// `:hover` rule, or a toolbar that reveals a button under the cursor all react
-/// to the event, so the revealed UI shows up in the next snapshot.
+/// point, delivered by pid.
+///
+/// **What it reaches, measured:** web content. A page's `:hover` rule fires and
+/// its `mousemove` listener reads back the exact coordinate this event carried,
+/// in both Chromium and WebKit (DESIGN §11).
+///
+/// **What it did not reach, also measured:** a Finder list row, which changed
+/// neither its accessibility tree nor one byte of its rendered image, in a run
+/// where a click at the same pixel selected the row. The standing explanation is
+/// that an `NSTrackingArea` crossing is computed by the window server from the
+/// real pointer rather than delivered as an event — which would make that a
+/// permanent split rather than a defect here — but that is a hypothesis and the
+/// split is what was measured.
 ///
 /// **What it cannot reach:** anything that asks where the pointer *is* rather
 /// than reading where the event says it went — `NSEvent.mouseLocation`,
