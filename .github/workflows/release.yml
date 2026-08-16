@@ -18,8 +18,14 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
 
-      - name: Rename asset
-        run: cp target/release/cua-rs cua-rs-macos-arm64
+      # Both binaries, because the drawn cursor is the only thing an agent
+      # working in a background window leaves on screen. `cua-rs` looks for
+      # `cua-overlay` next to itself (crates/cua-core/src/overlay.rs), so
+      # shipping the server alone means every `curl | sh` install is silent.
+      - name: Rename assets
+        run: |
+          cp target/release/cua-rs cua-rs-macos-arm64
+          cp target/release/cua-overlay cua-overlay-macos-arm64
 
       # Ad-hoc signing keeps a stable identifier across rebuilds. TCC keys a
       # grant on the binary's code signature, so an unsigned or randomly-signed
@@ -36,9 +42,16 @@ jobs:
             --options runtime \
             cua-rs-macos-arm64
           codesign -dv cua-rs-macos-arm64 2>&1 | head -5
+          codesign --force --sign - \
+            --identifier com.maestrojeong.cua-overlay \
+            --options runtime \
+            cua-overlay-macos-arm64
+          codesign -dv cua-overlay-macos-arm64 2>&1 | head -5
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: cua-rs-macos-arm64
+          files: |
+            cua-rs-macos-arm64
+            cua-overlay-macos-arm64
           generate_release_notes: true
