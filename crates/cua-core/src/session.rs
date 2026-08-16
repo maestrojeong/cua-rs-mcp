@@ -816,6 +816,57 @@ impl Delivery {
     }
 }
 
+/// How `type_text` should get a string into an element.
+///
+/// Two mechanisms, and the caller picks — because neither is right for every
+/// target and picking silently would hide which one ran.
+///
+/// [`Mechanism::Ax`] is the default and stays the default: one `AXValue` /
+/// `AXSelectedText` write replaces or inserts the whole string atomically and
+/// is addressed at the element, so it cannot land anywhere else and needs no
+/// focus at all. That is the one operation accessibility expresses *better*
+/// than events do, so making events the default would be a downgrade for every
+/// ordinary text field.
+///
+/// [`Mechanism::Keystrokes`] is for the targets that ignore `AXValue`
+/// entirely — terminals, canvas editors — where a real key event is the only
+/// thing that works. It is opt-in rather than a fallback because its
+/// weaknesses are the mirror image: a long stream of per-character events
+/// addressed at a *process*, landing on whatever that process's first
+/// responder is, multiplying the focus risk by the length of the string. The
+/// result carries a [`FocusCheck`] for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mechanism {
+    /// A single accessibility write. Default.
+    #[default]
+    Ax,
+    /// Real per-character key events, routed to the target pid.
+    Keystrokes,
+}
+
+impl Mechanism {
+    /// Parse the wire spelling. Unknown values are an error rather than a
+    /// silent fall back to the default: a caller who typed `keystroke` meant
+    /// keystrokes, and quietly writing `AXValue` into a terminal that ignores
+    /// it would look like the tool succeeded and did nothing.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ax" => Ok(Mechanism::Ax),
+            "keystrokes" => Ok(Mechanism::Keystrokes),
+            other => Err(format!(
+                "mechanism must be \"ax\" (one atomic AXValue write, the default) or \"keystrokes\" (real key events routed to the pid, for terminals and canvases that ignore AXValue), got {other:?}"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mechanism::Ax => "ax",
+            Mechanism::Keystrokes => "keystrokes",
+        }
+    }
+}
+
 /// Where a pid-routed keystroke was going to land, as far as accessibility can
 /// say.
 ///
@@ -1231,17 +1282,29 @@ impl Cua {
     }
 
     /// Append text to an element, preferring insertion over replacement.
+    ///
+    /// `mechanism` picks how: [`Mechanism::Ax`] (the default) writes the
+    /// string through accessibility in one call, [`Mechanism::Keystrokes`]
+    /// sends real per-character key events to the target pid for the targets
+    /// that ignore `AXValue`. See [`Mechanism`] for why the choice is the
+    /// caller's rather than automatic.
     pub fn type_text(
         &self,
         app: &str,
         target: Target,
         text: &str,
+        mechanism: Mechanism,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        // `false` is the drawn cursor's "no click ring", the same as
+        // `press_key`: keystrokes are not a click whichever mechanism carries
+        // them.
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.type_text(&app, target, &text))
+            inner.acting(&app, return_state, |i| {
+                i.type_text(&app, target, &text, mechanism)
+            })
         })
     }
 
@@ -2128,7 +2191,16 @@ impl Inner {
         )
     }
 
-    fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
+    fn type_text(
+        &mut self,
+        query: &str,
+        target: Target,
+        text: &str,
+        mechanism: Mechanism,
+    ) -> Result<ActionResult> {
+        if mechanism == Mechanism::Keystrokes {
+            return self.type_text_as_keystrokes(query, target, text);
+        }
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
@@ -2145,6 +2217,69 @@ impl Inner {
             element_point(&el),
         )
         .with_overlay_target(self.overlay_target(info.pid)))
+    }
+
+    /// `type_text` with `mechanism: "keystrokes"` — real per-character key
+    /// events routed to the target pid, for the targets that ignore `AXValue`.
+    ///
+    /// Everything `set_value`'s comment says against this mechanism is still
+    /// true: it appends wherever the process's first responder is, one
+    /// character at a time, with no element addressing. It exists because on a
+    /// terminal or a canvas editor the atomic, element-addressed write it
+    /// loses to simply does nothing at all. So it is a separate, explicit
+    /// choice rather than a fallback, and it reports its [`FocusCheck`] —
+    /// which matters more here than for a single chord, since a miss is
+    /// repeated once per character.
+    fn type_text_as_keystrokes(
+        &mut self,
+        query: &str,
+        target: Target,
+        text: &str,
+    ) -> Result<ActionResult> {
+        if text.is_empty() {
+            return Err(CoreError::PidKeyUnavailable {
+                key: "<empty string>".into(),
+                reason: "there is nothing to type".into(),
+            });
+        }
+        cua_ax::require_trusted()?;
+        let (info, el, desc) = self.resolve(query, &target)?;
+        let before = self.window_fingerprint(info.pid);
+
+        if !cua_hid::skylight_available() {
+            return Err(CoreError::PidKeyUnavailable {
+                key: text.to_string(),
+                reason: "SLEventPostToPid is not available on this macOS version".into(),
+            });
+        }
+
+        let focus = self.prime_for_pid_keyboard(&info, &el);
+        self.enforce_strict_focus(
+            &focus,
+            &format!("{} characters", text.chars().count()),
+            &desc,
+        )?;
+
+        cua_hid::type_text_background_pid(info.pid, text).map_err(|e| {
+            CoreError::PidKeyUnavailable {
+                key: text.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult {
+            verb: format!(
+                "pid-routed keystrokes ({} characters)",
+                text.chars().count()
+            ),
+            target: desc,
+            ui_changed: changed,
+            delivery: Delivery::PidKey,
+            point: element_point(&el),
+            overlay_target: self.overlay_target(info.pid),
+            state: None,
+            focus: Some(focus),
+        })
     }
 
     /// Refuse the send when strict focus mode is on and the app names a
@@ -3275,6 +3410,37 @@ mod tests {
         assert!(refusable(FocusState::Mismatched));
         assert!(!refusable(FocusState::Unverified));
         assert!(!refusable(FocusState::Verified));
+    }
+
+    #[test]
+    fn mechanism_defaults_to_the_accessibility_write() {
+        // The default is the decision, not an accident of ordering: a bulk
+        // text write is the one operation AX expresses better than events.
+        assert_eq!(Mechanism::default(), Mechanism::Ax);
+        assert_eq!(Mechanism::parse("ax"), Ok(Mechanism::Ax));
+        assert_eq!(Mechanism::parse("keystrokes"), Ok(Mechanism::Keystrokes));
+        // Tolerant about shape, not about spelling.
+        assert_eq!(Mechanism::parse("  KeyStrokes "), Ok(Mechanism::Keystrokes));
+    }
+
+    #[test]
+    fn an_unknown_mechanism_is_an_error_rather_than_the_default() {
+        // Falling back to `ax` here would write `AXValue` into a terminal that
+        // ignores it and report success, which is the exact failure the
+        // explicit mechanism exists to prevent.
+        let err = Mechanism::parse("keystroke").expect_err("a near-miss must not be accepted");
+        assert!(
+            err.contains("keystrokes"),
+            "the error names the two valid values: {err}"
+        );
+        assert!(Mechanism::parse("hid").is_err());
+        assert!(Mechanism::parse("").is_err());
+    }
+
+    #[test]
+    fn mechanism_labels_are_stable() {
+        assert_eq!(Mechanism::Ax.as_str(), "ax");
+        assert_eq!(Mechanism::Keystrokes.as_str(), "keystrokes");
     }
 
     #[test]

@@ -22,9 +22,9 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
-    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState, Observed,
-    Permissions, PostActionState, Presence, Screenshot, ScrollDir, StateOptions, Target,
-    WaitOutcome,
+    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,
+    Mechanism, Observed, Permissions, PostActionState, Presence, Screenshot, ScrollDir,
+    StateOptions, Target, WaitOutcome,
 };
 pub use snapshot::{diff_trees, render_tree, RenderOptions, TreeDiff};
 
