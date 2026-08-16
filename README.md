@@ -47,10 +47,18 @@ second half: it activates the target and keeps it frontmost, which is a
 reasonable trade when a human is not sitting there, and the wrong one when they
 are.
 
-[trycua/cua](https://github.com/trycua/cua/tree/main/libs/cua-driver)'s driver is
-a superset of all three — AX actions, SkyLight per-pid delivery, a global HID
-queue for scroll, and `CGWarpMouseCursorPosition` — so it can drive more than
-this can. Breadth is the trade it makes; background-only is the trade made here.
+[trycua/cua](https://github.com/trycua/cua/tree/main/libs/cua-driver)'s driver
+does not pick one: it ships both contracts side by side. Its `click_at_xy` routes
+a SkyLight event to a pid — the same recipe cua-rs ports — while
+`click_at_xy_desktop` posts to the global HID tap so the OS delivers it to
+whatever owns the pixel, "the foreground, vision-driven model that complements
+the background contract" in its own words. Which transport you get depends on how
+the agent found the target: a tree gives you a pid, a screenshot gives you a
+pixel.
+
+cua-rs implements only the background half. That is the honest reason canvas and
+games are out: not that accessibility is missing — it is — but that there is no
+foreground path here to fall back to, by choice.
 
 So cua-rs is best described by what it will not do. There is no flag that warps
 the pointer, posts to the shared keyboard stream, or raises a window: those paths
@@ -168,7 +176,7 @@ Honest ones, not a roadmap.
 | Electron apps | yes — the tree builds lazily, so read twice |
 | Return, Escape, stepper arrows | yes, as AX verbs |
 | arbitrary chords (`⌘⇧P`), drag | **no** — no AX verb exists |
-| canvas apps, terminals | **no** — nothing to address |
+| canvas apps, terminals | **no** — nothing to address, and no pixel fallback |
 
 `set_value` replaces, `type_text` appends, and an app that only reacts to real
 key events will ignore both. Controls with no AX action at all get a mouse event

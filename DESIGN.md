@@ -1,6 +1,7 @@
 # Design notes
 
-Why cua-rs is built the way it is, and what is deliberately not built yet.
+Why cua-rs is built the way it is, what is deliberately not built yet, and what is
+planned next (§11).
 
 ---
 
@@ -64,6 +65,11 @@ AX cannot express everything:
 So the honest ceiling is: cua-rs drives *structured* UI extremely well and
 cannot drive canvas. That is an acceptable trade for the coexistence property,
 and it is written into the README rather than hidden.
+
+Three of those rows are softer than they look. "No verb exists" is a statement
+about accessibility, not about delivery, and the pid tier delivers events without
+consulting accessibility at all — see §11 for what that makes reachable without
+reopening shared input.
 
 ### `press_key`: decided
 
@@ -656,3 +662,79 @@ into whatever the user is editing. Verifying them needs the same
 control-and-measure treatment the click path got, against a target where a miss
 is unambiguous. Until then `press_key` remains AX-only and `post_chord` remains
 the honest, focus-stealing fallback.
+
+---
+
+## 11. Planned: widen the pid tier, never the shared tier
+
+The gaps in §1's capability table — no chords, no drag, no canvas — read like
+consequences of choosing accessibility. Most of them are not. They are
+consequences of `Target::Point` requiring an element, and of two written-but-
+unused functions in `cua-hid`. The shared-input tier stays permanently closed;
+what follows widens the *pid* tier instead, and none of it needs the cursor, the
+global HID queue, or `NSRunningApplication.activate`.
+
+The enabling fact: `PidClick` is `{pid, point, window_local, wid, count}`. There
+is no `Element` in it. Accessibility is how cua-rs *decides where* to click; it
+is not how the click is delivered, and the delivery path never needed an element
+to exist.
+
+### The tiers
+
+| | today | planned |
+|---|:--|:--|
+| element with an AX action | `AXPress`/`AXPick`/`AXConfirm` | unchanged |
+| element with a frame, no action | pid click at its point | unchanged |
+| **point with no element** | refused (`NoElementAtPoint`) | pid click, window-scoped and opt-in |
+| **drag** | refused | pid down / moves / up within one window |
+| **chords** | refused | `press_chord_background_pid`, already written |
+| **pixel-precise scroll** | `AXScroll*ByPage` only | pid wheel events |
+
+### Point with no element — the one that unlocks canvas
+
+An agent that reads a screenshot has a pixel, not an element. Today that is a
+dead end by policy, not by capability. The plan is a distinct opt-in — a
+`click_in_window` tool, or an explicit `require_element: false` — never a silent
+fallback from `click`, because "the point covers nothing" is exactly the shape of
+a typo and blind-clicking a typo is the worst outcome in this project.
+
+Gates, all of which already exist in some form:
+
+1. the caller names a window id from a snapshot, since without an element the
+   window is the only thing left to anchor to;
+2. the point lies inside that window's *live* frame, re-read immediately before
+   posting, which is the check `current_window_for_pid_click` already performs;
+3. the result says `delivery: pid (no element)`, so a caller can never mistake an
+   unverified click for a verified one.
+
+What this cannot do is verify. There is no element to inspect afterwards, so the
+post-action delta is the only feedback, and on a canvas even that is empty. The
+tool description has to say that plainly: aiming is the caller's job, and cua-rs
+is only promising the event reached that pixel of that window.
+
+### Drag
+
+`CGEventSetWindowLocation` is already stamped per event, so a drag is a down, a
+run of moves, and an up, all window-local against one window id. Refuse a drag
+whose endpoints resolve to different windows rather than interpolating across a
+boundary. This is strictly more delicate than a click — a lost mouse-up leaves
+the target mid-drag — so the up must be sent even when a move fails partway.
+
+### Chords
+
+`press_chord_background_pid` and `type_text_background_pid` exist and nothing
+calls them (§10). Turning them on is a verification problem, not an
+implementation one, and the asymmetry is why they are still off: a click that
+misses does nothing, while a keystroke that misses types into whatever the human
+is editing. Gate on the same activation evidence the click path already collects
+— the synthesized notice plus the `AXFrontmost` poll — and require a target whose
+text can be read back, so a miss is provable rather than assumed.
+
+### What stays closed
+
+`post_chord` and `click_by_moving_pointer` remain unreachable from the server.
+They exist so the shared-input path is visible in one file and can be reasoned
+about; if the pid tier above lands, they should be deleted rather than left as a
+temptation. Global HID delivery and cursor warping are not planned, not gated
+behind a flag, and not a future option: they are the thing this project exists
+to not do.
