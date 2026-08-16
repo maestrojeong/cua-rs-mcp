@@ -677,6 +677,30 @@ pub struct Candidate {
 }
 
 impl Candidate {
+    /// Replace the *answer* being judged, keeping the question.
+    ///
+    /// For a key that presses a dialog's default button rather than the control
+    /// it was aimed at (see [`key_activates_default_button`]). Both controls are
+    /// answers to the same question, so `context` is deliberately untouched —
+    /// what changes is which answer is about to be given.
+    ///
+    /// `value`, `settable` and `caption` are cleared rather than carried over:
+    /// they described the element the caller named, and keeping them would let a
+    /// text field the caller aimed at excuse a button it did not.
+    pub fn substitute_answer(
+        &mut self,
+        role: impl Into<String>,
+        label: Option<String>,
+        description: String,
+    ) {
+        self.role = role.into();
+        self.label = label;
+        self.value = None;
+        self.settable = false;
+        self.caption = None;
+        self.description = format!("{description} (the default button `return` will press)");
+    }
+
     /// Whether this looks like somewhere a human types.
     ///
     /// Used only to decide what a bare Delete key press means: in a text field
@@ -1214,6 +1238,35 @@ pub fn destructive_key(key: &str, candidate: Option<&Candidate>) -> Option<Strin
     }
 }
 
+/// Whether this key presses a dialog's **default** button rather than whatever
+/// the caller aimed at.
+///
+/// The gap this closes: every other gate here judges the element the caller
+/// named, which is right for a click because a click lands where it is aimed.
+/// Return does not. Inside an alert it activates the default button — the one
+/// AppKit drew with a pulsing highlight — no matter which control the caller
+/// addressed. So `press_key return` aimed at an alert's Cancel button was judged
+/// against *Cancel*, found exempt because cancelling is safe, and then pressed
+/// **Delete**. The one arrangement where the aimed element and the affected
+/// element are different, in the one place it costs the most.
+///
+/// Only Return and Enter. Escape has the mirror-image property — it activates
+/// the cancel button — but that direction is safe by construction, and space
+/// presses the focused control, which is the aimed-element case the rest of the
+/// gate already covers correctly.
+pub fn key_activates_default_button(key: &str) -> bool {
+    let key = key.trim().to_lowercase();
+    // A modified Return is an app-specific shortcut rather than "confirm this
+    // dialog", so it is left to the ordinary aimed-element judgement.
+    if key.contains('+') {
+        return false;
+    }
+    matches!(
+        key.as_str(),
+        "return" | "enter" | "kp_enter" | "keypad_enter" | "numpad_enter"
+    )
+}
+
 // ── screen lock ──────────────────────────────────────────────────────────────
 
 /// Whether this login session is locked or showing its screen saver.
@@ -1407,6 +1460,11 @@ impl Gate {
     }
 
     /// The element this action will land on, for the caller to resolve.
+    /// The key this gate is for, when it is a `press_key`.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
     pub fn target(&self) -> Option<&Target> {
         self.target.as_ref()
     }
@@ -2612,5 +2670,112 @@ mod tests {
         let list = parse_allowlist("com.1password.1password");
         assert!(in_scope(&list, "com.1password.1password"));
         assert!(forbidden_bundle("com.1password.1password").is_some());
+    }
+
+    // ── Return presses the default button, not the aimed one ─────────────────
+
+    #[test]
+    fn only_an_unmodified_return_presses_the_default_button() {
+        for key in [
+            "return",
+            "enter",
+            "Return",
+            " ENTER ",
+            "kp_enter",
+            "numpad_enter",
+        ] {
+            assert!(
+                key_activates_default_button(key),
+                "{key:?} should be treated as pressing the default button"
+            );
+        }
+        // Escape activates the *cancel* button, which is safe by construction,
+        // and space presses the focused control, which is the aimed-element case
+        // the rest of the gate already judges correctly.
+        for key in ["escape", "space", "a", "delete", "tab", "down"] {
+            assert!(!key_activates_default_button(key), "{key:?}");
+        }
+        // A modified Return is an app shortcut, not "confirm this dialog".
+        for key in ["cmd+return", "shift+enter", "ctrl+alt+return"] {
+            assert!(!key_activates_default_button(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn substituting_the_answer_keeps_the_question() {
+        let (sheet, answers) =
+            confirm_sheet("Delete 4 items?", "This cannot be undone.", &["Cancel"]);
+        let cancel = answers[0];
+
+        // Aimed at Cancel, the gate is right to allow it: cancelling is how a
+        // caller avoids the destruction.
+        let mut c = sheet.candidate(cancel);
+        assert!(destructive_context(&c).is_none(), "Cancel must stay exempt");
+
+        // But `return` will press Delete. Substituting the answer must flip the
+        // verdict while the question stays the same one.
+        let before = c.context.clone();
+        c.substitute_answer(
+            "AXButton",
+            Some("Delete".to_string()),
+            "[9] AXButton \"Delete\"".into(),
+        );
+        assert_eq!(c.context, before, "the question is unchanged");
+        assert!(
+            destructive_token(&c.classifiable_text()).is_some(),
+            "Delete is destructive on its own label"
+        );
+    }
+
+    #[test]
+    fn a_substituted_terse_default_is_caught_by_the_question() {
+        // The harder shape: the default button says nothing, so only the
+        // question can convict it. This is the case the whole context rule
+        // exists for, reached through a key rather than a click.
+        let (sheet, answers) =
+            confirm_sheet("4개 항목을 삭제할까요?", "되돌릴 수 없습니다.", &["취소"]);
+        let cancel = answers[0];
+
+        let mut c = sheet.candidate(cancel);
+        assert!(destructive_context(&c).is_none(), "취소 must stay exempt");
+
+        c.substitute_answer(
+            "AXButton",
+            Some("확인".to_string()),
+            "[9] AXButton \"확인\"".into(),
+        );
+        let (_, matched) = destructive_context(&c).expect("확인 under a 삭제 question is refused");
+        assert!(matched.contains("삭제"), "matched {matched:?}");
+    }
+
+    #[test]
+    fn substitution_does_not_carry_the_aimed_elements_exemptions() {
+        // Aimed at a text field, which is exempt from context evidence because
+        // typing into a sheet is not the decision. If substitution kept
+        // `settable`, the field would excuse the button Return actually presses.
+        let mut sheet = Tree::default();
+        let window = sheet.window("Documents");
+        let ctx = sheet.sheet(window, None);
+        let body = sheet.group(ctx);
+        sheet.text(body, "Delete 4 items?");
+        let name = sheet.field(ctx, "notes about deleting things");
+
+        let mut c = sheet.candidate(name);
+        assert!(
+            destructive_context(&c).is_none(),
+            "a field is not the decision"
+        );
+
+        c.substitute_answer(
+            "AXButton",
+            Some("OK".to_string()),
+            "[9] AXButton \"OK\"".into(),
+        );
+        assert!(!c.settable, "the field's writability must not survive");
+        assert!(c.value.is_none(), "the field's text must not survive");
+        assert!(
+            destructive_context(&c).is_some(),
+            "OK under a delete question is refused even when a field was aimed at"
+        );
     }
 }

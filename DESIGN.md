@@ -1004,6 +1004,41 @@ Closing the race properly means being *notified* rather than polling, and by
 something whose lifetime does not depend on this process. That is a separate
 helper, not a flag.
 
+**Return does not land where it was aimed, and that was a hole.** Every other
+gate here judges the element the caller named, which is right for a click. Inside
+an alert, Return activates the **default** button — the one AppKit draws
+highlighted — whatever control the caller addressed. So `press_key return` aimed
+at a dialog's Cancel button was judged against *Cancel*, found exempt because
+cancelling is the safe answer, and then pressed **Delete**. Measured, before the
+fix, on a real `AXWindow[AXDialog]` asking *Delete 4 items?*: the call was allowed
+and `osascript` reported `button returned:Delete`.
+
+The fix follows the reference the window already publishes. For an unmodified
+Return, the gate resolves `AXDefaultButton` on the nearest window-like ancestor —
+bottom-up, so a sheet's own default button wins over its parent window's — and
+judges *that* control instead. The question is deliberately untouched: both
+controls are answers to the same one, and only the answer changes. The aimed
+element's `value`, `settable` and `caption` are dropped in the swap, so a text
+field the caller aimed at cannot excuse the button Return actually presses.
+
+Attempted for every Return, not only where an enclosing decision context was
+found, because aiming at the dialog *window itself* has no context above it — the
+window **is** the context — and that was the shape of the first live failure.
+Outside a dialog no window publishes a default button, so it resolves to nothing
+and changes nothing.
+
+Verified after the fix, on the same dialog: aiming at Cancel and aiming at the
+window are both refused, quoting `AXButton "Delete" (the default button
+`return` will press)`, and the dialog is still on screen afterwards. A dialog
+asking *Save these settings?* with an `OK` default is still allowed and returned
+`button returned:OK`.
+
+Deliberately narrow. Escape has the mirror-image property — it activates the
+cancel button — but that direction is safe by construction. Space presses the
+focused control, which is the aimed-element case already judged correctly. A
+*modified* Return is an app shortcut rather than "confirm this dialog", so it
+keeps the ordinary judgement.
+
 ### HTTP: loopback is not authorization
 
 The Streamable HTTP transport used to rely on binding to `127.0.0.1`. That keeps

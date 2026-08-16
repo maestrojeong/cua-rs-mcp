@@ -1101,6 +1101,38 @@ struct FocusProbe {
 
 /// A short human-readable name for a live element, for error text and for
 /// naming the element that holds focus instead of the addressed one.
+/// The default button of the nearest window-like ancestor that publishes one.
+///
+/// Walks up from the element itself, asking each window-like ancestor for
+/// `AXDefaultButton` and returning the first answer. Both steps matter: a sheet
+/// publishes its own default button, and asking the element's parent window
+/// first would return the window's instead of the sheet's — the wrong control,
+/// in exactly the case a sheet is up.
+///
+/// `None` when nothing up the chain publishes one, which is the ordinary case
+/// outside a dialog and is why the caller only asks inside a decision context.
+fn default_button_of_ancestor(el: &Element) -> Option<Element> {
+    /// Roles that can own a default button. `AXSheet` before `AXWindow` is not
+    /// an ordering here — the walk is bottom-up, which gets the same result.
+    const WINDOW_LIKE: &[&str] = &["AXSheet", "AXDialog", "AXWindow", "AXPopover"];
+    /// A window is a handful of levels above a button even in a deep toolkit;
+    /// the cap only exists so a malformed parent chain cannot spin.
+    const MAX_STEPS: usize = 32;
+
+    let mut current = Some(el.clone());
+    for _ in 0..MAX_STEPS {
+        let node = current?;
+        let role = node.role().unwrap_or_default();
+        if WINDOW_LIKE.iter().any(|w| *w == role) {
+            if let Some(button) = node.element("AXDefaultButton") {
+                return Some(button);
+            }
+        }
+        current = node.element(cua_ax::attr::PARENT);
+    }
+    None
+}
+
 fn describe_element(el: &Element) -> String {
     let role = el.role().unwrap_or_else(|| "element".into());
     match el
@@ -2363,7 +2395,12 @@ impl Inner {
     /// is the one the tree showed them. `None` when nothing can be resolved,
     /// which the gate treats as "unknown" rather than "harmless"; the action's
     /// own resolution then reports the real reason.
-    fn safety_candidate(&self, query: &str, target: &Target) -> Option<crate::safety::Candidate> {
+    fn safety_candidate(
+        &self,
+        query: &str,
+        target: &Target,
+        key: Option<&str>,
+    ) -> Option<crate::safety::Candidate> {
         let info = apps::resolve_app(query).ok()?;
         let snap = self.snapshots.get(&info.pid)?;
         let node = match *target {
@@ -2394,7 +2431,7 @@ impl Inner {
         let context = crate::safety::decision_context(&projection, node.index);
         let caption = crate::safety::caption(&projection, node.index);
 
-        Some(crate::safety::Candidate {
+        let mut candidate = crate::safety::Candidate {
             role: node.role.clone(),
             label: node.label.clone(),
             value: node.value.clone(),
@@ -2403,7 +2440,36 @@ impl Inner {
             caption,
             description: describe_node(node),
             context,
-        })
+        };
+
+        // Return does not land where it was aimed. Inside a decision context it
+        // presses that context's default button, so that is the control the gate
+        // has to judge — see `safety::key_activates_default_button`. The question
+        // is unchanged, because both controls are answers to the same one; only
+        // the answer being given is different from the one the caller named.
+        //
+        // Read live rather than from the snapshot: `AXDefaultButton` is a
+        // reference the window publishes, and following it is exact, where
+        // guessing which snapshot node it points at would be a second heuristic
+        // inside a gate that exists to avoid one. This runs on the native
+        // thread, which is the only place an `AXUIElement` may be touched.
+        // Attempted whenever the key is Return, not only when a decision context
+        // was found above the aimed element. Aiming at the dialog *window*
+        // itself has no context above it — the window is the context — and the
+        // first live run of this gate pressed a real "Delete" that way. If
+        // nothing up the chain publishes a default button, which is every
+        // ordinary window, this resolves to `None` and changes nothing.
+        if key.is_some_and(crate::safety::key_activates_default_button) {
+            if let Some(button) = default_button_of_ancestor(&node.element) {
+                candidate.substitute_answer(
+                    button.role().unwrap_or_default(),
+                    button.label(),
+                    describe_element(&button),
+                );
+            }
+        }
+
+        Some(candidate)
     }
 
     fn acting<F>(
@@ -2421,7 +2487,9 @@ impl Inner {
         // is gated by default instead of by remembering. An app that will not
         // resolve is left to the action, which reports that better.
         if let Ok(info) = apps::resolve_app(query) {
-            let candidate = gate.target().and_then(|t| self.safety_candidate(query, t));
+            let candidate = gate
+                .target()
+                .and_then(|t| self.safety_candidate(query, t, gate.key()));
             crate::safety::guard(&info, &self.human, &gate, candidate.as_ref())?;
         }
 
