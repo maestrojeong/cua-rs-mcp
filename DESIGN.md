@@ -1,7 +1,7 @@
 # Design notes
 
-Why cua-rs is built the way it is, what is deliberately not built yet, and what is
-planned next (§11).
+Why cua-rs is built the way it is, what is deliberately not built yet, what is
+planned next (§11), and the largest thing currently declined (§12).
 
 ---
 
@@ -669,6 +669,7 @@ or verified live
 | Spaces handling | off-Space windows are observation-only, matching prior art |
 | per-app leases | needed once two agents share one machine |
 | yield-to-human detection | requires watching real input, which needs an event tap |
+| picture-in-picture mirror of the driven window | measured 5–8 fps at 39% of a core on the current capture path; clearing that means `SCStream`, a signed bundle and a second Screen Recording grant — §12 |
 
 ---
 
@@ -884,3 +885,199 @@ adding the import back first.
 
 Global HID delivery and cursor warping are not planned, not gated behind a flag,
 and not a future option: they are the thing this project exists to not do.
+
+---
+
+## 12. Picture-in-picture: mirroring the driven window
+
+A spike, not a plan. §11 is what is planned next; this is the strongest
+alternative to it that was considered and is currently declined, with the
+measurements that decided it.
+
+It lives in this file rather than a `docs/` tree because §2 is already the same
+genre — a rejected capture alternative argued with head-to-head numbers — and
+because a reader asking "why does cua-rs not mirror the window" looks here,
+next to §9 and §11, not in a second document.
+
+### The problem it would solve
+
+The drawn cursor (§ the overlay, `crates/cua-overlay`) tells you *where* the
+agent acted. It cannot tell you *what happened*, because the window it is
+annotating may be behind another window or on another Space — which is the
+normal case, since §1's contract forbids raising it. So the honest description
+of the shipped state is: you see a marker floating over a window you may not be
+able to read.
+
+Picture-in-picture is the complete answer: a small always-visible window
+showing live pixels of the driven window, so the human watches the work without
+the work being brought to them. It is the same idea as the overlay, taken to
+its end.
+
+### What the current capture path would cost as a mirror
+
+`cua-capture::capture_window` is one `/usr/sbin/screencapture -l<id>` process,
+optionally one `/usr/bin/sips` process, a temp directory, and a PNG read — per
+frame. §2 explains why every one of those is deliberate for *screenshots*: the
+process boundary catches a SkyLight `SIGABRT` that no Rust `Result` can, and a
+screenshot is a once-per-tool-call event where 150 ms is free.
+
+Measured on this machine (M-series, macOS 15, 211 windows live), 12 iterations
+per window, full `capture_window` including the pre-capture re-enumeration:
+
+| window | size | `max_dim=1400` | no resize |
+|---|:--|:--|:--|
+| Slack | 1393×884 | p50 187 ms · mean 188 · **5.3 fps** | p50 147 ms · mean 146 · 6.9 fps |
+| Xcode welcome | 740×460 | p50 188 ms · mean 185 · **5.4 fps** | p50 135 ms · mean 134 · 7.5 fps |
+| Calendar | 935×598 | p50 163 ms · mean 163 · **6.1 fps** | p50 122 ms · mean 123 · 8.2 fps |
+
+Broken down, on the same windows:
+
+| stage | cost |
+|---|:--|
+| bare `screencapture -x -o -l<id>` | **70–100 ms** |
+| `sips --resampleHeightWidthMax 1400` | 10–40 ms |
+| `list_windows()` (re-enumerated every frame) | p50 **28 ms**, max 56 |
+| temp dir, PNG read, IHDR parse, `Vec` | the rest, ~15–25 ms |
+
+And the sustained cost, 30 back-to-back captures of the 935×598 window:
+**4.90 s wall, 1.37 s user + 0.52 s sys** — about **39% of one core held
+continuously to produce 6 fps of a single medium window.** That is the number
+that decides this. A mirror is not a screenshot; it runs for the whole session,
+next to an agent that also wants CPU, on a laptop the human is using.
+
+So: a 5–8 fps ceiling, ~160 ms of latency before compositing, and a third of a
+core. A mirror at that rate is not "slow video", it is a slideshow that lags far
+enough behind that a human cannot tell whether the agent has stalled. The
+threshold for "watchable" is roughly 15 fps and under 150 ms end to end; the
+current path misses both by a factor of two to three, and no amount of tuning
+closes it, because the floor is `screencapture`'s own 70–100 ms process launch.
+
+### Whether §2's conclusion transfers. It does not.
+
+§2 concludes ScreenCaptureKit "buys nothing here", and that conclusion is sound
+for what it was about: **correctness**. The head-to-head was whether
+`SCScreenshotManager` returns a *better image* than `screencapture -l` — it does
+not; the two agree window for window, succeeding and failing together, because
+the block is at the window layer rather than in the API.
+
+A continuous mirror asks a different question: **throughput**. On that axis the
+two are not equivalent at all, and the measurements above are the reason.
+`SCStream` is a persistent stream — one content filter, one session, frames
+delivered to a callback as `CMSampleBuffer`s at a requested interval, with no
+process launch, no file, no PNG encode and no re-enumeration per frame. It is
+built for exactly the workload the subprocess path is worst at. Two of §2's own
+findings actually reinforce this rather than contradict it: that a second
+`SCScreenshotManager` capture in one process fails with `-3811`, and that the
+per-frame process boundary exists to survive `SIGABRT`, are both statements
+about *repeated one-shot captures*, which is the pattern a stream replaces.
+
+So the honest position is that §2 rejected ScreenCaptureKit for the screenshot
+requirement and was right to, and that a mirror would have to revisit it and
+would probably land the other way — which is exactly why the mirror is
+expensive rather than cheap. It is not "reuse `cua-capture` and add a window".
+
+Two things carry over unchanged and must not be lost in a rewrite:
+`SCContentFilter` can abort the process outright inside `SLGetDisplaysWithRect`
+before any capture is attempted, so a stream stays behind a process boundary
+regardless — the boundary moves from per-frame to per-session, which is the
+whole saving. And the mirror must never composite a *region*: §2 measured a
+region capture of a covered window returning an unrelated app's pixels, and a
+mirror that silently shows the wrong window while claiming to show the agent's
+is worse than no mirror.
+
+### TCC is the blocker, and it is not a code problem
+
+§7 is the constraint: Screen Recording is granted to the **host** process that
+launches `cua-rs` — the terminal, Claude Desktop, Cursor — not to `cua-rs`.
+Today's subprocess path works precisely because of that. `screencapture` is an
+Apple-signed system binary launched as a child of the responsible host, and it
+inherits the host's authorization. cua-rs holds no grant of its own and needs
+none.
+
+`SCStream` does not inherit like that in practice. The API path that makes a
+stream work is a signed bundle with a Team ID holding its **own** Screen
+Recording entry, hardened runtime, `LSUIElement`. That means:
+
+- an Apple Developer account and Developer ID signing plus notarization — which
+  §7 already declines, on the grounds that it buys one download path and no
+  fewer permission prompts. A mirror would make it mandatory rather than nice.
+- a **second, separate** Screen Recording approval the user must give, to a
+  binary, on top of the grants they already gave their host app. Every §7
+  paragraph about how badly this project's users are served by per-host grants
+  applies twice as hard to a second grant on a different principal.
+- the persistent screen-sharing indicator in the menu bar for the whole
+  session. Arguably correct — something *is* watching the screen — but it is a
+  visible, permanent change to the user's machine that the current design does
+  not make.
+- a `.app` bundle as the shipped artifact. `install.sh` currently drops two
+  bare executables into a directory on PATH; a bundle is a different
+  distribution story end to end, and it would break the `curl | sh` install
+  that is the documented entry point.
+
+That last chain is the real cost. Ship a mirror and the project stops being
+"one Rust binary you can `curl | sh`" and becomes a signed, notarized macOS app
+that asks for its own screen-recording permission. That is a change of category,
+not a feature.
+
+### Where it would live, if it were built
+
+Not in `cua-mcp`, and not in a third binary. `cua-overlay` is already the right
+shape and nearly all of the hard-won parts are already solved in it: a
+borderless `NSWindow` that is never focused and never key, click-through so it
+cannot intercept the human's input, `CanJoinAllSpaces | Stationary |
+IgnoresCycle`, level tracking that follows the target's own `CGWindow` layer
+band and refuses to promote itself above every app on the machine, hiding
+itself when the target app is not frontmost, a line-oriented stdin protocol, and
+exit on EOF. A mirror is that window with a different `drawRect`. Rebuilding
+those properties in a third binary would be duplicating the subtlest 891 lines
+in the workspace.
+
+But the process boundary should move. Today `cua-rs` captures and `cua-overlay`
+draws; a mirror should have the overlay hold the stream and draw frames it owns,
+because piping frames over the stdin pipe would add a copy and a serialization
+per frame to a budget that is already the problem. That inverts which process
+needs the Screen Recording grant — the overlay, not the server — which is
+convenient in one way (only the drawn-cursor binary needs a bundle) and awkward
+in another (`cua-rs` is a plain executable and `cua-overlay` is a signed app,
+installed side by side, which `install.sh` and the sibling lookup in
+`cua-core/src/overlay.rs` would both have to learn).
+
+### Recommendation: do not build it
+
+Not now, and not as an incremental step on `cua-capture`. The measured ceiling
+of the current path is 5–8 fps at 39% of a core, which is not a watchable
+mirror; clearing it means an `SCStream` rewrite; that rewrite means a signed,
+notarized bundle with its own Screen Recording grant, a second permission
+prompt, and the end of the single-binary `curl | sh` install. The observability
+problem it addresses is real, but the overlay shipped in the release now covers
+the cheap 80% of it — you can see, live and on your own Space, where every
+action landed — and PIP is the expensive remaining 20%.
+
+What would change the answer, in the order it would change it:
+
+1. **A Developer ID and notarization becoming necessary for another reason.**
+   If §7's "would be nicer" ever happens for Gatekeeper's sake, the dominant
+   cost of PIP is already paid and the calculation flips. This is the likeliest
+   path, and it means PIP should be re-evaluated *after* signing, never as the
+   justification for it.
+2. **An `SCStream` prototype delivering ≥15 fps under 10% of a core, on a
+   grant the host already provides.** The second clause matters more than the
+   first: if a stream turns out to work under inherited host authorization,
+   without its own bundle grant, the entire TCC objection evaporates and this
+   becomes an afternoon's work in `cua-overlay`. Worth one day of measurement
+   before ever writing the feature. Nothing here establishes that it does not
+   work; it was not tested, because §2 had no reason to test throughput.
+3. **Users reporting that the arrow is not enough.** The overlay is new to the
+   release as of this section; the honest thing is to find out whether the
+   cheap answer was sufficient before costing the expensive one. If the common
+   complaint turns out to be "I can see where it clicked but not what
+   happened", that is the signal.
+4. **A second agent, or a headless Space.** Per-app leases (§9) and off-Space
+   work make the window genuinely unreachable rather than merely inconvenient,
+   and at that point a marker over an invisible window annotates nothing.
+
+What would *not* change the answer: making the subprocess path faster. Dropping
+the per-frame `list_windows` saves 28 ms, skipping `sips` saves 10–40, keeping
+one temp directory saves a few — call it 60 ms off a 163 ms frame, landing at
+~10 fps and still a third of a core. Optimizing toward a target that is a
+factor of two away is how a slideshow gets shipped.
