@@ -5,6 +5,101 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.6.0
+
+The tier order flipped. `click` and `press_key` now go through pid-routed
+delivery unconditionally, with no accessibility attempt in either direction, and
+`press_key` accepts arbitrary chords for the first time. `set_value` and
+`type_text` are deliberately untouched.
+
+Read the last section of this entry before turning it on anywhere that matters:
+the keyboard half ships **unverified**, on purpose and on the record.
+
+### `click`: pid only, no AX and no retry
+
+Through 0.5.x, `click` tried `AXPress`/`AXPick`/`AXConfirm` first and used the
+pid tier only where an element advertised no action. Now every click is a mouse
+event routed to the target process, and a failure is a failure — there is no
+`AXPress` attempt before it and no retry through one afterwards.
+
+The reason is not that pid delivery is faster; it is not. It pays a window
+re-enumeration, a window-identity match and an `AXFrontmost` poll before it sends
+anything, where `AXPress` is one synchronous IPC call. The reason is that
+accessibility was never the delivery mechanism, only the way cua-rs decides
+*where* to click, and it cannot express a click count at all — so a double-click
+was already pid-only and the tier boundary was arbitrary. One route per action
+removes a case analysis rather than adding a mechanism.
+
+Dropping the retry is the substantive part. Retrying a failed pid click through
+`AXPress` reads as free insurance and is not: it reintroduces exactly the quirks
+the pid tier exists to escape — an element that advertises `AXPress` and silently
+ignores it, an action that fires while the visual state lags, a stale handle
+recycled onto other content that would still happily accept a press. "Try A, and
+if that seems to have failed, also try B" is where the surprising bugs live.
+
+`CUA_AX_FIRST=1` restores the 0.5.x order. It is a bisecting tool, not a
+supported "best of both" mode.
+
+### `press_key`: arbitrary chords, and a delivery mode with a caveat
+
+`press_key` used to map `return`/`enter` to `AXConfirm`, `escape` to `AXCancel`,
+`up`/`down` to `AXIncrement`/`AXDecrement`, and refuse everything else. It now
+parses and sends real key events, so `cmd+shift+p`, `ctrl+alt+delete`, plain
+letters and digits all work — closing the "arbitrary chord — no verb exists,
+still refused" row that §1 of DESIGN.md had listed as a permanent ceiling.
+
+Nothing was discovered to make this possible; `press_chord_background_pid` has
+been written and unreachable for several releases. What changed is the decision to
+call it, and the argument for calling it is that accessibility has no vocabulary
+for a key press beyond `AXConfirm` and `AXCancel`. A real event is the only thing
+`⌘⇧P` could ever be, so there is no second tier to fall back to.
+
+Results carry `delivery: pid (keyboard)`, a distinct label from `pid`, because
+what it promises is different — see below.
+
+`CUA_KEY_AX_ONLY=1` restores the AX-verb-only path (`return`/`escape`/`up`/`down`
+only, chords refused).
+
+### `set_value` and `type_text` did not move, on purpose
+
+They still write `AXValue`/`AXSelectedText`. A bulk text write is the one
+operation accessibility expresses *better* than events can: one call, atomic,
+addressed at the element. The same text as keystrokes is a long stream landing on
+whatever holds focus, character by character, which multiplies the risk below by
+the length of the string and buys nothing. `type_text_background_pid` stays
+written and unwired for the same reason.
+
+So an app that only reacts to real key events still ignores both, exactly as
+before. `press_key` is the way to reach it, one key or chord at a time.
+
+### What this release does not have: verification of the keyboard path
+
+A pid key event carries a target **pid** and no target **element**. It lands
+wherever that process's own first responder currently is. `cua-core`
+best-effort-focuses the addressed element first via `AXFocused`, but accessibility
+does not make every element settably focused, and there is no query that confirms
+the focus moved before the keystrokes did.
+
+That is why this sat gated for several releases: a click that misses does nothing,
+while a keystroke that misses types into whatever the human was editing. Being the
+only possible mechanism is an argument for the design — it is not evidence that a
+key lands where it was aimed, and no control-and-measure run has been done. Earlier
+drafts of DESIGN.md papered over this by pointing at another implementation's
+behaviour as though it were cua-rs's own measurement; §10 now states the debt
+plainly instead.
+
+Treat `press_key` on an app you have not tried yourself as unproven. Verify on a
+target whose text can be read back, and use `CUA_KEY_AX_ONLY=1` if it misbehaves.
+
+### Other
+
+- `Delivery` gains `PidKey` (`pid (keyboard)`). Callers matching exhaustively need
+  the arm.
+- New errors: `PidClickFailed`, `PidKeyUnavailable` — the pid tier's own failure
+  modes, distinct from `PidClickUnavailable`, which meant "accessibility was tried
+  and the quiet fallback also failed".
+- README trimmed to essentials.
+
 ## 0.5.2
 
 Three defects an external review of 0.5.1 found in `cua-overlay`. All of them are
