@@ -11,18 +11,30 @@
 //!   `#[tool]` macros from types. A renamed field or a tool that stops being
 //!   registered is invisible until an agent calls it and fails, and no unit test
 //!   covers the wiring between the arg structs and the router.
-//! - **The HID refusal.** `press_key` permanently rejecting a chord is
-//!   the project's central safety property. It is enforced before any AX call, so
-//!   it is reachable and assertable with no permissions at all.
+//! - **The keyboard tier switch.** `press_key`'s capability check
+//!   (`cua_hid::parse_chord` in the default pid-only mode, `ax_verb_for_key`
+//!   under `CUA_KEY_AX_ONLY=1`) runs before any AX call in both modes, so which
+//!   one is active is reachable and assertable with no permissions at all —
+//!   this used to be a single "chords are always refused" invariant; it is now
+//!   two, one per mode.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 /// Send a batch of JSON-RPC lines to the binary and collect the responses.
 fn talk(args: &[&str], requests: &[&str]) -> Vec<serde_json::Value> {
+    talk_with_env(args, &[], requests)
+}
+
+/// Like [`talk`], with extra environment variables set on the child — for
+/// exercising a `std::env::var`-gated switch like `CUA_KEY_AX_ONLY` without
+/// touching the test process's own environment (which `cargo test` shares
+/// across parallel test threads and would make this racy).
+fn talk_with_env(args: &[&str], env: &[(&str, &str)], requests: &[&str]) -> Vec<serde_json::Value> {
     let exe = env!("CARGO_BIN_EXE_cua-rs");
     let mut child = Command::new(exe)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -183,8 +195,12 @@ fn every_action_tool_accepts_a_snapshot_id() {
 }
 
 #[test]
-fn a_chord_is_refused_without_a_shared_hid_escape_hatch() {
-    // Reachable with no grants: the refusal happens before any AX call.
+fn a_chord_is_attempted_via_pid_by_default() {
+    // Reachable with no grants: `cua_hid::parse_chord` is pure and runs before
+    // `require_trusted`/`resolve`, so this either fails on the missing grant
+    // or the missing snapshot depending on the test machine's own TCC state —
+    // never on the old "no accessibility equivalent" refusal, because that
+    // refusal no longer applies to a chord in the default keyboard tier.
     let responses = talk(
         &[],
         &[
@@ -195,7 +211,34 @@ fn a_chord_is_refused_without_a_shared_hid_escape_hatch() {
     assert_eq!(
         response(&responses, 3)["result"]["isError"],
         true,
-        "a chord must be refused by default"
+        "no permission/snapshot means this still fails, just not for lacking an AX verb"
+    );
+    let text = call_text(&responses, 3);
+    assert!(
+        !text.contains("does not synthesize shared HID") && !text.contains("no accessibility equivalent"),
+        "a chord must not be refused for lacking an AX verb in the default (pid) keyboard tier: {text}"
+    );
+}
+
+#[test]
+fn cua_key_ax_only_restores_the_old_chord_refusal() {
+    // The escape hatch back to the pre-pid-tier contract: with it set, a
+    // chord is refused by the same `KeyNoAccessibilityEquivalent` message as
+    // before this tier existed, and — like the default mode above — that
+    // refusal is reachable with no grants because `ax_verb_for_key` is pure
+    // and runs before `require_trusted`.
+    let responses = talk_with_env(
+        &[],
+        &[("CUA_KEY_AX_ONLY", "1")],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"press_key","arguments":{"app":"Finder","element_index":"0","key":"cmd+shift+p"}}}"#,
+        ],
+    );
+
+    assert_eq!(
+        response(&responses, 3)["result"]["isError"],
+        true,
+        "a chord must be refused under CUA_KEY_AX_ONLY=1"
     );
     let text = call_text(&responses, 3);
     assert!(

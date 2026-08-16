@@ -780,6 +780,9 @@ fn render_action(r: &cua_core::ActionResult) -> String {
             cua_core::Delivery::Ax => {
                 "  (accessibility action: cursor, focus and frontmost app untouched)"
             }
+            cua_core::Delivery::PidKey => {
+                "  (real key events routed to the target process via the private SkyLight SPI, not through the shared keyboard tap: they land wherever that process's own first responder currently is, which cua-rs best-effort-focuses first but cannot guarantee)"
+            }
         },
         r.ui_changed.as_str(),
     );

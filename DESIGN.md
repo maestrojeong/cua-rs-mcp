@@ -20,14 +20,14 @@ occasionally type into the wrong window.
 The Accessibility API addresses an element, not a screen position:
 
 ```rust
-// what a click actually is here
-element.perform("AXPress")?;              // AXUIElementPerformAction
 // what typing actually is here
 element.set_string("AXValue", "hello")?;  // AXUIElementSetAttributeValue
 ```
 
 Neither call has a coordinate, a cursor, or a notion of focus. The app receives a
-message and acts on it.
+message and acts on it. (Through 0.4.x, `click` was also `element.perform("AXPress")`
+first. As of this change it is not — see "click and press_key moved to pid-only"
+below for why that changed and why `set_value`/`type_text` did not.)
 
 ### This was verified, not assumed
 
@@ -57,26 +57,29 @@ AX cannot express everything:
 | Return, Escape | `AXConfirm`, `AXCancel` | works |
 | context menu | `AXShowMenu` | works |
 | page a scroll area | `AXScroll*ByPage` | works |
-| set text | `AXValue` write | works, but *replaces* |
-| **arbitrary chord** (`⌘⇧P`) | — | **no verb exists**, still refused |
-| **drag** | — | **no verb exists**, still refused |
+| set text | `AXValue` write | works — still the *only* mechanism `set_value`/`type_text` use, see below |
+| **arbitrary chord** (`⌘⇧P`) | — | no verb exists, but reachable since the pid-only change below via the pid tier (not a fallback — the only tier) |
+| **drag** | — | **no verb exists**, still refused — the pid tier has no drag primitive wired in yet |
 | pixel-only surfaces | — | nothing to address — reachable anyway, see below |
 
 Those rows are softer than they look. "No verb exists" is a statement about
 accessibility, not about delivery, and the pid tier delivers events without
 consulting accessibility at all.
 
-The last row has since moved. `click_in_window` clicks a bare window-local point
-with no element behind it, which makes a canvas reachable — deliberately opt-in,
-labelled `delivery: pid (no element)`, and explicitly unverified, because there
-is no element to read back. §11 has the gates and the measurement. The two rows
-above it are still open, and the honest ceiling is now: cua-rs drives
-*structured* UI extremely well, can be aimed at an unstructured surface when the
-caller accepts responsibility for the aim, and still cannot drag or chord.
+Two of these rows have since moved. `click_in_window` clicks a bare
+window-local point with no element behind it, which makes a canvas reachable —
+deliberately opt-in, labelled `delivery: pid (no element)`, and explicitly
+unverified, because there is no element to read back. §11 has the gates and
+the measurement. Chords moved too: `press_key` routes every chord through the
+pid tier unconditionally (§1a), so "no verb exists" no longer means "refused"
+for a key press the way it still does for a drag. The honest ceiling is now:
+cua-rs drives *structured* UI extremely well, can be aimed at an unstructured
+surface when the caller accepts responsibility for the aim, can send any key
+or chord, and still cannot drag.
 
-### `press_key`: decided
+### `press_key`: decided, then reconsidered
 
-Three options, none free:
+Four options across two rounds, none free:
 
 1. **`AXUIElementPostKeyboardEvent`** — app-scoped, in the crate, deprecated, no
    modifier-chord support. Rejected.
@@ -84,22 +87,91 @@ Three options, none free:
    chords are refused. Chosen in 0.3.1.
 3. **AX where a verb exists, HID behind an explicit flag otherwise.** Removed
    in 0.3.1 because the flag also enabled shared-pointer fallback.
+4. **Pid-only, no AX verb attempted at all.** Chosen below.
 
-So `press_key` maps `return`/`enter` to `AXConfirm`, `escape` to `AXCancel`, and
-`up`/`down` to `AXIncrement`/`AXDecrement`. Those stay in the background. Anything
-else — every chord, every letter — is refused.
+Through 0.4.x, `press_key` mapped `return`/`enter` to `AXConfirm`, `escape` to
+`AXCancel`, and `up`/`down` to `AXIncrement`/`AXDecrement`, and refused every
+chord and every letter. Every successful key action reported `delivery: ax`;
+there was no shared keyboard-input delivery mode.
 
-Every successful key action therefore reports `delivery: ax`; there is no
-shared keyboard-input delivery mode.
+One subtlety from that era is still worth recording, because it produced a
+self-contradicting error message before it was fixed: a key can *have* an AX
+verb that the *target element* does not accept. A tab button has `AXPress` and
+`AXShowMenu` but not `AXCancel`, so `escape` on it used to fall through to the
+generic "no accessibility equivalent" refusal — text that named `escape` as
+something which works without HID. That case has its own error (still true
+under `CUA_KEY_AX_ONLY=1`, see below) naming the verb, listing what the
+element does accept, and pointing at where `AXCancel` usually lives (the
+window or a dialog's default button).
 
-One subtlety worth recording, because it produced a self-contradicting error
-message before it was fixed: a key can *have* an AX verb that the *target element*
-does not accept. A tab button has `AXPress` and `AXShowMenu` but not `AXCancel`, so
-`escape` on it used to fall through to the generic "no accessibility equivalent"
-refusal — text that named `escape` as something which works without HID. That case
-now has its own error naming the verb, listing what the element does accept, and
-pointing at where `AXCancel` usually lives (the window or a dialog's default
-button).
+---
+
+## 1a. `click` and `press_key` moved to pid-only
+
+Through 0.4.x, `click` tried `AXPress`/`AXPick`/`AXConfirm` first and fell back
+to the pid tier only when the element advertised no AX action, and `press_key`
+never touched the pid tier at all. This change removes both fallbacks: `click` and
+`press_key` now go through `cua_hid`'s pid-routed delivery unconditionally,
+with no AX attempt in either direction. `set_value` and `type_text` are
+**not** part of this change — they still write `AXValue`/`AXSelectedText`
+exactly as before.
+
+**Why this asymmetry, and not "AX everywhere" or "pid everywhere":** the split
+follows what each API can actually express, not a preference.
+
+A click and a key press are *events*. Accessibility has no vocabulary for
+either: `AXPress` is "activate this element" with no notion of click count, so
+it cannot say "double-click" at all (§1 measured a chat list that opens on two
+and merely selects on one); and there is no verb for a chord, only `AXConfirm`
+for Return and `AXCancel` for Escape. Anything a caller might mean by "press
+`⌘⇧P`" has to become a real event whatever else happens, so making events the
+*only* path costs nothing that AX was providing.
+
+Setting text is not an event. `AXValue` writes replace a whole string in one
+call, atomically, addressed at the element — which is precisely what a caller
+asking to set a field wants. Delivering the same thing as keystrokes would mean
+a stream of events landing wherever the target process's first responder
+happens to be, character by character, with no element addressing and no way to
+confirm the focus went where it was aimed. That is strictly worse for the one
+operation AX does exactly right, so `set_value` and `type_text` keep it.
+
+That also reframes what "no AX fallback" costs on the click path. Retrying a
+failed pid click through `AXPress` sounds free and is not: it reintroduces the
+app-specific quirks the pid tier exists to escape — an element that advertises
+`AXPress` but silently ignores it, a control whose action fires but whose visual
+state lags, a stale AX handle recycled onto different content that would still
+happily accept a press. One delivery mechanism per action, chosen once, is
+easier to reason about than "try A, and if that seems to have failed, also try
+B"; the second half of that sentence is where the surprising bugs live.
+
+The corollary is that the "arbitrary chord — no verb exists, still refused"
+row from §1's capability table is gone: `press_key` no longer has a concept of
+"no verb exists" to refuse, because it never consults a verb. `cmd+shift+p`,
+`ctrl+alt+delete`, a bare letter — all of it goes through
+`cua_hid::parse_chord` and `press_chord_background_pid`, gated only on whether
+the chord *parses* and whether the SkyLight primitives are available on this
+macOS version, not on whether AX has an opinion.
+
+**What this does not change:** the cursor is still never warped, the shared
+keyboard tap is still never posted to, and `NSRunningApplication.activate` is
+still never called — every click and key event this crate sends goes out
+through `cua_hid`'s per-pid recipe (§6), exactly as the pid tier already
+worked in 0.4.x. What changed is which actions reach that tier and whether AX
+is tried around it, not the tier's own mechanics.
+
+**Escape hatches, one per action, not one shared flag:** `CUA_AX_FIRST=1`
+restores 0.4.x's `click` order (AXPress first, pid only when no AX verb
+exists, with a retry through AX if pid then fails). `CUA_KEY_AX_ONLY=1`
+restores 0.4.x's `press_key` (`return`/`escape`/`up`/`down` only, chords
+refused, no synthesized input at all). Neither is a supported "best of both"
+mode — mixing tiers per call is the exact pattern the paragraph above argues
+against — they exist to bisect a specific app or macOS version where the pid
+tier turns out to be the less reliable choice.
+
+**The manual-test checklist (§8) predates this change** and still describes
+0.4.x's tier order in places; it has not yet been re-walked end to end against
+this change's pid-only click/key path. Treat rows there that assume an AX-first
+click as aspirational until they are re-verified.
 
 ---
 
@@ -653,18 +725,36 @@ dialog, observed once. `return_state` makes that visible — the diff reported
 exactly one changed line, `(selected)` — so it is measurable now, but it has not
 been characterized.
 
-**The per-pid keyboard path is written but unproven.**
-`press_chord_background_pid` and `type_text_background_pid` exist in `cua-hid`
-and nothing calls them. Their construction —
+**`press_chord_background_pid` is wired in; `type_text_background_pid` still
+is not.** Both exist in `cua-hid`, built the same way —
 `CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
-`CGEventKeyboardSetUnicodeString` for characters with no keycode, posted per-pid —
-invalidates this crate's founding assumption that keyboard input must go through
-the global tap and steal focus. They stay gated because a keystroke that
-lands in the wrong process is far worse than a click that does not land: it types
-into whatever the user is editing. Verifying them needs the same
-control-and-measure treatment the click path got, against a target where a miss
-is unambiguous. Until then `press_key` remains AX-only and `post_chord` remains
-the honest, focus-stealing fallback.
+`CGEventKeyboardSetUnicodeString` for characters with no keycode, posted
+per-pid — which invalidates this crate's founding assumption that keyboard
+input must go through the global tap and steal focus. `press_key` now
+calls the former as its only tier (§1a), because accessibility cannot express a
+chord at all: there is `AXConfirm` and `AXCancel` and then nothing, so a real
+event is the only thing `cmd+shift+p` could ever become.
+
+**The control-and-measure treatment this paragraph used to demand is still
+owed.** Being the only possible mechanism is an argument for the design, not
+evidence that it lands correctly, and the risk originally named here has not
+moved: a keystroke goes to wherever the target process's own first responder is,
+`cua-core` can only best-effort-focus the addressed element first (`AXFocused`),
+and no query confirms the focus actually moved before the keystrokes did. A miss
+therefore types into whatever the human was editing — the asymmetry that kept
+this gated for several releases. Until that is measured on a target whose text
+can be read back, treat `press_key` on an app you have not tried as unproven,
+and use `CUA_KEY_AX_ONLY=1` to get the old AX-verb-only path back.
+
+`type_text_background_pid` stays unwired, for the reason §1a gives: a bulk text
+write is the one operation accessibility expresses better than events can. One
+`AXValue` write replaces the whole string atomically and is addressed at the
+element, where the same text typed as events becomes a long stream landing on
+whatever holds focus, one character at a time, multiplying the focus risk above
+by the length of the string. So `set_value`/`type_text` keep the AX-only
+mechanism they always had, and `post_chord` remains the honest, focus-stealing
+fallback for a caller that specifically needs real keystrokes typed into a
+terminal or canvas that ignores `AXValue`.
 
 ---
 
@@ -686,12 +776,19 @@ to exist.
 
 | | before | now |
 |---|:--|:--|
-| element with an AX action | `AXPress`/`AXPick`/`AXConfirm` | unchanged |
+| element with an AX action | `AXPress`/`AXPick`/`AXConfirm` | **pid click at its point — see §1a; `CUA_AX_FIRST=1` restores this row** |
 | element with a frame, no action | pid click at its point | unchanged |
 | **point with no element** | refused (`NoElementAtPoint`) | **`click_in_window`, window-scoped and opt-in** |
 | drag | refused | still refused — planned |
-| chords | refused | still refused — `press_chord_background_pid` written, unwired |
+| chords | refused | **pid-routed via `press_chord_background_pid` — see §1a; `CUA_KEY_AX_ONLY=1` restores the refusal** |
 | pixel-precise scroll | `AXScroll*ByPage` only | still page-only — planned |
+
+The first and fifth rows moved after this section was originally written —
+§1a has the reasoning (accessibility cannot express a click count or a chord, so
+events are the only mechanism that could serve either) and the environment
+variables that undo it per action. The rest of this section's argument (pid delivery needs a point, not
+an element) is unaffected: it explains *why* the pid tier could reach further
+than accessibility-only, not which actions choose it by default.
 
 Shipped in tiers rather than at once. The elementless click was ready — only the
 policy gate stood in the way — while a drag needs a story for the mouse-up that

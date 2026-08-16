@@ -34,18 +34,24 @@ the API, it is **what they are willing to take from you**.
 
 | | shared input | per-process, plus focus | cua-rs |
 |---|:--|:--|:--|
-| how a click travels | cursor warp, then the global HID queue | synthesized event routed to one pid | AX action; a pid-routed event where no AX action, or on request no element, exists |
+| how a click/key travels | cursor warp / global HID queue | synthesized event routed to one pid | synthesized event routed to one pid — no AX-action attempt or fallback |
+| bulk text | posted as keystrokes | posted as keystrokes | a single AX write (`AXValue`), not synthesized |
 | the pointer | moves | stays | stays |
 | keyboard focus | goes wherever the click lands | target is activated and held | unchanged |
 | your Space | can switch | can switch | never |
 | an occluded window | blank or stale capture | raised first, so never occluded | captured where it is |
 | you, working meanwhile | input collides | you lose focus | works |
 
-The middle column is a real design, not a strawman — routing per pid is what
-cua-rs does too for controls that expose no AX action. The difference is the
-second half: it activates the target and keeps it frontmost, which is a
-reasonable trade when a human is not sitting there, and the wrong one when they
-are.
+The middle column is a real design, not a strawman — routing per pid is the
+entire click and key-press story in cua-rs too, not just the fallback for
+controls with no AX action. That split follows what each API can say: a click
+count and a chord have no accessibility verb at all, so those have to be events,
+while replacing a field's text is one atomic `AXValue` write addressed at the
+element and is worse as a stream of keystrokes. The difference from the middle column is still the second
+half: per-process delivery there activates the target and keeps it frontmost,
+which is a reasonable trade when a human is not sitting there, and the wrong
+one when they are — cua-rs never does that, even for its pid-routed clicks and
+keys.
 
 [trycua/cua](https://github.com/trycua/cua/tree/main/libs/cua-driver)'s driver
 does not pick one: it ships both contracts side by side. Its `click_at_xy` routes
@@ -64,8 +70,11 @@ there, which is why it is a separate opt-in tool rather than a fallback.
 
 So cua-rs is best described by what it will not do. There is no flag that warps
 the pointer, posts to the shared keyboard stream, or raises a window: those paths
-are absent, and [DESIGN.md](DESIGN.md) covers what that costs — no chords, no
-drag, and no verification once you aim at a pixel yourself.
+are absent, and [DESIGN.md](DESIGN.md) covers what that costs — no drag, no AX
+fallback for a click or key that the pid tier cannot deliver, and no
+verification once you aim at a pixel yourself. Arbitrary chords (`⌘⇧P`) are no
+longer on that list: `press_key` routes every key through the same pid tier as
+`click`, which has no notion of "no verb exists" to refuse in the first place.
 
 ## Install
 
@@ -151,10 +160,10 @@ names a place.
 |---|:--|
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
 | `find` · `wait_for` | search the snapshot; poll until text appears or goes |
-| `click` | `AXPress` → `AXPick` → `AXConfirm`, else a pid-routed event |
+| `click` | a pid-routed event; no `AXPress`/`AXPick`/`AXConfirm` attempt |
 | `click_in_window` | last resort: a bare point, no element, nothing verified |
-| `set_value` · `type_text` · `select_text` | write, append, select a substring |
-| `press_key` | Return / Escape / arrows via AX; chords are refused |
+| `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call |
+| `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
 | `scroll` · `perform_secondary_action` | page a scroll area; any AX verb |
 | `list_apps` · `check_permissions` | running apps; grant status |
 
@@ -177,15 +186,26 @@ Honest ones, not a roadmap.
 |---|:--|
 | buttons, menus, tabs, rows, text fields | yes |
 | Electron apps | yes — the tree builds lazily, so read twice |
-| Return, Escape, stepper arrows | yes, as AX verbs |
-| arbitrary chords (`⌘⇧P`), drag | **no** — no AX verb exists |
+| any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …) | yes, pid-routed — see `CUA_KEY_AX_ONLY` below |
+| drag | **no** — no AX verb, and the pid tier has no drag primitive wired in yet |
 | canvas apps, games | clickable, but you supply the coordinate and the confidence |
-| terminals | reading yes; typing no — they ignore AX writes |
+| terminals | reading yes; typing no — `set_value`/`type_text` write `AXValue`, which terminals ignore; `press_key` reaches them (real key events) but only one key or chord at a time |
 
 `set_value` replaces, `type_text` appends, and an app that only reacts to real
-key events will ignore both. Controls with no AX action at all get a mouse event
-routed to the target process by window id, reported as `delivery: pid`; if that
-is unavailable the action fails rather than touching your pointer.
+key events will ignore both — unchanged from AX-only cua-rs, on purpose: one
+atomic `AXValue` write addressed at the element beats the same text typed
+character by character into whatever happens to hold focus. `click` and
+`press_key`, by contrast, never attempt an AX action at all: every click is a
+mouse event routed to the target process by window id, and every key is a
+keyboard event routed to the target process by pid, both reported as
+`delivery: pid`; if the pid tier is unavailable the action fails rather than
+touching your pointer or the shared keyboard.
+
+Two environment variables restore the pre-pid-tier behavior for comparison or
+if the pid tier proves untrustworthy on a given app: `CUA_AX_FIRST=1` puts
+`click` back to `AXPress` first, pid only when no AX verb exists; `CUA_KEY_AX_ONLY=1`
+puts `press_key` back to AX-verb-only (`return`/`escape`/`up`/`down`, chords
+refused). Neither is a supported "best of both" mode — see DESIGN.md §1.
 
 For a surface that publishes no elements at all, `click_in_window` takes a
 window-local point in points — a screenshot pixel divided by the scale

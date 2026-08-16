@@ -53,6 +53,39 @@
 //! The cua-rs server only calls [`click_background_pid`]. [`post_chord`] remains
 //! as a diagnostic API for the probe examples; no CLI flag or MCP tool can reach
 //! it.
+//!
+//! # `press_chord_background_pid`, promoted from unverified to primary
+//!
+//! This used to sit here unreachable from the server — "written but unproven"
+//! in the original docs, gated out because a keystroke that lands in the
+//! wrong process is worse than a click that does not land, and nothing had
+//! measured that it lands in the right one. `cua-core`'s `press_key` now calls
+//! it as the *only* tier (no AX verb attempted at all, not even as a fallback),
+//! because accessibility has no vocabulary for a key press beyond `AXConfirm`
+//! and `AXCancel`: a real event is the only thing an arbitrary chord could ever
+//! become, so there is no second tier to fall back to.
+//!
+//! That is an argument for the design, not evidence that it lands correctly.
+//! It reverses the caution the original gate encoded rather than satisfying it,
+//! and the risk that gate named has not gone away: these events carry
+//! no target *element*, only a target *pid*, so they land wherever that
+//! process's own first responder currently is. `cua-core` mitigates this by
+//! best-effort-focusing the addressed element (`AXFocused`) before sending a
+//! chord through this crate, but accessibility does not make every element
+//! settably focused, and there is no query here that could tell a caller
+//! whether the focus actually moved before the keystrokes did.
+//! `CUA_KEY_AX_ONLY=1` (read in `cua-core`) is the way back to the old,
+//! AX-verb-only keyboard path (`return`/`escape`/`up`/`down` only) if this
+//! proves untrustworthy on a given app.
+//!
+//! [`type_text_background_pid`] is written for the same reason and stays
+//! unreachable from the server for the opposite one: a bulk text write is the
+//! single operation accessibility expresses better than events can. One
+//! `AXValue` write replaces the whole string atomically, addressed at the
+//! element, where the same text as keystrokes is a long stream landing on
+//! whatever holds focus — multiplying the focus risk above by the length of the
+//! string for nothing in return. `cua-core`'s `set_value`/`type_text` therefore
+//! keep the AX write, and do not follow this crate's click/key precedent.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -371,16 +404,45 @@ pub fn click_background_pid(
 
 /// Gap between the pairs of a multi-click gesture, in milliseconds.
 ///
-/// Named after `AccessibilitySupport.SynthesizedEvent.humanClickInterval`, which
-/// is the same idea: the pairs have to be far enough apart that the target does
-/// not coalesce them, and close enough that they land inside the system
-/// double-click interval. macOS defaults that interval to 500 ms, so this sits
-/// comfortably inside it.
+/// The pairs have to be far enough apart that the target does not coalesce them,
+/// and close enough that they land inside the system double-click interval.
+/// macOS defaults that interval to 500 ms, so this sits comfortably inside it.
 const HUMAN_CLICK_INTERVAL_MS: u64 = 80;
+
+/// Ask a target process to notice it has key focus, before any keyboard event
+/// is posted to it.
+///
+/// Keyboard events carry no window number, so unlike a click there is no
+/// per-event field that pins them to a window — but the same open question
+/// applies: does a pid-addressed `CGEvent` even reach the target's real event
+/// loop if that process does not believe it is active? Nothing in this crate
+/// answers that with certainty (see the module docs' "promoted from unverified
+/// to primary" note), so this sends the same two AppKit-level notices
+/// [`click_background_pid`] sends before its first mouse event, on the theory
+/// that whatever makes a synthesized click land also improves the odds for a
+/// synthesized keystroke. `window_number` is best-effort: pass the window the
+/// caller already resolved for this pid, or `None` to send only the bare
+/// `ApplicationActivated` notice.
+///
+/// Never fails the caller: an activation notice is an assist, not the
+/// keystroke itself, and a target that ignores it is no worse off than if this
+/// had not been called.
+pub fn prime_keyboard_target(
+    pid: i32,
+    window_number: Option<isize>,
+    believes_it_is_frontmost: &dyn Fn() -> bool,
+) {
+    let _ = post_activation_notice(pid, nsevent::notify_window_key_focus_returned());
+    let _ = post_activation_notice(
+        pid,
+        nsevent::notify_app_activated(window_number.unwrap_or(0)),
+    );
+    wait_until_believed_frontmost(believes_it_is_frontmost);
+}
 
 /// Send a key chord to one process without touching the shared keyboard.
 ///
-/// # Status: unproven, not reachable from the MCP surface
+/// # Status: reachable from the MCP surface as of the pid-first keyboard tier
 ///
 /// This is the keyboard counterpart to [`click_background_pid`], and it exists
 /// because the premise this crate was built on — "there is no per-app keyboard
@@ -389,11 +451,11 @@ const HUMAN_CLICK_INTERVAL_MS: u64 = 80;
 /// `kCGEventSourceStateHIDSystemState` source can be posted through the same
 /// per-pid route the clicks here use, with no global tap involved.
 ///
-/// It is deliberately *not* wired into the `press_key` MCP tool yet.
-/// Keyboard input that silently lands in the wrong process is far more damaging
-/// than a missed click — it can type into whatever the user is editing — so this
-/// needs the same measured verification the click path got before anything calls
-/// it automatically. Drive it from `examples/pid_key_probe.rs` to do that.
+/// See the module docs for what changed: this used to be unreachable from the
+/// server, deliberately, pending the verification a missed click does not need
+/// and a misdelivered keystroke does. `cua-core` now calls it as the primary
+/// keyboard tier; call [`prime_keyboard_target`] first so the target has a
+/// chance to notice it should accept the keystroke that follows.
 ///
 /// Unlike [`post_chord`], nothing here touches `CGEventPost`, so the user's
 /// focused app keeps receiving their real typing throughout.
@@ -416,10 +478,10 @@ pub fn press_chord_background_pid(pid: i32, chord: &Chord) -> Result<()> {
 
 /// Type literal text into one process without touching the shared keyboard.
 ///
-/// # Status: unproven, not reachable from the MCP surface
+/// # Status: reachable from the MCP surface as of the pid-first keyboard tier
 ///
-/// See [`press_chord_background_pid`] for why this exists and why nothing calls
-/// it yet. The mechanism is `CGEventKeyboardSetUnicodeString` on a keycode-0
+/// See [`press_chord_background_pid`] for why this exists and what changed.
+/// The mechanism is `CGEventKeyboardSetUnicodeString` on a keycode-0
 /// event, which is how you type a character that has no virtual keycode on the
 /// current layout.
 ///

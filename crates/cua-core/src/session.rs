@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use cua_ax::{AxNode, Element, Limits};
@@ -87,11 +88,35 @@ pub enum CoreError {
         available: String,
     },
 
+    /// `key` did not parse as a chord `cua_hid::parse_chord` understands, in
+    /// the default (pid-first) keyboard mode. There is no AX-verb fallback to
+    /// try here — see [`CoreError::PidKeyUnavailable`] for why.
+    #[error("`{key}` is not a chord cua-rs's keyboard parser understands ({reason}). Set CUA_KEY_AX_ONLY=1 to fall back to the old AX-verb-only path (return/escape/up/down only) instead")]
+    KeyChordUnparseable { key: String, reason: String },
+
+    /// A chord parsed but the pid-routed delivery itself failed. Distinct from
+    /// [`CoreError::PidClickFailed`]'s wording because the escape hatch here is
+    /// `CUA_KEY_AX_ONLY`, not `CUA_AX_FIRST` — the two tiers were promoted to
+    /// pid-only on separate switches so one can be dialed back without the
+    /// other.
+    #[error("could not deliver key `{key}` via the pid-routed route: {reason}. cua-rs's default keyboard path does not fall back to accessibility (see CUA_KEY_AX_ONLY to opt into the old AX-verb-only path)")]
+    PidKeyUnavailable { key: String, reason: String },
+
     #[error("{original}. This element advertises no AXPress/AXPick/AXConfirm, and the quiet SkyLight pid-routed click is unavailable: {reason}. cua-rs will not fall back to moving the real pointer. perform_secondary_action with AXShowMenu may reach the same control another way")]
     PidClickUnavailable {
         original: cua_ax::AxError,
         reason: String,
     },
+
+    /// The pid-routed click could not be delivered, and — unlike
+    /// [`CoreError::PidClickUnavailable`] — accessibility was never tried at
+    /// all. This is the default click path's only failure mode: it does not
+    /// attempt `AXPress` first and does not retry through it afterward, because
+    /// one delivery mechanism per action beats a tier that sometimes silently
+    /// no-ops. `CUA_AX_FIRST=1` restores the old AXPress-then-pid order for a
+    /// caller that would rather have the fallback back.
+    #[error("could not deliver this click via the pid-routed SkyLight route: {reason}. cua-rs's default click path does not fall back to accessibility (see CUA_AX_FIRST to opt into the old AXPress-then-pid order)")]
+    PidClickFailed { reason: String },
 
     /// The live element no longer contains the identifying text captured in
     /// the snapshot. List views can recycle one AX handle for another row.
@@ -351,6 +376,59 @@ fn post_action_render() -> crate::snapshot::RenderOptions {
         note_omissions: false,
         ..crate::snapshot::RenderOptions::default()
     }
+}
+
+/// Legacy switch for `click`: when set, restores the *original* tier order
+/// (`AXPress` first, pid only when no AX verb exists at all, with a retry
+/// through AX if the pid tier then fails). The default (`false`) is pid-only
+/// with no AX attempt in either direction.
+///
+/// Accessibility is how cua-rs decides *where* to click; it was never how the
+/// click is delivered, and it cannot express a click count at all — `AXPress` has
+/// no notion of one, so a double-click was already pid-only. Making every click
+/// take the same route removes the case analysis rather than adding a mechanism.
+///
+/// The retry through AX after a pid failure is what this default drops, and it
+/// was never free: it reintroduces exactly the app-specific quirks that motivated
+/// the pid tier — an element that advertises `AXPress` but silently ignores it, a
+/// control whose action fires while its visual state lags, a stale handle
+/// recycled onto other content that would still accept a press.
+///
+/// `CUA_AX_FIRST=1` is kept only as a bisecting tool if the pid tier proves
+/// untrustworthy on a given machine or app — it is not a supported "best of
+/// both" mode, since mixing the two tiers is the thing this default avoids.
+fn ax_first() -> bool {
+    static AX_FIRST: OnceLock<bool> = OnceLock::new();
+    *AX_FIRST.get_or_init(|| {
+        std::env::var("CUA_AX_FIRST")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether `press_key` routes through the pid tier
+/// (`cua_hid::press_chord_background_pid`) instead of the old, AX-verb-only
+/// path. `set_value`/`type_text` are unaffected by this switch: one `AXValue`
+/// write replaces a whole string atomically and is addressed at the element,
+/// where the same text as keystrokes is a long stream landing on whatever holds
+/// focus. This switch only covers discrete key and chord presses, which have no
+/// accessibility verb to express them in the first place.
+///
+/// DESIGN.md §10 gated `press_chord_background_pid` out of the MCP surface
+/// entirely: "a keystroke that lands in the wrong process is far worse than a
+/// click that does not land". Making it the *only* tier for `press_key` (no
+/// AX verb attempted, not even as a fallback) is the reversal of that gate —
+/// so `CUA_KEY_AX_ONLY=1` is kept as the way back to the old, purely
+/// AX-verb-limited path (`return`/`escape`/`up`/`down` only, nothing else, no
+/// synthesized input at all) if the pid tier proves untrustworthy on a given
+/// machine or app.
+fn pid_keyboard_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CUA_KEY_AX_ONLY")
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(true)
+    })
 }
 
 impl Default for StateOptions {
@@ -635,6 +713,16 @@ pub enum Delivery {
     /// there is no element to inspect afterwards, so a caller that needs to know
     /// whether anything was hit has to look for itself.
     PidNoElement,
+    /// A key chord or literal text, routed to the target pid via
+    /// `press_chord_background_pid`/`type_text_background_pid` — real
+    /// `CGEventKeyboardEvent`s posted per-pid, not through the shared HID
+    /// keyboard tap. The keystrokes land wherever the *target process's own*
+    /// first responder currently is, which cua-rs cannot itself constrain
+    /// beyond best-effort focusing the addressed element first (`AXFocused`
+    /// where settable). A caller that must be certain which field received the
+    /// text should re-read the element afterward rather than trust the
+    /// delivery label alone.
+    PidKey,
 }
 
 impl Delivery {
@@ -643,8 +731,22 @@ impl Delivery {
             Delivery::Ax => "ax",
             Delivery::Pid => "pid",
             Delivery::PidNoElement => "pid (no element)",
+            Delivery::PidKey => "pid (keyboard)",
         }
     }
+}
+
+/// The outcome of attempting the pid tier of a click, split so the caller can
+/// tell "try accessibility instead" apart from "stop — do not press anything
+/// else". See [`Inner::pid_click_result`].
+enum PidFailure {
+    /// Safe to retry through accessibility: the pid tier could not run, but
+    /// nothing was pressed and the identified element has not been shown to
+    /// have changed.
+    Retryable(String),
+    /// Must not be retried through any tier: pressing anything now would act
+    /// on an element the caller no longer means.
+    Fatal(CoreError),
 }
 
 fn live_tokens(el: &Element) -> HashSet<String> {
@@ -1526,50 +1628,80 @@ impl Inner {
             Target::Point { .. } => None,
         };
 
-        // AX first, always — unless the caller asked for a double-click, which
-        // the accessibility API simply cannot say. `AXPress` is "activate this
-        // element", with no notion of click count, and performing it twice is
-        // not the same event: an app that opens on double-click and selects on
-        // single-click (KakaoTalk's conversation list, measured) would see two
-        // selections. So a `count` above 1 is a statement that only a real
-        // mouse event will do, and it goes straight to pid-routed delivery.
-        let ax_err = if count > 1 {
-            // Checked *before* activating, not after: `el.activate()` is not a
-            // query, and performing a press only to discard it would deliver
-            // the single click the caller explicitly said was wrong.
-            cua_ax::AxError::Unsupported {
-                what: "action",
-                name: format!("a {count}-click (accessibility has no click count)"),
-            }
-        } else {
+        // `ax_first()` (default `false`) is now a pure legacy switch: it
+        // restores the *original* tier order (AXPress, then pid only when no
+        // AX verb exists at all). The default has moved past "try pid first,
+        // then retry through AX" to no AX fallback whatsoever: accessibility
+        // decides *where* to click and never delivered the click, and it cannot
+        // express a click count at all, so a double-click was already pid-only.
+        // One route for every click removes the case analysis instead of adding
+        // a mechanism. Retrying through AX after a pid failure reintroduces
+        // exactly the app-specific AX quirks (`AXPress` advertised but
+        // ignored, a stale-handle press) that motivated moving to pid at all.
+        if ax_first() && count <= 1 {
             match el.activate() {
                 Ok(verb) => {
                     let changed = self.changed_since(info.pid, before);
                     return Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
                         .with_overlay_target(self.overlay_target(info.pid)));
                 }
-                Err(e) => e,
+                Err(ax_err) => {
+                    if !matches!(ax_err, cua_ax::AxError::Unsupported { .. }) {
+                        return Err(CoreError::Ax(ax_err));
+                    }
+                    return match self.pid_click_result(&info, &el, desc, count, expected, before) {
+                        Ok(result) => Ok(result),
+                        Err(PidFailure::Fatal(err)) => Err(err),
+                        Err(PidFailure::Retryable(reason)) => Err(CoreError::PidClickUnavailable {
+                            original: ax_err,
+                            reason,
+                        }),
+                    };
+                }
             }
-        };
-
-        if !matches!(ax_err, cua_ax::AxError::Unsupported { .. }) {
-            return Err(CoreError::Ax(ax_err));
         }
 
-        // No AX verb landed. Route a click to the target process without ever
-        // touching the shared cursor. `AXActivationPoint` is the app's answer
-        // to "where is this element clicked", and it is not always the middle
-        // of its frame, so prefer it when available.
+        match self.pid_click_result(&info, &el, desc, count, expected, before) {
+            Ok(result) => Ok(result),
+            Err(PidFailure::Fatal(err)) => Err(err),
+            Err(PidFailure::Retryable(pid_reason)) => {
+                Err(CoreError::PidClickFailed { reason: pid_reason })
+            }
+        }
+    }
+
+    /// The pid-routed tier of a click, decoupled from which tier is tried
+    /// first. `Ok` on success; `Err` distinguishes a failure the caller may
+    /// still recover from by trying accessibility ([`PidFailure::Retryable`])
+    /// from one that must not be retried at all ([`PidFailure::Fatal`]).
+    ///
+    /// The only fatal case is a detected [`CoreError::TargetChanged`]: falling
+    /// back to `AXPress` after finding that the live element no longer matches
+    /// what the snapshot described would press whatever now occupies a
+    /// recycled handle, which is exactly the staleness bug §3 of DESIGN.md
+    /// calls "the single worst bug this system can have". Every other failure
+    /// here is a capability or transient-state gap (no SkyLight, no window,
+    /// element publishes no point) and is safe to retry through AX.
+    fn pid_click_result(
+        &mut self,
+        info: &AppInfo,
+        el: &Element,
+        desc: String,
+        count: u8,
+        expected: Option<(usize, HashSet<String>)>,
+        before: Option<String>,
+    ) -> std::result::Result<ActionResult, PidFailure> {
+        // `AXActivationPoint` is the app's answer to "where is this element
+        // clicked", and it is not always the middle of its frame, so prefer it
+        // when available.
         let (x, y) = match el.activation_point() {
             Some(p) => (p.x, p.y),
             None => {
-                let Some(frame) = el.frame() else {
-                    return Err(CoreError::PidClickUnavailable {
-                        original: ax_err,
-                        reason: "the element publishes neither AXActivationPoint nor AXFrame"
-                            .into(),
-                    });
-                };
+                let frame = el.frame().ok_or_else(|| {
+                    PidFailure::Retryable(
+                        "the element publishes neither AXActivationPoint nor AXFrame".into(),
+                    )
+                })?;
                 (
                     frame.origin.x + frame.size.width / 2.0,
                     frame.origin.y + frame.size.height / 2.0,
@@ -1578,10 +1710,28 @@ impl Inner {
         };
 
         if !cua_hid::skylight_available() {
-            return Err(CoreError::PidClickUnavailable {
-                original: ax_err,
-                reason: "SLEventPostToPid is not available on this macOS version".into(),
-            });
+            return Err(PidFailure::Retryable(
+                "SLEventPostToPid is not available on this macOS version".into(),
+            ));
+        }
+
+        // Detect staleness before anything else fires: an index whose element
+        // has changed identity since the snapshot must never be pressed by
+        // either tier, so this check has to happen regardless of which tier
+        // ends up doing the pressing.
+        if let Some((index, expected)) = &expected {
+            if !expected.is_empty() {
+                let found = live_tokens(el);
+                if !tokens_still_present(expected, &found) {
+                    let mut gone: Vec<&String> = expected.difference(&found).collect();
+                    gone.sort();
+                    return Err(PidFailure::Fatal(CoreError::TargetChanged {
+                        index: *index,
+                        expected: format!("{gone:?}"),
+                        found: format!("{:?}", sorted(&found)),
+                    }));
+                }
+            }
         }
 
         // Re-enumerate the exact window immediately before posting. The
@@ -1593,44 +1743,26 @@ impl Inner {
             .get(&info.pid)
             .and_then(|snap| snap.window.as_ref())
             .cloned()
-            .ok_or_else(|| CoreError::PidClickUnavailable {
-                original: ax_err.clone(),
-                reason: "the snapshot has no verified ScreenCaptureKit window id; enable Screen Recording and take a fresh snapshot".into(),
+            .ok_or_else(|| {
+                PidFailure::Retryable(
+                    "the snapshot has no verified ScreenCaptureKit window id; enable Screen \
+                     Recording and take a fresh snapshot"
+                        .into(),
+                )
             })?;
-        let live_windows =
-            cua_capture::list_windows().map_err(|e| CoreError::PidClickUnavailable {
-                original: ax_err.clone(),
-                reason: format!(
-                    "could not revalidate the target window immediately before input: {e}"
-                ),
-            })?;
+        let live_windows = cua_capture::list_windows().map_err(|e| {
+            PidFailure::Retryable(format!(
+                "could not revalidate the target window immediately before input: {e}"
+            ))
+        })?;
         let live_window =
-            current_window_for_pid_click(&live_windows, &snapshot_window, info.pid, x, y).map_err(
-                |reason| CoreError::PidClickUnavailable {
-                    original: ax_err.clone(),
-                    reason,
-                },
-            )?;
+            current_window_for_pid_click(&live_windows, &snapshot_window, info.pid, x, y)
+                .map_err(PidFailure::Retryable)?;
         let wid = live_window.id;
         let window_local = (
             x - live_window.frame.origin.x,
             y - live_window.frame.origin.y,
         );
-
-        if let Some((index, expected)) = expected {
-            if !expected.is_empty() {
-                let found = live_tokens(&el);
-                if !tokens_still_present(&expected, &found) {
-                    let mut gone: Vec<&String> = expected.difference(&found).collect();
-                    gone.sort();
-                    return Err(CoreError::TargetChanged {
-                        index,
-                        expected: format!("{gone:?}"),
-                        found: format!("{:?}", sorted(&found)),
-                    });
-                }
-            }
-        }
 
         // The synthesized activation notice inside `click_background_pid` only
         // takes effect once the target's own run loop drains it, so the click has
@@ -1654,10 +1786,7 @@ impl Inner {
             assist,
             &believes_frontmost,
         )
-        .map_err(|e| CoreError::PidClickUnavailable {
-            original: ax_err,
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| PidFailure::Retryable(e.to_string()))?;
         let changed = self.changed_since(info.pid, before);
         Ok(ActionResult {
             verb: format!("SkyLight pid-routed {count}-click at ({x:.0}, {y:.0})"),
@@ -1821,6 +1950,15 @@ impl Inner {
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
+        // `AXValue=` stays the whole mechanism, on purpose. This is the one
+        // operation accessibility expresses better than events can: a single
+        // write replaces the whole string atomically and is addressed at *this*
+        // element. The same text delivered as keystrokes is a long stream landing
+        // on whatever the target process's first responder happens to be, one
+        // character at a time, which multiplies the pid tier's focus risk by the
+        // length of the string and gives nothing back. So the tier decision made
+        // for `click`/`press_key` (pid, no AX fallback) deliberately does not
+        // transfer here.
         el.set_string(cua_ax::attr::VALUE, value)?;
         let changed = self.changed_since(info.pid, before);
         Ok(
@@ -1836,7 +1974,9 @@ impl Inner {
         let write = el.append_text(text)?;
         let changed = self.changed_since(info.pid, before);
         // Name the mechanism, not just the intent. "typed" would imply
-        // keystrokes were synthesized, which is exactly what did not happen.
+        // keystrokes were synthesized, which is exactly what did not happen —
+        // see `set_value` for why this crate keeps bulk text writes on AX
+        // rather than routing them through `cua_hid::type_text_background_pid`.
         Ok(ActionResult::ax_at(
             format!("AXSelectedText+ ({})", write.as_str()),
             desc,
@@ -1844,6 +1984,32 @@ impl Inner {
             element_point(&el),
         )
         .with_overlay_target(self.overlay_target(info.pid)))
+    }
+
+    /// Best-effort preparation before any pid-routed keyboard event: try to
+    /// move accessibility focus onto the addressed element, then send the same
+    /// activation notices [`Inner::pid_click_result`] sends, in case the
+    /// target's willingness to accept a synthesized keystroke depends on
+    /// believing it is frontmost the same way its willingness to accept a
+    /// synthesized click does.
+    ///
+    /// Neither step is checked for success. `AXFocused` is not settable on
+    /// every element — Terminal's own text view is a measured case — and a
+    /// failure here is not a reason to refuse the keystrokes that follow: the
+    /// element may already have focus, or the app may accept real key events
+    /// regardless of what accessibility reports.
+    fn prime_for_pid_keyboard(&mut self, info: &AppInfo, el: &Element) {
+        let _ = el.set_bool(cua_ax::attr::FOCUSED, true);
+        let window_number = self
+            .snapshots
+            .get(&info.pid)
+            .and_then(|snap| snap.window.as_ref())
+            .map(|w| w.id as isize);
+        let believes_frontmost = {
+            let app_el = Element::for_pid(info.pid);
+            move || app_el.bool("AXFrontmost").unwrap_or(false)
+        };
+        cua_hid::prime_keyboard_target(info.pid, window_number, &believes_frontmost);
     }
 
     fn select_text(
@@ -1875,8 +2041,61 @@ impl Inner {
     }
 
     fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {
-        // Capability first so an unsupported chord reports the permanent API
-        // constraint instead of a misleading missing-snapshot error.
+        // Capability first, before `require_trusted`/`resolve`, the same
+        // shape the old AX-only path used — so a key this build cannot
+        // express at all is reported without needing a grant or a snapshot,
+        // and so the pid tier's own tests can run with no permissions.
+        //
+        // Pid-only by default, no AX attempt at all, because accessibility has
+        // no vocabulary for a key press: `AXConfirm` for Return, `AXCancel` for
+        // Escape, and then nothing. A real event is the only thing `cmd+shift+p`
+        // could ever become, so events are the only tier. `cua_hid::parse_chord`
+        // understands arbitrary chords (`cmd+shift+p`, `ctrl+alt+delete`,
+        // plain letters and digits) — the capability DESIGN.md §1/§9 listed as
+        // permanently absent ("arbitrary chord — no verb exists, still
+        // refused") is reachable now for exactly that reason.
+        //
+        // `CUA_KEY_AX_ONLY=1` is the way back to the old, AX-verb-only path
+        // (`return`/`escape`/`up`/`down` only, nothing else, no synthesized
+        // input at all) — see [`pid_keyboard_enabled`].
+        if pid_keyboard_enabled() {
+            let chord = cua_hid::parse_chord(key).map_err(|e| CoreError::KeyChordUnparseable {
+                key: key.to_string(),
+                reason: e.to_string(),
+            })?;
+
+            cua_ax::require_trusted()?;
+            let (info, el, desc) = self.resolve(query, &target)?;
+            let before = self.window_fingerprint(info.pid);
+
+            if !cua_hid::skylight_available() {
+                return Err(CoreError::PidKeyUnavailable {
+                    key: key.to_string(),
+                    reason: "SLEventPostToPid is not available on this macOS version".into(),
+                });
+            }
+            self.prime_for_pid_keyboard(&info, &el);
+            cua_hid::press_chord_background_pid(info.pid, &chord).map_err(|e| {
+                CoreError::PidKeyUnavailable {
+                    key: key.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let changed = self.changed_since(info.pid, before);
+            return Ok(ActionResult {
+                verb: format!("pid-routed key `{key}`"),
+                target: desc,
+                ui_changed: changed,
+                delivery: Delivery::PidKey,
+                point: element_point(&el),
+                overlay_target: self.overlay_target(info.pid),
+                state: None,
+            });
+        }
+
+        // Legacy path (`CUA_KEY_AX_ONLY=1`): only the handful of verbs AX
+        // actually expresses (`AXConfirm`, `AXCancel`,
+        // `AXIncrement`/`AXDecrement`), no synthesized input at all.
         let Some(ax_verb) = ax_verb_for_key(key) else {
             return Err(CoreError::KeyNoAccessibilityEquivalent {
                 key: key.to_string(),
