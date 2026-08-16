@@ -845,7 +845,12 @@ impl Element {
 // ── limits ───────────────────────────────────────────────────────────────────
 
 /// Caps for one [`Element::snapshot_tree`] walk.
-#[derive(Debug, Clone, Copy)]
+///
+/// Comparable because two walks under different caps are not comparable *trees*:
+/// a 40-node walk of a 300-node window is missing 260 nodes that a later default
+/// walk will report as new. Whoever diffs two snapshots has to be able to see
+/// that before subtracting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Hard ceiling on nodes returned. The real constraint is the agent's
     /// context window, not memory.

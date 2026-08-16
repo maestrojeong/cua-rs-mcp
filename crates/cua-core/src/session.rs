@@ -155,6 +155,23 @@ pub struct Snapshot {
     /// walk against it reports the entire window as new. Recorded so the
     /// post-action diff can decline instead of emitting that noise.
     scoped: bool,
+    /// Caps this walk ran under.
+    ///
+    /// Same reason as `scoped`, one step subtler: a walk capped below the
+    /// window's real size describes the same window *partially*, so the diff is
+    /// against a tree that was never complete. Measured on KakaoTalk — a
+    /// 40-element read followed by a click reported 278 appeared lines, all of
+    /// them nodes the first walk had simply not reached.
+    limits: Limits,
+    /// An action has run since this walk, and nothing has re-read the window.
+    ///
+    /// Only set when the action declined `return_state`, since a re-read
+    /// replaces the snapshot outright. `find` needs it: searching a tree from
+    /// before the click answers a question about a window that no longer exists,
+    /// and it answered "no AXMenu" about a menu that was open on screen. The
+    /// snapshot is kept rather than dropped because a run of actions with
+    /// `return_state: false` is exactly the flow that still needs its indices.
+    acted_on: bool,
 }
 
 /// What the agent gets back from `get_app_state`.
@@ -212,6 +229,34 @@ pub struct StateOptions {
 /// about the app: "12 structural elements omitted" is identical before and
 /// after, so it would either be diffed away as noise or, worse, flip when the
 /// count changes and read as a real UI change.
+/// Whether a stored snapshot can be the `before` side of a post-action diff.
+///
+/// Both refusals were measured on KakaoTalk, and they fail the same way: the
+/// stored tree is not a complete description of the window the re-read will
+/// walk, so subtracting them reports as "appeared" a pile of nodes that were
+/// there all along, and the few lines that are the actual answer fall past the
+/// output cutoff. A stated reason is worth more than a wrong diff.
+fn diff_basis(scoped: bool, limits: Limits) -> std::result::Result<(), &'static str> {
+    if scoped {
+        return Err("the previous snapshot was scoped to one subtree, which a whole-window \
+                    re-read cannot be subtracted from");
+    }
+    if limits != post_action_limits() {
+        return Err("the previous snapshot was walked under different caps, so it never described \
+                    the whole window and the difference would be mostly nodes it did not reach");
+    }
+    Ok(())
+}
+
+/// Caps a post-action re-read walks under.
+///
+/// Named rather than inlined so `rendered_current_tree` can compare a stored
+/// snapshot against the exact budget the re-read will use, instead of assuming
+/// the two happen to agree.
+fn post_action_limits() -> Limits {
+    StateOptions::default().limits
+}
+
 fn post_action_render() -> crate::snapshot::RenderOptions {
     crate::snapshot::RenderOptions {
         note_omissions: false,
@@ -1040,6 +1085,8 @@ impl Inner {
                 taken_at: Instant::now(),
                 process_key: key,
                 scoped: opts.scope.is_some(),
+                limits: opts.limits,
+                acted_on: false,
             },
         );
 
@@ -1158,15 +1205,25 @@ impl Inner {
         F: FnOnce(&mut Self) -> Result<ActionResult>,
     {
         let before = if return_state {
-            self.rendered_current_tree(query)
+            Some(self.rendered_current_tree(query))
         } else {
             None
         };
 
         let mut result = act(self)?;
 
-        if return_state {
-            result.state = self.read_state_after(query, before);
+        match before {
+            Some(before) => result.state = self.read_state_after(query, before),
+            // No re-read, so the snapshot still describes the window as it was
+            // before the action. Anything that would otherwise answer from it
+            // has to know that.
+            None => {
+                if let Ok(info) = apps::resolve_app(query) {
+                    if let Some(snap) = self.snapshots.get_mut(&info.pid) {
+                        snap.acted_on = true;
+                    }
+                }
+            }
         }
         Ok(result)
     }
@@ -1174,17 +1231,25 @@ impl Inner {
     /// The outline of the snapshot this app already has, plus the window it
     /// described, rendered the same way the post-action read will be.
     ///
-    /// `None` when the existing snapshot is not a fair basis for a diff. A
-    /// scoped walk covers one subtree, so a later whole-window walk would show
-    /// the entire window as new — 298 added lines for a click, measured — which
-    /// is worse than no diff at all because it buries the few lines that matter.
-    fn rendered_current_tree(&self, query: &str) -> Option<(String, Option<u32>)> {
-        let info = apps::resolve_app(query).ok()?;
-        let snap = self.snapshots.get(&info.pid)?;
-        if snap.scoped {
-            return None;
-        }
-        Some((
+    /// `Err` with the reason when the existing snapshot is not a fair basis for
+    /// a diff, so the caller can say why instead of emitting a diff that is
+    /// arithmetically correct and completely useless. Both refusals were
+    /// measured on KakaoTalk: a scoped walk describes one subtree, and a walk
+    /// capped below the window's size describes the window partially, so in
+    /// either case a later default walk reports hundreds of lines as new and
+    /// buries the handful that are.
+    fn rendered_current_tree(
+        &self,
+        query: &str,
+    ) -> std::result::Result<(String, Option<u32>), &'static str> {
+        let info = apps::resolve_app(query)
+            .map_err(|_| "this app could not be resolved before the action")?;
+        let snap = self
+            .snapshots
+            .get(&info.pid)
+            .ok_or("this app had no previous snapshot to diff against")?;
+        diff_basis(snap.scoped, snap.limits)?;
+        Ok((
             crate::snapshot::render_tree(&snap.nodes, post_action_render()),
             snap.window.as_ref().map(|w| w.id),
         ))
@@ -1194,11 +1259,12 @@ impl Inner {
     fn read_state_after(
         &mut self,
         query: &str,
-        before: Option<(String, Option<u32>)>,
+        before: std::result::Result<(String, Option<u32>), &'static str>,
     ) -> Option<PostActionState> {
         let opts = StateOptions {
             include_screenshot: false,
             render: post_action_render(),
+            limits: post_action_limits(),
             ..StateOptions::default()
         };
         let state = self.get_app_state(query, opts).ok()?;
@@ -1211,17 +1277,23 @@ impl Inner {
             .ok()
             .and_then(|info| self.snapshots.get(&info.pid))
             .and_then(|s| s.window.as_ref().map(|w| w.id));
-        let comparable = before.filter(|(_, before_window)| *before_window == after_window);
+        let comparable = before.and_then(|(tree, before_window)| {
+            if before_window == after_window {
+                Ok(tree)
+            } else {
+                Err("the window this app is showing is not the one the previous snapshot \
+                     described, so there is nothing to diff against")
+            }
+        });
 
         Some(PostActionState {
             snapshot_id: state.snapshot_id,
             diff: comparable
                 .as_ref()
-                .map(|(b, _)| crate::snapshot::diff_trees(b, &state.tree)),
-            note: comparable.is_none().then(|| {
-                "the window this app is showing is not the one the previous snapshot described, \
-                 so there is nothing to diff against. Call get_app_state to read the new window"
-                    .to_string()
+                .ok()
+                .map(|b| crate::snapshot::diff_trees(b, &state.tree)),
+            note: comparable.err().map(|why| {
+                format!("{why}. The full tree is at the snapshot_id above; call get_app_state to read it")
             }),
             node_count: state.node_count,
         })
@@ -1504,11 +1576,13 @@ impl Inner {
         let info = apps::resolve_app(query)?;
 
         // Search the snapshot the agent is already holding, so the indices it
-        // gets back stay valid against the state it has seen. Only walk afresh
-        // when there is nothing to search.
+        // gets back stay valid against the state it has seen. Walk afresh when
+        // there is nothing to search, or when an action has happened since —
+        // a search of the pre-action tree is an answer about a window that is
+        // no longer on screen.
         let snapshot_id = match self.snapshots.get(&info.pid) {
-            Some(s) => s.id,
-            None => {
+            Some(s) if !s.acted_on => s.id,
+            _ => {
                 let opts = StateOptions {
                     include_screenshot: false,
                     ..Default::default()
@@ -1985,6 +2059,27 @@ mod tests {
         let mut n = tnode(index, role, None, None, act);
         n.frame = Some(f);
         n
+    }
+
+    #[test]
+    fn a_default_whole_window_snapshot_is_a_fair_diff_basis() {
+        assert!(diff_basis(false, post_action_limits()).is_ok());
+    }
+
+    #[test]
+    fn a_scoped_or_capped_snapshot_is_refused_as_a_diff_basis() {
+        assert!(
+            diff_basis(true, post_action_limits()).is_err(),
+            "a subtree cannot be subtracted from a whole window"
+        );
+        let capped = Limits {
+            max_nodes: 40,
+            ..post_action_limits()
+        };
+        assert!(
+            diff_basis(false, capped).is_err(),
+            "a 40-node walk of a 300-node window would report 260 nodes as new"
+        );
     }
 
     #[test]
