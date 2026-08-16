@@ -1362,6 +1362,27 @@ action reports `ui_changed: no` while something certainly happened. That
 particular blind spot is what the `focus` field on pid-routed keyboard results
 covers — it compares the *element*, not a string built from it.
 
+**The settle polls now, and a menu action still needs a re-read.** The 120 ms
+wait before `ui_changed` was a fixed sleep; it polls the fingerprint every 16 ms
+and returns the moment it moves, so a change that lands in one frame is reported
+after one frame instead of after the whole window. Only "nothing changed" pays
+the deadline, which it has to — that is the one claim that cannot be made early.
+
+A longer deadline was the obvious next step and it was wrong. §10's other
+measurement says a menu item's effect becomes readable 50 ms to 1.7 s after the
+press, so a 2 s deadline was built and tried: pressing TextEdit's *Show Tab Bar*
+reported `Unchanged` after waiting the full **2 198 ms**, and the next call proved
+the press had worked because the row had renamed itself to *Hide Tab Bar*. The
+fingerprint reads the focused window's title and the focused element's role and
+label; a tab bar appearing changes none of them. The limit is *what* is compared,
+not *when*, and the 1.7 s figure came from a probe watching the pressed item's own
+attributes — a different observation. The deadline stayed at 120 ms and the
+patient variant was deleted rather than shipped as a 2 s tax that buys nothing.
+
+For a menu action the answer is to read the row back: `menu_bar` returns each
+row's title and its checkmark, and a toggle renames itself, so the state is
+readable without trusting a diff that structurally cannot see it.
+
 **One snapshot per app.** Driving two windows of the same app alternately
 invalidates indices each time. Correct, but awkward; keying snapshots by window
 would fix it.

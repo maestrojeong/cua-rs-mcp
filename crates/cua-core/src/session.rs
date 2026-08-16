@@ -4168,6 +4168,18 @@ impl Inner {
         }
     }
 
+    /// How long to wait for an ordinary action's effect to become readable.
+    ///
+    /// Unchanged from the fixed sleep this replaced, so no existing action got
+    /// slower: accessibility reflects most changes within a frame or two, and the
+    /// deadline is only spent in full when nothing changed at all.
+    const SETTLE_MS: u64 = 120;
+
+    /// How often to re-read while waiting. One 60 Hz frame is the smallest interval
+    /// at which a change could plausibly become visible, and polling faster would
+    /// spend AX round trips to learn nothing.
+    const SETTLE_POLL_MS: u64 = 16;
+
     /// Wait for the app to settle, then say what moved.
     ///
     /// Two observations, not one. The fingerprint answers "did the window this
@@ -4183,10 +4195,52 @@ impl Inner {
     /// of the 120 ms, and it is the only window enumeration this adds per
     /// action.
     fn changed_since(&self, pid: libc::pid_t, before: Watch) -> Settled {
-        // A short settle window: AX reflects most changes within a frame or two,
-        // and waiting longer would add latency to every single action.
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        let after = self.window_fingerprint(pid);
+        self.settle(pid, before, Self::SETTLE_MS)
+    }
+
+    /// Why there is no patient variant of this, though the numbers invited one.
+    ///
+    /// §10 records that a menu item's effect becomes readable 50 ms to 1.7 s
+    /// after the press — up to fourteen times [`Inner::SETTLE_MS`] — which reads
+    /// like a deadline that is simply too short. A 2 s deadline was built and
+    /// measured, and it changed nothing: pressing TextEdit's Show Tab Bar
+    /// reported `Unchanged` after waiting the whole 2 198 ms, while the *next*
+    /// call proved the press had worked, because the item had renamed itself to
+    /// Hide Tab Bar.
+    ///
+    /// The fingerprint reads the focused window's title and the focused
+    /// element's role and label. Showing a tab bar changes none of them, so no
+    /// amount of waiting makes it visible — the limit is *what* is compared, not
+    /// *when*. The 1.7 s figure came from a probe watching the pressed item's own
+    /// attributes, which is a different observation from this one.
+    ///
+    /// So the deadline stayed short, and the honest fix for a menu action is the
+    /// one §10 already names: re-read the element, or read the menu again and
+    /// look at the row's own title and mark. `menu_bar` returns both for exactly
+    /// this reason.
+    /// Poll the fingerprint until it moves, or until `deadline_ms` runs out.
+    ///
+    /// The poll replaced a fixed sleep, and it is strictly better in both
+    /// directions: a change that lands in one frame is reported after one frame
+    /// instead of after the whole window, and a change that takes ten frames is
+    /// still seen. Only the no-change case pays the deadline, and it has to —
+    /// "nothing happened" is exactly the claim that cannot be made early.
+    fn settle(&self, pid: libc::pid_t, before: Watch, deadline_ms: u64) -> Settled {
+        let started = std::time::Instant::now();
+        let deadline = std::time::Duration::from_millis(deadline_ms);
+        let mut after;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(Self::SETTLE_POLL_MS));
+            after = self.window_fingerprint(pid);
+            // A difference is final: nothing later can un-change it, and waiting
+            // to confirm would only add latency to the successful case.
+            if after.is_some() && after != before.fingerprint {
+                break;
+            }
+            if started.elapsed() >= deadline {
+                break;
+            }
+        }
         let focus_verdict = match (before.fingerprint, after) {
             // Either end unreadable and the comparison is meaningless. Say so
             // instead of picking the answer that happens to be shorter.
