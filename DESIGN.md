@@ -1013,7 +1013,9 @@ these are the wiring, which does
 | **press-and-hold gestures** (a drag that pauses to let a spring-loaded folder open; click-and-hold) | the primitives are there — a drag *is* a down, a run of moves and an up — but holding means owning a mouse-down that outlives one tool call, and a release that never arrives leaves the target mid-gesture |
 | **wheel momentum and rubber-banding** | a trackpad fling is a phase-tagged stream of events, not a delta. Nothing has needed it |
 | AX notification streams (`AXObserver`) | would replace the fingerprint heuristic in §10 |
-| menu invocation | needs temporary activation + focus restore; easy to get wrong |
+| ~~menu invocation~~ | **the menu opens, and cua-rs now reports and photographs it — but a coordinate cannot pick a row. §10** |
+| reading a pop-up menu's items | it has no accessibility representation to read them from, and cua-rs does no OCR. The caller reads the screenshot |
+| parsing key equivalents out of a menu image | the shortcut is the way to activate an item, and recognising `⌥⌘⌫` from pixels well enough to *press* it is a different risk from describing it. The caller reads it |
 | Spaces handling | off-Space windows are observation-only, matching prior art |
 | per-app leases | needed once two agents share one machine |
 | ~~yield-to-human detection~~ | **built, opt-in, `CUA_YIELD_TO_HUMAN=1` — see below** |
@@ -1072,6 +1074,19 @@ changes it cannot see. It is reported honestly rather than optimistically,
 because an agent that believes every action landed is worse than one that knows
 it should re-read. The right fix is `AXObserver` notifications.
 
+One blind spot this section used to name has been closed, and it is worth
+recording how narrowly. "A menu opening in its own window" changed neither the
+focused element nor the window title, so the fingerprint was byte-identical and
+the action reported `ui_changed: no` while a 202x318 menu sat on screen. The
+settle now also enumerates the app's windows and compares the set of transient
+ones — anything of that pid, on screen, above ordinary content level, excluding
+the menu-bar and status levels — so a pop-up appearing *or* vanishing is
+`ui_changed: yes` on its own evidence, and the pop-up's id, level and frame ride
+back in the action's own result rather than waiting for the caller to ask. That
+costs one window enumeration, p50 ~28 ms, on top of the 120 ms. It does not make
+the fingerprint less of a heuristic for anything that happens *inside* one
+window.
+
 One failure of it is specific enough to name: the fingerprint is *focused
 window title | focused element role | focused element title*, and two text
 fields of one window usually share a role and have no title. Text landing in
@@ -1108,10 +1123,12 @@ edge is an app whose own activation handler calls `activateIgnoringOtherApps:`,
 which would turn the notice into a real raise. Releasing the belief on a session
 boundary rather than per click is the shape of the fix, and it is not built.
 
-**Menu-opening controls: solved, and the fix was two bugs rather than a
-mechanism.** KakaoTalk's chat-room hamburger was the standing case — no AX
-actions, so a synthesized click is the only route, and for a long time it did
-nothing. Neither missing piece was exotic:
+**Menu-opening controls: the click lands, the menu is now visible, and a
+coordinate still cannot pick a row.** This section used to say "solved", and it
+was wrong in a specific and instructive way, so the correction is kept rather
+than the claim.
+
+Two real bugs were fixed and are still fixed:
 
 - `is_plausible_target()` required `layer == 0`, which excluded the app's own
   floating chat windows at layer 3. The cap is now 3.
@@ -1119,18 +1136,82 @@ nothing. Neither missing piece was exotic:
   destroyed the key-window state the next click depended on. It is gone by
   default, and `CUA_DEACTIVATE_AFTER_CLICK=1` restores it for comparison.
 
-With both fixed the menu opens reliably, its items are readable in the tree, and
-`press_key escape` on the `AXMenu` closes it. Ruled out along the way, each by
-measurement rather than argument: the coordinate; the AppKit event header; the
-timestamp; the ordering of the focus notices; whether the target believes it is
-frontmost (`AXFrontmost` does flip, in about 150 ms); and the private versus
-public per-pid post route.
+Ruled out along the way, each by measurement rather than argument: the
+coordinate; the AppKit event header; the timestamp; the ordering of the focus
+notices; whether the target believes it is frontmost (`AXFrontmost` does flip, in
+about 150 ms); and the private versus public per-pid post route.
 
-What remains unsolved is one step further in: an `AXMenuItem` does not reliably
-act on the first `AXPress`. The first press selected it and the second opened the
-dialog, observed once. `return_state` makes that visible — the diff reported
-exactly one changed line, `(selected)` — so it is measurable now, but it has not
-been characterized.
+What was wrong was the sentence that followed: "its items are readable in the
+tree". They are not, and the `AXMenu`/`AXMenuItem` paragraph that used to be here
+described an object that is not in the tree at all. Re-measured on KakaoTalk's
+chat-room hamburger (`[7]`, an `AXButton` advertising **zero** AX actions —
+`AXShowMenu` returns "this element supports []"):
+
+1. **The click lands and a menu opens.** A new window of the same pid appears
+   within ~50 ms: level 101, 202x318, on screen, no title. It persists — polled
+   every 20 ms for 2.5 s, present throughout. No activation is needed; the
+   frontmost app was a terminal the whole time.
+2. **Accessibility cannot see it.** The application element has only its two
+   `AXMenuBar` children. `AXUIElementCopyElementAtPosition` at a point *inside*
+   the menu returns the `AXMenuBar` at `0,0 1512x33` — a fallback for a point
+   outside every frame it knows about. There is no `AXMenu` and no `AXMenuItem`
+   anywhere. The pop-up is a CGWindow with no accessibility representation.
+3. **Pixels can see it.** `screencapture -x -o -l<id>` renders it legibly.
+4. **The menu is drawn at the real cursor, not at the control.** The button is at
+   `(949,145)`; the menu appeared at `(677,572)` with the pointer at
+   `(678.3,574.5)`, and moved to `(982,599)` after the pointer moved. Cosmetic in
+   itself, and a strong hint about what follows.
+5. **A pid-routed click inside the menu delivers but selects nothing.** Measured
+   twice, on two rows: the menu closes and no item acts. The menu's own state is
+   unchanged afterwards — including on a run where the human's pointer was
+   hovering a *different* row, so it does not pick the wrong item; it picks none.
+6. **The item's keyboard shortcut does work.** `press_key cmd+t` against the app
+   with that menu open activated `항상 위에 유지`: the chat window moved from
+   level 0 to level 3, and a second `cmd+t` moved it back.
+
+Point 5 with point 4 is the finding. A macOS menu tracks the *pointer* to decide
+what is highlighted, and cua-rs does not move the pointer — so menu-row selection
+by coordinate is the same impossibility as §9's pointer-position spoofing, not a
+tuning problem. Nothing in the widened mouse model changes that, and a caller
+told to click a menu row would be told to do something measured not to work.
+
+What ships instead is observation plus the keyboard:
+
+- Every `get_app_state`, and **every action's own result**, lists the app's
+  transient windows: id, level, frame, and whether each one appeared while the
+  action ran. In the action's own response deliberately — a caller told one round
+  trip later has already concluded the control did nothing, which is exactly the
+  wrong conclusion and exactly the one users drew.
+- `is_addressable_target()` widens what a pid-routed event may be stamped with,
+  so a pop-up *can* be aimed at: right for a popover or panel with ordinary
+  event-driven views, right for dismissing a menu, and honestly labelled as not
+  the way to pick a menu row. `is_plausible_target()` is deliberately left
+  capped at level 3, because it answers the different question of which window a
+  snapshot is *of*, and a menu chosen there would have its number stamped onto
+  clicks meant for content — the §6 failure that the cap was raised to fix.
+- The tool descriptions for `press_key` and `click_in_window` say which is which,
+  so the path that works is tried first.
+
+Not built, on purpose: reading the menu's items, and recognising their key
+equivalents, from the image. The shortcut is what activates an item, and a
+misread `⌥⌘⌫` presses "leave the chat room". Describing pixels and *acting* on a
+guess about pixels are different risks, and cua-rs does the first by handing over
+the screenshot and refuses the second.
+
+The capture question resolved itself in passing, and not the way it looked.
+`screencapture -l<menu_id>` succeeds, but it does not return the menu: asking for
+the menu's id and asking for its parent window's id returned **the same
+2188x1662 image**, covering the union of the parent at `46,86 924x770` and the
+menu at `938,599 202x318` — exactly 1094x831 points at 2x. macOS photographs a
+window together with the pop-up attached to it. So a pop-up needs no capture of
+its own, and there is no second image to order; what it needed was for
+`WindowShot` to stop assuming the image covers the requested window's frame,
+which had `scale` reporting 2.37 px/pt for the parent and 10.83 for the menu
+instead of 2.0 — every pixel-to-point conversion against that image wrong for as
+long as a menu was up. The extent is now recovered by testing candidate rects
+against the pixel count and keeping the one whose horizontal and vertical
+px-per-point agree, and both the covered rect and the window's own frame are
+reported.
 
 **Both per-pid keyboard functions are wired in now.**
 `press_chord_background_pid` and `type_text_background_pid` are built the same
