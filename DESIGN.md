@@ -62,7 +62,7 @@ AX cannot express everything:
 | **drag** | — | no verb exists; delivered as a real down/drag/up gesture by the pid tier (§11). Not yet verified against a real drag source |
 | **right click where the element advertises nothing** | `AXShowMenu` | works *where the element advertises it*; where it does not, a real `rightMouseDown`/`rightMouseUp` pair by the pid tier |
 | **modifier click** (⌘-click, ⇧-click) | — | no verb exists — `AXPress` is "activate this", with no room for a held key. Pid tier only |
-| **hover** | — | no verb exists; a synthesized `mouseMoved` by the pid tier. Implemented and **unproven** — and permanently unable to reach an app that polls the real cursor (§11) |
+| **hover** | — | no verb exists; a synthesized `mouseMoved` by the pid tier. **Measured to work on web content** and measured to do nothing on a Finder list row (§11) — and permanently unable to reach an app that polls the real cursor |
 | **scroll by a distance** | — | `AXScroll*ByPage` is whole pages only; a `scrollWheel` event covers the rest, and covers elements that advertise no scroll action at all. Implemented and **unproven** (§11) |
 | pixel-only surfaces | — | nothing to address — reachable anyway, see below |
 
@@ -85,13 +85,12 @@ new rows above are: a right or middle button, held modifier keys, a drag with
 interpolated intermediate moves, a hover, and a wheel scroll. §11 has the
 design and the verification status, which is worth stating here too rather than
 burying: the parsing, geometry, interpolation and tier selection are
-unit-tested without any grant, and the gestures themselves have **not** been
-walked against a real drag source, a real hover-revealed control, or a real
-Electron list. They are built, they are reachable, and they are unmeasured. The
-hover and the wheel scroll are the two to distrust hardest: nothing anywhere
-corroborates that a synthesized per-pid `mouseMoved` or `scrollWheel` drives a
-real app, so they rest on reasoning alone. §11 names the experiment that would
-settle each.
+unit-tested without any grant, and the gestures have since been walked against
+real apps one at a time. The drag, the modifier click and the right click work.
+The hover works on web content and does nothing to a Finder list row, which is a
+split rather than a verdict. The wheel scroll does not work at all and is
+refused by default. §11 has each measurement, and says which of them is one app
+rather than a survey.
 
 The honest ceiling is now: cua-rs drives *structured* UI extremely well, can be
 aimed at an unstructured surface when the caller accepts responsibility for the
@@ -1382,6 +1381,19 @@ element in the first place.
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.
 
+**A browser in the background accepts nothing.** Chrome and Safari each took a
+pid-routed click and a pid-routed `mouseMoved` at the same pixel of the same
+window and acted on neither while their application was not frontmost, and acted
+on both the moment it was. Measured with the `hover_check versus` arm; §11 has
+the readings. This is not the hover event and not the pid route — a background
+pid-routed ⇧-click on TextEdit selected text in the same session — so the shape
+of it is "some apps only process synthesized pointer input while active", with
+two browsers as the known members and no idea how large the set is. It is
+recorded here rather than in §11 because it bounds *what can be driven*, which
+is a different question from which gesture is expressible. The synthesized
+activation notices of §6 do not buy past it; nothing tried does, short of a real
+activation, which is out of scope.
+
 **A target is left believing it is active.** The `ApplicationActivated` notice is
 not revoked after the click (§6), because revoking it broke the following click.
 Nothing verifies that the belief ever clears: macOS will not deactivate an app it
@@ -2032,8 +2044,78 @@ the code and one changed what the tool descriptions may claim.
 | `drag` | **works** | dragging 220 points along a line of TextEdit left `AXSelectedText = "The quick brown fox jumps over th"`. A string the app computed from where it believes the gesture went, so nothing but a tracked press-move-release produces it |
 | ⇧-click | **works** | a plain `click_in_window` planted the caret, then a `shift` click 200 points along left `AXSelectedText = "The quick brown fox jumps over"`. An unmodified click leaves the selection empty, so the selection *is* the modifier arriving |
 | right click | **works** | on TextEdit's text view: a new window of the same pid, level 101, 181x342, within 50 ms. Unambiguous because the element it was aimed at is not a menu and nothing else opens one |
-| `hover` | **unproven** | delivered, and no app has yet been found whose hover state enters the tree. The limitation in the next section stands |
+| `hover` | **works on web content, does nothing on the AppKit surfaces tried** | a hover-only `AXButton` appears in the tree while the point is hovered and is gone when the pointer leaves, and the page reads back the exact coordinate the event carried. Measured in two engines. A Finder list row, with a click as the control arm, showed nothing at all. See below |
 | wheel tier | **does not work** | see below |
+
+**`hover` drives web content, and nothing else that has been tried.** The
+experiment this section asked for has been run, with one change: a Mail row was
+not available, so the tree-visible hover state was built rather than found. A
+local page publishes three rows, each with a button that CSS keeps at
+`display: none` until the row is hovered, and a paragraph that a `mousemove`
+listener rewrites with the coordinate it was handed (`assets/hover_fixture.html`,
+kept so the reading can be re-taken). The first is the signal an
+agent could act on — a hidden button is not in the accessibility tree and a shown
+one is. The second is stronger than any hover state could be, because a
+coordinate the app *computed* cannot be produced by anything except the event
+arriving with that coordinate in it.
+
+```console
+$ hover_check versus "Google Chrome" 45        # Chrome frontmost
+both arms aim at window-local (450,189)
+click arm = SkyLight pid-routed 1-click (left) at window-local (450, 189)
+hover arm = SkyLight pid-routed mouseMoved to (650, 222)
+  + [55] AXStaticText = "mousemove #5 at 450,102"     # the click's own primer
+  + [56] AXStaticText = "mousedown #1 at 450,102"
+  + [55] AXStaticText = "mousemove #6 at 450,102"     # the hover
+==> BOTH LAND
+```
+
+`450,102` is `450,189` less the 87 points of browser chrome above the page. The
+page was told the pointer arrived at exactly the pixel cua-rs aimed at. Safari
+reproduces it — aimed at window-local `(662,234)`, the page logged
+`mousemove #3 at 662,102` — so this is not one engine's quirk, and the
+`hover_check sweep` arm shows the revealed control appearing and withdrawing:
+`[42] AXButton "HOVER-REVEALED-ONE"` is present in the tree at the target stop
+and absent at the dull-point stops on either side of it.
+
+**A Finder list row is not moved by the same event.** Same probe, same run
+structure, Finder frontmost, both arms at one pixel of one row:
+
+```console
+$ hover_check versus Finder 92
+pixel signal usable = true (idle 395233 -> 395233 bytes)
+click arm  -> the row reads (selected), pixels 395233 -> 395052
+hover arm  -> tree 524 lines -> 524 lines, 0 gone, 0 new; pixels 395052 -> 395052
+==> the CLICK LANDS AND THE HOVER DOES NOT
+```
+
+Reproduced on a second row. This is the negative case the section wanted handled
+carefully, and the two signals answer the two questions it splits into. The tree
+did not change, so accessibility saw no hover state — and the window's own image
+did not change *by a single byte*, so the app did not draw one either. It is
+therefore not a hover that happened where cua-rs cannot see it; nothing happened.
+The click at the same pixel of the same window in the same run is what rules out
+the routing, the window number, the aim and the instrument, exactly as
+`scroll_check`'s `key` arm does for the wheel tier.
+
+Why the two surfaces differ is a **hypothesis, not a measurement**: AppKit's
+hover affordances are `NSTrackingArea` crossings, and a crossing is computed by
+the window server from where the *real* pointer is, not from a `mouseMoved` a
+process was handed — while a web engine recomputes `:hover` from the event it
+receives. That would make the split permanent rather than a bug, and it fits
+every reading here, but nothing above proves it. What is measured is the split
+itself, on Chrome, Safari, Finder and KakaoTalk.
+
+**A browser accepts nothing at all while it is not frontmost, and that is not
+about hover.** In the same session, with Finder frontmost, the click arm and the
+hover arm both produced nothing on Chrome and on Safari — no `mousedown`, no
+`mousemove`, no pixel change. A pid-routed ⇧-click on TextEdit, in the
+background, in the same session, selected `"alpha bravo charlie"` as §11 already
+records. So the pid route is healthy for background apps and these two browsers
+are the exception; §10 carries it as a limitation of what can be driven, not of
+which gesture is used. It is also the reason the probe has a click arm at all:
+without it, four separate runs would have been recorded as "hover does not work"
+when what they showed was "nothing reaches this app right now".
 
 **The wheel tier delivers and scrolls nothing.** Measured against the window's
 own pixels, captured before and after:
@@ -2049,11 +2131,34 @@ The control arm is what makes that mean something. A pid-routed `pagedown`
 *keystroke* scrolls the same window in the same run, so the failure is not pid
 routing, not the window number, not the aim point, and not the instrument — it is
 the scroll event itself. Also measured and also negative: Chromium web content,
-and both `ScrollUnit::Pixel` and `ScrollUnit::Line` on both apps. The most likely
-explanation is §6's finding applied to a different event family: a `CGEvent`
-synthesized from scratch has no AppKit identity, a click can be given one by
-building the `NSEvent` first, and `NSEvent` offers no scroll-wheel factory to
-build from.
+and both `ScrollUnit::Pixel` and `ScrollUnit::Line` on both apps.
+
+**The obvious explanation was tested and is wrong.** §6's finding is that a
+`CGEvent` synthesized from scratch has no AppKit identity, and that a click only
+lands once the `NSEvent` is built first. Applying that to scrolls is the natural
+guess, and `NSEvent` publishes no scroll-wheel factory to build from — so the
+guess is also the convenient one. `ScrollRecipe` exists to falsify it. Four
+constructions, selectable with `CUA_WHEEL_RECIPE`, measured against a native
+`AXScrollArea` holding a 400-line document:
+
+| recipe | what it adds | scrolled |
+|---|:--|:-:|
+| `plain` | `CGEventCreateScrollWheelEvent2`, as shipped | no |
+| `nsevent` | round-tripped through `+[NSEvent eventWithCGEvent:]` and back, so AppKit has seen it | no |
+| `phased` | `ScrollPhase` began → changed → ended, which a phaseless receiver may require | no |
+| `gesture` | phases plus the momentum and continuous fields a trackpad carries | no |
+
+Then the same four over the **public** `CGEventPostToPid` instead of the private
+SkyLight route (`CUA_PUBLIC_POST=1`): also no. Six constructions across two
+routes, every one delivered, none moving a pixel — `260063 bytes -> 260063
+bytes`, byte-identical — while the `key` control arm scrolled the same document
+immediately before and after, and `idle` confirmed the image is stable at rest.
+
+So it is not the AppKit header, not the phase fields, and not the post route. What
+remains untested is whether a per-pid scroll is honoured *at all* by anything
+outside the window server's own dispatch, which is not a question this codebase
+can answer from the sending side. Recorded as unexplained rather than guessed at
+again.
 
 So the tier **refuses by default**. Documenting a tier as unreliable and then
 delivering it anyway is the worst of the options: the caller is told
@@ -2131,13 +2236,15 @@ sizing, the coordinate generation guard, and every argument-validation refusal.
 That is a statement about the logic. It is not evidence that any app accepts the
 events, and it should not be read as one.
 
-`hover` deserves a stronger warning than the rest, because for it there is no
-corroboration available anywhere. The click and key paths were at least built
-against a recipe that had been observed to work elsewhere, and their §10
-measurements exist. Nobody here has seen a synthesized per-pid `mouseMoved` drive
-anything. The construction is reasoned — the same window stamping, the same pid
-route, the same fresh timestamp that make a click land — and reasoning is not a
-measurement. Treat it as *implemented and unproven*, in the strong sense.
+`hover` used to carry the strongest warning in this file: nobody had seen a
+synthesized per-pid `mouseMoved` drive anything, there was no corroboration
+available anywhere, and the construction was reasoning rather than measurement.
+That has been settled — see the measurement above. A synthesized per-pid
+`mouseMoved` does drive an app, and the app reads back the exact coordinate it
+carried. What replaces the warning is narrower and still worth distrusting: it
+has only ever been *seen* to work on web content, an AppKit list row measurably
+ignores it, and how many of the AppKit surfaces an agent cares about fall on
+which side of that line is unknown. Two apps is not a survey.
 
 The wheel tier used to carry the same warning. It has now been measured, and the
 answer was no; see the section above. That is the outcome this paragraph called a
@@ -2147,14 +2254,15 @@ What would prove each, concretely:
 
 | | the experiment |
 |---|:--|
-| `hover` | an app whose hover state is readable *in the tree*, not just on screen — a Mail message row publishes its hover buttons as new `AXButton` children, so `hover` on the row and then `get_app_state` either shows them or does not. A tooltip is a worse test: it may be drawn without ever entering the tree, so its absence proves nothing |
+| `hover` | **run** — `hover_check`, against a page whose rows reveal a button on `:hover` and whose script writes the event's own coordinate into the document. Both signals arrived, in two engines. What is still owed is the *population*: which AppKit surfaces respond, if any, given that a Finder row measurably does not |
 | wheel tier | anything with a readable scroll position. A native `AXScrollArea` publishes `AXValue` as a 0–1 fraction — scroll it by an exact `pixels` amount and read the value back. That also cross-checks the delta *sign*, which is the easiest thing here to have backwards and is invisible on a symmetric list |
 | `drag` | Finder's icon view, which persists icon positions: drag one icon and re-read its `AXPosition`. A list reorder is the more useful case but a worse first test, since a failed reorder and a refused drag look identical |
 | right click | a control with no AX actions at all — §10's chat-app hamburger is the standing example — where a menu appearing is unambiguous, because there is no `AXShowMenu` that could have done it |
 | ⌘-click | a browser link, where the tab count before and after is a count rather than a judgement |
 | all of them | `CGEvent(source: nil).location` byte-identical before and after, which is the §8 coexistence check the whole project rests on |
 
-None of these has been run. §8's checklist carries them so that stays visible.
+Only the first two have been run. §8's checklist carries the rest so that stays
+visible.
 
 ### Chords and literal text — both wired, both verified
 

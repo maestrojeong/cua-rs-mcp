@@ -174,17 +174,25 @@ one of them.
 | any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed. A bare character key carries the character as well as the keycode, so a non-Latin input source cannot substitute a different letter — `press_key x` under a Korean source delivered `ㅌ` before this |
 | right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed. **Measured:** a right-click opened a context menu on TextEdit's text view; a ⇧-click extended a selection an unmodified click leaves empty |
 | drag | yes: a real down, interpolated moves and an up, both ends in one window. **Measured:** dragging across TextEdit selected exactly the text spanned |
-| hover | a synthesized `mouseMoved` — **built, unproven**, and your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react at all |
+| hover | **yes on web content, no on the native surfaces tried.** A synthesized `mouseMoved`. **Measured:** in Chrome and in Safari, a button a page reveals only on `:hover` appeared in the accessibility tree while the point was hovered and was gone when the pointer left, and the page read back the exact coordinate the event carried. On a Finder list row the same event changed nothing — not the tree, not one byte of the window's image — while a click at the same pixel in the same run selected the row. Your cursor does not move, so an app that polls the *real* pointer position rather than reading the event cannot react, and a native hover affordance may well be the window server's own cursor tracking rather than an event the app is handed |
 | scrolling something with no AX scroll verb (Electron list, canvas, web content) | **no, and it is refused rather than faked.** The wheel event is delivered and scrolls nothing — measured against the window's pixels on a native `AXScrollArea` and on Chromium web content, in both pixel and line units — so `scroll` errors and the message sends you to `press_key` with `pagedown` / `pageup` / `down` / `up`, which does reach the same scroller. `CUA_WHEEL_SCROLL=1` delivers it anyway, for re-running the experiment. [DESIGN.md](DESIGN.md) §11 has the numbers |
 | canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
 | terminals | reading yes; typing yes with `type_text mechanism="keystrokes"`, which sends real per-pid key events. The default `AXValue` write is still ignored by terminals, and the keystroke path is measured on TextEdit, not yet on a terminal |
 
-"Built, not yet verified" means the events are constructed and delivered on the
-same pid route `click` uses, the logic behind them is unit-tested without any
-grant, and nobody has yet watched a real app accept one. Distrust `hover` and
-the wheel scroll hardest: they rest entirely on reasoning by analogy with the
-click path. [DESIGN.md](DESIGN.md) §11 lists what is owed and names the
-experiment that would settle each one.
+Every row above that says **Measured** was walked against a real app with a
+control arm — an arm that can only produce good news is not a measurement. Where
+a row says a gesture does nothing, that is a reading and not an omission: the
+wheel scroll and the Finder hover were each sent alongside something already
+known to work, at the same pixel of the same window in the same run, so a silent
+result is the gesture failing rather than nothing reaching the app.
+[DESIGN.md](DESIGN.md) §11 has the numbers, and says plainly which results are
+one app rather than a survey.
+
+Two limits worth reading before you plan around them. Chrome and Safari accepted
+**no** pid-routed pointer event at all — click as much as hover — while their
+application was not frontmost, in a session where a background click on TextEdit
+worked; so a browser you can read in the background is not necessarily a browser
+you can drive there. And `hover` is only known to reach web content.
 
 `set_value` replaces and `type_text` appends via one atomic `AXValue` write; an
 app that only reacts to real key events ignores both, which is what

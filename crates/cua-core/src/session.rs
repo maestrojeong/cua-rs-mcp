@@ -3882,8 +3882,15 @@ impl Inner {
     /// the whole project — and also the honest limit of this tool. An app that
     /// reads where the pointer *is* (`NSEvent.mouseLocation`, a poll of the
     /// cursor position) rather than where the event says it went will not
-    /// respond, and no version of this call can make it. Apps that track the
-    /// event — anything using `NSTrackingArea`, and everything web-based — do.
+    /// respond, and no version of this call can make it.
+    ///
+    /// # What it is measured to drive
+    ///
+    /// Web content, in both Chromium and WebKit: a `:hover` rule fires and the
+    /// page reads back the exact coordinate the event carried. A Finder list row
+    /// did not respond at all — not in the tree and not in its pixels — while a
+    /// click at the same point in the same run selected it. DESIGN §11 has both
+    /// readings; the population between those two poles is unknown.
     ///
     /// Nothing is pressed, so unlike a click this never synthesizes the
     /// activation-assist click on the window's own activation point; only the

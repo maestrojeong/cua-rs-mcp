@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  The bed for the `hover` experiment in DESIGN.md §11, driven by
+  `cargo run -p cua-core --example hover_check`.
+
+  Two signals, deliberately:
+
+  * each row hides a button until the row is hovered, and a button that is
+    `display: none` is not in the accessibility tree while a shown one is — so
+    the tree either grows an `AXButton` under the pointer or it does not. That
+    is the signal an agent could actually act on.
+  * the script writes the coordinate of every mousemove and mousedown into the
+    document. A coordinate the page *computed* cannot be produced by anything
+    except the event arriving carrying it, which makes it stronger evidence than
+    any hover state: it proves not just that something happened but that it
+    happened at the pixel cua-rs aimed at.
+
+  Open it in the browser under test (`open -g -a Safari assets/hover_fixture.html`)
+  and make the window tall enough that both paragraphs are inside the viewport —
+  a web engine does not publish offscreen text to accessibility, and a probe
+  reading an empty group will call a landed event a miss.
+-->
+<html><head><meta charset="utf-8"><title>cua hover fixture</title>
+<style>
+ body { font: 28px/1.6 -apple-system, sans-serif; margin: 0; padding: 40px; background: #fff; }
+ .row { padding: 24px; margin: 16px 0; background: #eee; border-radius: 8px; }
+ .row .reveal { display: none; }
+ .row:hover { background: #ffd24d; }
+ .row:hover .reveal { display: inline-block; }
+ button { font: inherit; }
+</style></head>
+<body>
+<div class="row" id="r1">Row one <button class="reveal" aria-label="HOVER-REVEALED-ONE">Archive one</button></div>
+<div class="row" id="r2">Row two <button class="reveal" aria-label="HOVER-REVEALED-TWO">Archive two</button></div>
+<div class="row" id="r3">Row three <button class="reveal" aria-label="HOVER-REVEALED-THREE">Archive three</button></div>
+<p id="log">no pointer events yet</p>
+<p id="clicklog">no clicks yet</p>
+<script>
+ let n = 0, c = 0;
+ document.addEventListener('mousedown', e => {
+   c++;
+   document.getElementById('clicklog').textContent =
+     'mousedown #' + c + ' at ' + Math.round(e.clientX) + ',' + Math.round(e.clientY);
+ });
+ document.addEventListener('mousemove', e => {
+   n++;
+   document.getElementById('log').textContent =
+     'mousemove #' + n + ' at ' + Math.round(e.clientX) + ',' + Math.round(e.clientY);
+ });
+</script>
+</body></html>

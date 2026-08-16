@@ -105,7 +105,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use objc2::rc::Retained;
-use objc2_app_kit::NSEventType;
+use objc2_app_kit::{NSEvent, NSEventType};
 use objc2_core_foundation::{CFRetained, CGPoint};
 // Two names are deliberately absent from this list, and their absence is
 // checkable rather than promised. `CGWarpMouseCursorPosition` is the only API
@@ -980,6 +980,96 @@ impl ScrollUnit {
     }
 }
 
+/// How a scroll event is built before it is stamped and posted.
+///
+/// This exists because the wheel tier does not work and the reason is not known
+/// (DESIGN §11). Every variant here is a hypothesis about *why* a pid-routed
+/// `scrollWheel` is delivered and scrolls nothing, expressed as the smallest
+/// change to the recipe that would falsify it, so the next person can re-run the
+/// experiment by setting one environment variable rather than by editing this
+/// file. They are not options a caller chooses between: [`Plain`] is what ships,
+/// and the rest are instruments.
+///
+/// [`Plain`]: ScrollRecipe::Plain
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollRecipe {
+    /// `CGEventCreateScrollWheelEvent2`, stamped and posted. What ships, and
+    /// what was measured not to scroll.
+    #[default]
+    Plain,
+    /// The same event handed to `+[NSEvent eventWithCGEvent:]` and taken back
+    /// with `-[NSEvent CGEvent]`.
+    ///
+    /// The hypothesis: §6 found that a click only works when AppKit builds the
+    /// event, because AppKit rebuilds its `NSEvent` from the record's own header
+    /// rather than from fields a caller patched in, and `NSEvent` publishes no
+    /// scroll-wheel factory to build one with. If the round trip is enough to
+    /// attach whatever a factory would have attached, this scrolls and `Plain`
+    /// does not.
+    NsEventRoundTrip,
+    /// One event, plus the fields a real trackpad carries:
+    /// `kCGScrollWheelEventIsContinuous`, the point deltas, and a scroll phase.
+    ///
+    /// The hypothesis: a receiver that only honours a phased gesture rejects a
+    /// phaseless one outright.
+    Phased,
+    /// Three events — phase `Began`, phase `Changed` carrying the delta, phase
+    /// `Ended` — which is the shape of one real trackpad gesture.
+    ///
+    /// The hypothesis above, taken seriously: a receiver may need the *gesture*
+    /// and not merely the phase field, since a lone `Changed` with no `Began`
+    /// before it is not a state any real device produces.
+    PhasedGesture,
+}
+
+impl ScrollRecipe {
+    /// The spelling accepted in `CUA_WHEEL_RECIPE`.
+    pub fn parse(name: &str) -> Option<ScrollRecipe> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "plain" | "" => Some(ScrollRecipe::Plain),
+            "nsevent" | "ns" | "roundtrip" => Some(ScrollRecipe::NsEventRoundTrip),
+            "phased" => Some(ScrollRecipe::Phased),
+            "gesture" | "phased-gesture" => Some(ScrollRecipe::PhasedGesture),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollRecipe::Plain => "plain",
+            ScrollRecipe::NsEventRoundTrip => "nsevent",
+            ScrollRecipe::Phased => "phased",
+            ScrollRecipe::PhasedGesture => "gesture",
+        }
+    }
+
+    /// The recipe named by `CUA_WHEEL_RECIPE`, defaulting to [`Plain`].
+    ///
+    /// An unrecognized name is [`Plain`] rather than an error: this switch
+    /// exists for an experiment, and an experiment that silently ran the wrong
+    /// arm would be worse than one that ran the shipped arm — which is what the
+    /// probe prints, so a typo is visible in the output rather than in the
+    /// verdict.
+    ///
+    /// [`Plain`]: ScrollRecipe::Plain
+    pub fn from_env() -> ScrollRecipe {
+        static RECIPE: OnceLock<ScrollRecipe> = OnceLock::new();
+        *RECIPE.get_or_init(|| {
+            std::env::var("CUA_WHEEL_RECIPE")
+                .ok()
+                .and_then(|v| ScrollRecipe::parse(&v))
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// `kCGScrollPhaseBegan`, `…Changed`, `…Ended` — the values a real trackpad
+/// gesture carries in `kCGScrollWheelEventScrollPhase`. Not in the generated
+/// bindings; these are the documented `CGScrollPhase` constants.
+const SCROLL_PHASE_BEGAN: i64 = 1;
+const SCROLL_PHASE_CHANGED: i64 = 2;
+const SCROLL_PHASE_ENDED: i64 = 4;
+
 /// Everything needed to send the *localized* form of an activation notice, rather
 /// than the bare one.
 ///
@@ -1256,9 +1346,19 @@ pub fn drag_background_pid(
 /// the real pointer.
 ///
 /// This is the whole of "hover": a `mouseMoved` event carrying the target
-/// point, delivered by pid. A view with an `NSTrackingArea`, a web page with a
-/// `:hover` rule, or a toolbar that reveals a button under the cursor all react
-/// to the event, so the revealed UI shows up in the next snapshot.
+/// point, delivered by pid.
+///
+/// **What it reaches, measured:** web content. A page's `:hover` rule fires and
+/// its `mousemove` listener reads back the exact coordinate this event carried,
+/// in both Chromium and WebKit (DESIGN §11).
+///
+/// **What it did not reach, also measured:** a Finder list row, which changed
+/// neither its accessibility tree nor one byte of its rendered image, in a run
+/// where a click at the same pixel selected the row. The standing explanation is
+/// that an `NSTrackingArea` crossing is computed by the window server from the
+/// real pointer rather than delivered as an event — which would make that a
+/// permanent split rather than a defect here — but that is a hypothesis and the
+/// split is what was measured.
 ///
 /// **What it cannot reach:** anything that asks where the pointer *is* rather
 /// than reading where the event says it went — `NSEvent.mouseLocation`,
@@ -1344,22 +1444,92 @@ pub fn scroll_background_pid(
     post_mouse_moved_primer(&route, point, window_local)?;
     std::thread::sleep(std::time::Duration::from_millis(12));
 
-    let source =
-        CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok_or(HidError::NoSource)?;
-    // Two wheels: vertical first, horizontal second, which is the order
-    // `CGEventCreateScrollWheelEvent2` documents. Asking for one wheel and then
-    // stamping the horizontal axis afterwards leaves the event describing
-    // itself as one-dimensional.
-    let event = CGEvent::new_scroll_wheel_event2(Some(&source), unit.cg(), 2, delta_y, delta_x, 0)
-        .ok_or(HidError::NoSource)?;
-    CGEvent::set_flags(Some(&event), modifiers);
-    CGEvent::set_location(Some(&event), point);
+    let recipe = ScrollRecipe::from_env();
+    let send = |delta_y: i32, delta_x: i32, phase: Option<i64>| -> Result<()> {
+        let source =
+            CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok_or(HidError::NoSource)?;
+        // Two wheels: vertical first, horizontal second, which is the order
+        // `CGEventCreateScrollWheelEvent2` documents. Asking for one wheel and
+        // then stamping the horizontal axis afterwards leaves the event
+        // describing itself as one-dimensional.
+        let built =
+            CGEvent::new_scroll_wheel_event2(Some(&source), unit.cg(), 2, delta_y, delta_x, 0)
+                .ok_or(HidError::NoSource)?;
+        if let Some(phase) = phase {
+            // A real trackpad reports continuous point deltas as well as the
+            // wheel deltas, and a receiver that reconstructs a gesture reads the
+            // point axes. Setting the phase without them describes a gesture
+            // that moved nothing.
+            CGEvent::set_integer_value_field(
+                Some(&built),
+                CGEventField::ScrollWheelEventIsContinuous,
+                1,
+            );
+            CGEvent::set_integer_value_field(
+                Some(&built),
+                CGEventField::ScrollWheelEventPointDeltaAxis1,
+                delta_y as i64,
+            );
+            CGEvent::set_integer_value_field(
+                Some(&built),
+                CGEventField::ScrollWheelEventPointDeltaAxis2,
+                delta_x as i64,
+            );
+            CGEvent::set_integer_value_field(
+                Some(&built),
+                CGEventField::ScrollWheelEventScrollPhase,
+                phase,
+            );
+            CGEvent::set_integer_value_field(
+                Some(&built),
+                CGEventField::ScrollWheelEventMomentumPhase,
+                0,
+            );
+        }
+        // The round trip has to happen before the CG-space fields below are
+        // written, because AppKit hands back a *different* event record and
+        // anything stamped on the original would be left behind on it.
+        let round_tripped = if recipe == ScrollRecipe::NsEventRoundTrip {
+            Some(
+                NSEvent::eventWithCGEvent(&built)
+                    .and_then(|ns| ns.CGEvent())
+                    .ok_or(HidError::NoSource)?,
+            )
+        } else {
+            None
+        };
+        let event: &CGEvent = match &round_tripped {
+            Some(e) => e,
+            None => &built,
+        };
+        CGEvent::set_flags(Some(event), modifiers);
+        CGEvent::set_location(Some(event), point);
 
-    let ptr = CFRetained::as_ptr(&event).as_ptr() as *mut c_void;
-    route.stamp(ptr, window_local)?;
-    CGEvent::set_timestamp(Some(&event), nsevent::uptime_nanos());
-    post_once(pid, &event, ptr)
+        let ptr = event as *const CGEvent as *mut c_void;
+        route.stamp(ptr, window_local)?;
+        CGEvent::set_timestamp(Some(event), nsevent::uptime_nanos());
+        post_once(pid, event, ptr)
+    };
+
+    match recipe {
+        ScrollRecipe::Plain | ScrollRecipe::NsEventRoundTrip => send(delta_y, delta_x, None),
+        ScrollRecipe::Phased => send(delta_y, delta_x, Some(SCROLL_PHASE_CHANGED)),
+        ScrollRecipe::PhasedGesture => {
+            // A gesture, not three scrolls: the deltas ride on the middle event
+            // only, because a real `Began` carries the finger landing and an
+            // `Ended` carries the finger leaving, and neither moves content.
+            send(0, 0, Some(SCROLL_PHASE_BEGAN))?;
+            std::thread::sleep(std::time::Duration::from_millis(SCROLL_PHASE_INTERVAL_MS));
+            send(delta_y, delta_x, Some(SCROLL_PHASE_CHANGED))?;
+            std::thread::sleep(std::time::Duration::from_millis(SCROLL_PHASE_INTERVAL_MS));
+            send(0, 0, Some(SCROLL_PHASE_ENDED))
+        }
+    }
 }
+
+/// Gap between the phases of a synthesized trackpad gesture, in milliseconds.
+/// One display frame, the same reasoning as [`DRAG_STEP_INTERVAL_MS`].
+const SCROLL_PHASE_INTERVAL_MS: u64 = 16;
 
 /// How many `mouseDragged` events to interpolate between a drag's endpoints.
 ///
@@ -1797,6 +1967,36 @@ fn key_table() -> HashMap<&'static str, u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scroll_recipe_name_round_trips_and_a_typo_is_the_shipped_one() {
+        for recipe in [
+            ScrollRecipe::Plain,
+            ScrollRecipe::NsEventRoundTrip,
+            ScrollRecipe::Phased,
+            ScrollRecipe::PhasedGesture,
+        ] {
+            assert_eq!(
+                ScrollRecipe::parse(recipe.as_str()),
+                Some(recipe),
+                "{} must survive being printed and read back, or the probe's own \
+                 output stops naming the arm it ran",
+                recipe.as_str()
+            );
+        }
+        // Case and stray whitespace come from a shell variable, not from code.
+        assert_eq!(
+            ScrollRecipe::parse(" NsEvent "),
+            Some(ScrollRecipe::NsEventRoundTrip)
+        );
+        // An unset variable is the shipped recipe, and so is an empty one.
+        assert_eq!(ScrollRecipe::parse(""), Some(ScrollRecipe::Plain));
+        assert_eq!(ScrollRecipe::default(), ScrollRecipe::Plain);
+        // A misspelling has to be distinguishable from a real arm here, so that
+        // `from_env` can fall back to the shipped recipe rather than silently
+        // running a different experiment than the one that was asked for.
+        assert_eq!(ScrollRecipe::parse("phased-gestrue"), None);
+    }
 
     #[test]
     fn a_modifier_list_shares_the_chord_vocabulary() {
