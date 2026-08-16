@@ -2628,30 +2628,38 @@ impl Inner {
     /// typo blindly is the worst outcome available here, so the caller has to
     /// ask for this by name.
     ///
-    /// # One case where this is the first choice, not the last
+    /// # Transient UI, and the limit found by trying it
     ///
-    /// Everything above describes a canvas, where accessibility publishes no
-    /// children and a coordinate is a concession. Transient UI is not that case,
-    /// and calling this a last resort there would be false advice.
+    /// Everything above describes a canvas. A pop-up is a second case, and the
+    /// reason this accepts a pop-up's window id at all: measured on KakaoTalk's
+    /// chat-room hamburger, the menu is a window of the app's own process at
+    /// level 101 that accessibility does not describe *at all* — the application
+    /// element has only its two `AXMenuBar` children, and
+    /// `AXUIElementCopyElementAtPosition` inside the menu's frame returns the
+    /// menu bar as a fallback. No element to find, no better walk to make, no AX
+    /// verb to send. A window-local coordinate is the only addressing that
+    /// exists, so refusing the window id — which is what the old level-3 cap
+    /// did — left the one kind of UI accessibility cannot see as the one kind
+    /// cua-rs could not aim at either.
     ///
-    /// A pop-up menu — measured on KakaoTalk's chat-room hamburger — is a
-    /// window of the app's own process at level 101 that accessibility does not
-    /// describe *at all*: the application element has only its two `AXMenuBar`
-    /// children, and `AXUIElementCopyElementAtPosition` inside the menu's frame
-    /// returns the menu bar as a fallback. There is no element to find, no
-    /// better walk to make, and no AX verb to send. The window server can see
-    /// the menu, `screencapture` can photograph it, and a window-local
-    /// coordinate can reach it. That is the entire toolset, so this is the
-    /// primary path there rather than the desperate one.
+    /// What aiming at it turned out to buy is less than hoped, and saying so is
+    /// part of shipping it. A pid-routed click at a menu row was measured twice,
+    /// on two different rows of that menu: the event arrives — the menu closes —
+    /// and **nothing is selected**. The menu's own state was unchanged
+    /// afterwards, including on a run where the human's real pointer was
+    /// hovering a different row, so it does not pick the wrong item either; it
+    /// picks none. That is consistent with the other thing the menu does: it
+    /// draws itself at the *real* cursor rather than at the point the event
+    /// carried. A menu tracks the pointer, and cua-rs does not move the pointer,
+    /// which puts menu-row selection in the same bucket as §9's
+    /// pointer-position spoofing — out, permanently, by the same rule.
     ///
-    /// Two honest qualifications. First, it is still unverified in the same way:
-    /// the caller supplies the aim, and cua-rs confirms delivery and nothing
-    /// else. Second, it is not always the cheapest route in. Menu items usually
-    /// draw a keyboard shortcut next to them — ⌘I, ⌘Y, ⌥⌘, — and where one
-    /// exists, `press_key` addresses the app's own key handling instead of a
-    /// pixel, so it cannot land one row off. cua-rs does not read those
-    /// shortcuts out of the image and does not try to; deciding between the two
-    /// is the caller's, made from the screenshot.
+    /// So the honest ordering for a menu is `press_key` with the item's own key
+    /// equivalent first, which was measured to work (⌘T on that menu toggled the
+    /// chat window's always-on-top state). This call remains right for a pop-up
+    /// that is not a menu — a popover or panel whose views handle events
+    /// normally — and for dismissing a menu. cua-rs reads no shortcuts out of
+    /// the image and does no OCR; the caller reads the screenshot and decides.
     ///
     /// # Coordinates are window-local
     ///
