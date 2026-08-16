@@ -1315,10 +1315,9 @@ focused element gives cua-rs nothing to check against, and the honest report is
 that nothing is known. `AXObserver` notifications would be the real fix here as
 they would be for `ui_changed`.
 
-`post_chord` remains the unreachable, focus-stealing shared-input path. Its
-last stated reason to exist — being the only way to type real keystrokes into a
-terminal — is gone with `mechanism: "keystrokes"`, and §11 says it should be
-deleted.
+`post_chord`, the focus-stealing shared-input keyboard path that both of these
+made redundant, has been deleted — §11 has what it was for and why nothing
+needed it.
 
 ---
 
@@ -1773,21 +1772,47 @@ a pid, so a miss stays inside the target process.
 
 ### What stays closed
 
-`post_chord` remains unreachable from the server. It exists so the shared-input
-keyboard path is visible in one file and can be reasoned about. Its last
-argument for existing — being the only way to type real keystrokes into a
-terminal — is gone now that `type_text` can do it per-pid, so it should be
-deleted; it is left in this change only because deleting it is a separate edit
-from the one that made it redundant.
+**The shared tier is now closed by absence, not by policy.** Both of the
+functions that could write to it have been deleted, and each deletion took an
+import with it, which turns a promise into something a reader can check with
+`grep`.
 
-Its mouse counterpart is already gone. `click_by_moving_pointer` warped the real
-pointer, clicked through the shared HID stream, and warped back; every control it
-existed for is now reachable by the elementless pid click, so keeping a working
-pointer warp in the tree was leaving a temptation rather than a fallback. Its
-deletion took the last `CGWarpMouseCursorPosition` reference with it, and that
-absence is now the check: nothing in the workspace imports the only API that can
-move the user's cursor, so no edit elsewhere can reintroduce a warp without
-adding the import back first.
+`click_by_moving_pointer` went first. It warped the real pointer, clicked through
+the shared HID stream, and warped back; every control it existed for is now
+reachable by the elementless pid click. Its deletion took the last
+`CGWarpMouseCursorPosition` reference with it.
+
+`post_chord` has now gone the same way. It posted a key or chord with
+`CGEventPost(kCGHIDEventTap)` — no `app` parameter, deliberately, because
+pretending to target an app while writing to the shared stream would have been a
+lie. It was the one function in `cua-hid` that took the human's keyboard focus,
+and it existed because the crate was built believing there was no per-app
+keyboard route: an arbitrary chord, a terminal, and a canvas app that only reads
+real key events were all unreachable without it. That belief is what
+`press_chord_background_pid` and `type_text_background_pid` disproved (§10), and
+the last argument for keeping it — being the only way to type real keystrokes
+into a terminal — expired with `type_text mechanism: "keystrokes"`. It was last
+reachable in 0.3.0, as the HID half of §1's rejected option 3, and has been
+unreachable from the server since 0.3.1 removed that flag: `press_key` routes
+through the pid tier, `CUA_KEY_AX_ONLY=1` selects an AX-verb-only path that
+synthesizes nothing at all, and no example or probe in the workspace called it
+either. So nothing had to be rewired to delete it — the function and its
+shared-stream `CGEventTapLocation` import were removed, and the workspace built,
+tested and linted unchanged.
+
+That import is the check. `CGEventTapLocation` is the only argument
+`CGEventPost` takes, so with it gone from the file that does the posting, a
+shared-stream write cannot be added there without putting it back first — the
+same test the missing cursor-warp import provides. Both absences are verifiable
+in one `grep` over `crates/*/src`: `CGEvent::post` returns only `post_to_pid`
+calls, every one of which names a target process, and
+`CGWarpMouseCursorPosition` returns nothing but prose. `CGEventTapLocation` has
+exactly one surviving `src` use, in `humanwatch`, where it says where to
+*create* the listen-only tap (§9) and is never handed to a post. The probe
+examples under `crates/cua-hid/examples/` do still post to the shared tap,
+deliberately and only there: `click_probe`'s `global` arm exists to reproduce
+the finding that a warped-pointer shared click works where `CGEventPostToPid`
+does not, and an example is not shipped in the binary.
 
 Global HID delivery and cursor warping are not planned, not gated behind a flag,
 and not a future option: they are the thing this project exists to not do.

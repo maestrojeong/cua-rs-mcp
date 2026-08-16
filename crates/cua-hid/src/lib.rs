@@ -18,21 +18,30 @@
 //! click_count}` — and one delivery path, so widening what cua-rs can express
 //! never widens *how* it is delivered.
 //!
-//! Exactly one shared-input helper is left: [`post_chord`] writes into the
-//! session's single, shared HID event stream. It is global by necessity — there
-//! is no per-app keyboard focus API worth trusting — so it moves the cursor,
-//! takes keyboard focus, and competes with whatever the human is physically
-//! doing. Nothing reaches it, and it stays only until
-//! [`press_chord_background_pid`] has the verification story it needs.
+//! **No shared-input helper is left.** There is no function here that writes to
+//! the session's single HID event stream, and the absence is checkable rather
+//! than promised: `grep -rn 'CGEvent::post' crates/*/src/` returns only
+//! `post_to_pid` calls, which name a target process. `CGEventPost` itself, the
+//! one call that writes to the shared stream, appears nowhere. Its
+//! `CGEventTapLocation` argument survives in exactly one place, `humanwatch`,
+//! where it names where to *create* a listen-only tap and is never handed to a
+//! post. The same kind of check covers the cursor: `CGWarpMouseCursorPosition`
+//! is not imported anywhere in the workspace.
 //!
-//! Its mouse counterpart is gone. `click_by_moving_pointer` warped the real
-//! pointer to a screen point, clicked through the shared stream, and put the
-//! pointer back; it existed for custom-drawn controls that publish no `AXPress`
-//! and only respond to a real click. Those are now served by the pid tier
-//! instead — `click_background_pid` needs no `Element`, so a bare point in a
-//! window is deliverable without ever touching the cursor — and keeping a
-//! working pointer warp in the tree once its whole justification had evaporated
-//! was leaving a temptation, not a fallback.
+//! Two functions used to be here and are gone, both for the same reason and in
+//! the same shape. `click_by_moving_pointer` warped the real pointer to a screen
+//! point, clicked through the shared stream, and put the pointer back; it
+//! existed for custom-drawn controls that publish no `AXPress` and only respond
+//! to a real click. `post_chord` posted a key or chord through the shared
+//! keyboard stream to whatever app held focus; it existed because at the time
+//! there was believed to be no per-app keyboard route, so an arbitrary chord and
+//! a terminal were reachable only by taking the human's focus. Both premises
+//! expired: `click_background_pid` needs no `Element`, so a bare point in a
+//! window is deliverable without ever touching the cursor, and
+//! [`press_chord_background_pid`] / [`type_text_background_pid`] deliver keys
+//! per-pid, which is what `press_key` and `type_text mechanism: "keystrokes"`
+//! now use. Keeping either one in the tree once its whole justification had
+//! evaporated was leaving a temptation, not a fallback.
 //!
 //! [`click_background_pid`] delivers a stamped mouse event
 //! straight into one process's window queue — no pointer warp, no window raise,
@@ -49,21 +58,11 @@
 //! believe it is active for the duration of a click without the real frontmost
 //! app or the user's keyboard focus ever changing.
 //!
-//! `post_chord` exists because the Accessibility API has no general keyboard
-//! verb: there is `AXConfirm` for Return and `AXCancel` for Escape, and after
-//! that nothing — no way to express `⌘⇧P`, no way to drive a terminal, no way
-//! to reach a canvas app that only listens for real key events. Refusing to
-//! implement it leaves a real hole; implementing it silently would destroy the
-//! property that makes the rest of this project worth using.
-//!
-//! So it is isolated here, and the isolation is enforced by the dependency
-//! graph rather than by a comment: `cua-ax` and `cua-capture` do not depend on
-//! this crate and cannot reach it. `grep -rl cua_hid crates/` enumerates every
-//! call site that can touch real input.
-//!
-//! The cua-rs server only calls [`click_background_pid`]. [`post_chord`] remains
-//! as a diagnostic API for the probe examples; no CLI flag or MCP tool can reach
-//! it.
+//! Everything that can synthesize input at all is isolated here, and the
+//! isolation is enforced by the dependency graph rather than by a comment:
+//! `cua-ax` and `cua-capture` do not depend on this crate and cannot reach it.
+//! `grep -rl cua_hid crates/` enumerates every call site that can touch real
+//! input.
 //!
 //! # `press_chord_background_pid`, promoted from unverified to primary
 //!
@@ -89,14 +88,16 @@
 //! AX-verb-only keyboard path (`return`/`escape`/`up`/`down` only) if this
 //! proves untrustworthy on a given app.
 //!
-//! [`type_text_background_pid`] is written for the same reason and stays
-//! unreachable from the server for the opposite one: a bulk text write is the
-//! single operation accessibility expresses better than events can. One
-//! `AXValue` write replaces the whole string atomically, addressed at the
-//! element, where the same text as keystrokes is a long stream landing on
-//! whatever holds focus — multiplying the focus risk above by the length of the
-//! string for nothing in return. `cua-core`'s `set_value`/`type_text` therefore
-//! keep the AX write, and do not follow this crate's click/key precedent.
+//! [`type_text_background_pid`] is written for the same reason and reached only
+//! on request, for the opposite one: a bulk text write is the single operation
+//! accessibility expresses better than events can. One `AXValue` write replaces
+//! the whole string atomically, addressed at the element, where the same text as
+//! keystrokes is a long stream landing on whatever holds focus — multiplying the
+//! focus risk above by the length of the string for nothing in return. So
+//! `cua-core`'s `set_value`/`type_text` keep the AX write by default and do not
+//! follow this crate's click/key precedent; `type_text mechanism: "keystrokes"`
+//! is the explicit opt-in, for the terminals and canvas editors where the better
+//! mechanism does nothing at all.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -106,13 +107,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use objc2::rc::Retained;
 use objc2_app_kit::NSEventType;
 use objc2_core_foundation::{CFRetained, CGPoint};
-// `CGWarpMouseCursorPosition` is deliberately absent from this list, and its
-// absence is checkable: nothing in the workspace imports the only API that can
-// move the user's cursor, so no amount of editing elsewhere can reintroduce a
-// pointer warp without adding it back here first.
+// Two names are deliberately absent from this list, and their absence is
+// checkable rather than promised. `CGWarpMouseCursorPosition` is the only API
+// that can move the user's cursor, and nothing in the workspace imports it.
+// `CGEventTapLocation` is the only argument `CGEventPost` takes, and it left this
+// file with `post_chord`: without it, no code below can write to the session's
+// shared event stream at all. Every post here is `post_to_pid`, which names a
+// target process. The one surviving use of `CGEventTapLocation` in this crate's
+// `src/` is in `humanwatch`, where it says where to create a listen-only tap and
+// is never handed to a post.
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
-    CGEventType, CGMouseButton, CGScrollEventUnit,
+    CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventType,
+    CGMouseButton, CGScrollEventUnit,
 };
 
 pub mod humanwatch;
@@ -368,31 +374,6 @@ fn modifier_mask() -> CGEventFlags {
         | CGEventFlags::MaskSecondaryFn
 }
 
-/// Post a chord as a real key press to whatever currently has focus.
-///
-/// This is global: it goes to the focused app, not to a chosen one. There is no
-/// `app` parameter on purpose — pretending to target an app while writing to the
-/// shared HID stream would be a lie, and the honest contract is "this behaves
-/// exactly as if the user pressed the keys".
-pub fn post_chord(chord: Chord) -> Result<()> {
-    // `CombinedSessionState` rather than a private source so the window server
-    // treats these as ordinary session input and modifier state composes with
-    // whatever the user is physically holding.
-    let source =
-        CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok_or(HidError::NoSource)?;
-
-    for down in [true, false] {
-        let event = CGEvent::new_keyboard_event(Some(&source), chord.key, down)
-            .ok_or(HidError::NoSource)?;
-        // Flags must be set on both the down and the up event. Leaving them off
-        // the key-up leaves apps that track modifier transitions believing the
-        // modifier is still held.
-        CGEvent::set_flags(Some(&event), chord.flags);
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-    }
-    Ok(())
-}
-
 /// Post a left click at a screen point, addressed to one process, via the
 /// **public** `CGEventPostToPid` API.
 ///
@@ -645,8 +626,10 @@ pub fn prime_keyboard_target(
 /// keyboard tier; call [`prime_keyboard_target`] first so the target has a
 /// chance to notice it should accept the keystroke that follows.
 ///
-/// Unlike [`post_chord`], nothing here touches `CGEventPost`, so the user's
-/// focused app keeps receiving their real typing throughout.
+/// Nothing here touches `CGEventPost`, so the user's focused app keeps
+/// receiving their real typing throughout. There is no longer a shared-stream
+/// keyboard function to contrast this with: `post_chord` was deleted once this
+/// one became `press_key`'s only tier.
 pub fn press_chord_background_pid(pid: i32, chord: &Chord) -> Result<()> {
     if !skylight::is_available() {
         return Err(HidError::PrimitiveUnavailable("SLEventPostToPid"));

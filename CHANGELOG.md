@@ -5,6 +5,38 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## Unreleased
+
+### `cua_hid::post_chord` is deleted
+
+It posted a key or chord through `CGEventPost(kCGHIDEventTap)` — the session's
+one shared keyboard stream — so it went to whatever app had focus and took that
+focus from the human. It was the only function in `cua-hid` that did, and it
+existed because the crate was built believing there was no per-app keyboard
+route: without it, an arbitrary chord, a terminal and a canvas app that reads
+only real key events were unreachable.
+
+Nothing needs it now. `press_chord_background_pid` and
+`type_text_background_pid` deliver keys per-pid, `press_key` uses the former as
+its only tier, and `type_text mechanism: "keystrokes"` uses the latter — which
+took away its last stated reason to exist, being the only way to type into a
+terminal. It has been unreachable from the server since 0.3.1 removed the flag
+that reached it, and no example or probe called it either, so nothing was
+rewired: the function went, and with it `cua-hid`'s `CGEventTapLocation` import.
+
+That import is the point. It is the only argument `CGEventPost` takes, so with it
+gone from the file that does the posting, a shared-stream write cannot be added
+there without putting it back first — the same check the absent
+`CGWarpMouseCursorPosition` gives for the cursor. `grep -rn 'CGEvent::post'
+crates/*/src/` now returns only `post_to_pid`, and the one surviving
+`CGEventTapLocation` in `src/` is `humanwatch`'s listen-only tap, which creates a
+tap and posts nothing. DESIGN.md §11 has the reasoning; §10 and the crate docs no
+longer describe a fallback that exists.
+
+`parse_chord` is untouched: it is shared with the pid keyboard path. Nothing
+tested `post_chord` — there was no way to assert on a write to the shared stream
+— so the workspace test count is unchanged at 212.
+
 ## 0.7.0
 
 The mouse model widened, a safety layer arrived, and four coordinate bugs came
