@@ -17,12 +17,8 @@
 //! Building the `NSEvent` first and asking AppKit for its `CGEvent` inverts the
 //! dependency: AppKit fills in the header it will later validate, and we only
 //! adjust the CG-space fields it does not own (screen location, private window
-//! routing). This is the same construction OpenAI's `SkyComputerUseService`
-//! uses — `AccessibilitySupport.SynthesizedEvent.mouseEvent(eventNumber:type:
-//! clickCount:at:mouseButton:flags:inWindow:windowBounds:
-//! windowUsesFlippedCoordinates:)` wraps
-//! `-[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:
-//! context:eventNumber:clickCount:pressure:]` and then converts with
+//! routing): `-[NSEvent mouseEventWithType:location:modifierFlags:timestamp:
+//! windowNumber:context:eventNumber:clickCount:pressure:]`, then
 //! `-[NSEvent CGEvent]`.
 //!
 //! # Thread safety
@@ -46,20 +42,15 @@ use objc2_foundation::NSPoint;
 const APPKIT_DEFINED: NSEventType = NSEventType(13);
 
 /// The undocumented `NSEventType` that CoreProcessSwitching focus notifications
-/// travel on. Not in the public `NSEventType` enum; the reference implementation
-/// declares it as an extension constant with the value 21
-/// (`sky_decomp.c:1664962`).
+/// travel on. Not in the public `NSEventType` enum; the value is 21.
 const PROCESS_NOTIFICATION: NSEventType = NSEventType(21);
 
 /// `kCPSNotifyKeyFocusReturned`, one of the private CPS focus-notification
-/// subtypes (`sky_decomp.c:1665140`). The neighbouring constants in the same
-/// initializer are `kCPSNotifyNewFront` = 2, `kCPSNotifyLostKeyFocus` = 0x1000,
-/// `kCPSNotifyKeyFocusTaken` = 0x4000 and `kCPSNotifyKeyFocusChanged` = 0xf102;
-/// only this one is used here.
+/// subtypes. The neighbouring values are `kCPSNotifyNewFront` = 2,
+/// `kCPSNotifyLostKeyFocus` = 0x1000, `kCPSNotifyKeyFocusTaken` = 0x4000 and
+/// `kCPSNotifyKeyFocusChanged` = 0xf102; only this one is used here.
 ///
-/// `NSEventSubtype` is a `short`, so the value is negative once narrowed. That is
-/// what the reference stores too — it declares the constant on `NSEventSubtype`
-/// itself rather than as an integer.
+/// `NSEventSubtype` is a `short`, so the value is negative once narrowed.
 const CPS_NOTIFY_KEY_FOCUS_RETURNED: i16 = 0x8000_u16 as i16;
 
 /// Monotonic source for `-[NSEvent eventNumber]`.
@@ -109,8 +100,8 @@ pub(crate) fn uptime_nanos() -> u64 {
 /// caller is expected to overwrite the CG-space location afterwards, because
 /// `NSEvent` interprets its `location:` in flipped, window-relative AppKit
 /// coordinates while everything downstream here works in CG screen points.
-/// OpenAI's implementation does the same thing — it calls `CGEventSetLocation`
-/// immediately after the conversion.
+/// So the location is restamped with `CGEventSetLocation` immediately after the
+/// conversion.
 ///
 /// `window_number` is the AppKit window number of the target window. Passing the
 /// real one is what lets `-[NSEvent window]` resolve inside the target process;
@@ -145,10 +136,9 @@ pub(crate) fn mouse_event(
 ///
 /// This is the mechanism behind every notice below. The event is not aimed at a
 /// view — AppKit consumes it in `NSApplication`'s own event loop and updates its
-/// idea of activation and key focus from the type/subtype pair. The reference
-/// implementation builds all of them through one helper of exactly this shape
-/// (`sky_decomp.c:1678337`), with location, flags, timestamp, window number,
-/// `data1` and `data2` all zero.
+/// idea of activation and key focus from the type/subtype pair, so one helper
+/// builds all of them with location, flags, timestamp, window number, `data1`
+/// and `data2` all zero.
 fn notification_event(
     kind: NSEventType,
     subtype: i16,
@@ -170,9 +160,7 @@ fn notification_event(
 
 /// "Keyboard focus has come back to you."
 ///
-/// The reference implementation posts this *before* the activation notice, as the
-/// first step of `SyntheticAppFocusEnforcer.enforceActiveState(for:)`
-/// (`sky_decomp.c:1669727-1669778`). Telling an app it is active is not the same
+/// Posted *before* the activation notice. Telling an app it is active is not the same
 /// as telling it that its window owns key focus again, and a control that only
 /// arms itself when its window is key — a menu button being the measured case —
 /// needs the second statement as well as the first.

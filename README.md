@@ -223,9 +223,9 @@ name, bundle path basename, bundle-id suffix, name prefix, name substring — an
 
 ## Tools
 
-Names match OpenAI's Codex computer-use plugin, which has become the de-facto
-vocabulary for this capability on macOS. Models have already seen it; a private
-dialect would cost recognition and buy nothing.
+Names follow the vocabulary that has become de-facto standard for this
+capability on macOS. Models have already seen it; a private dialect would cost
+recognition and buy nothing.
 
 | Tool | Purpose |
 |---|:--|

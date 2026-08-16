@@ -37,9 +37,8 @@
 //! `click_by_moving_pointer` exists for the mouse equivalent: some custom-drawn
 //! controls (a chat app's conversation-list row, for instance) advertise no
 //! `AXPress`, `AXPick`, or `AXConfirm` and only ever respond to a real click.
-//! Refusing to implement either (which is effectively what OpenAI's
-//! implementation does) leaves a real hole; implementing them silently would
-//! destroy the property that makes the rest of this project worth using.
+//! Refusing to implement either leaves a real hole; implementing them silently
+//! would destroy the property that makes the rest of this project worth using.
 //!
 //! So both are isolated here, and the isolation is enforced by the dependency
 //! graph rather than by a comment: `cua-ax` and `cua-capture` do not depend on
@@ -295,8 +294,8 @@ pub fn click_background_pid(
     // Convince the target it is active before any mouse event arrives. A view
     // that gates on `NSApp.isActive` or `-[NSWindow isKeyWindow]` decides
     // whether to accept the click at mouse-down, so this has to land first.
-    // Order matters, and it is the reference implementation's order: key focus
-    // first, then activation, then the window click. "You are active" and "your
+    // Order matters: key focus first, then activation, then the window click.
+    // "You are active" and "your
     // window has key focus again" are two different statements, and a control
     // that gates on `-[NSWindow isKeyWindow]` needs the second one.
     post_activation_notice(pid, nsevent::notify_window_key_focus_returned())?;
@@ -377,12 +376,9 @@ const HUMAN_CLICK_INTERVAL_MS: u64 = 80;
 /// This is the keyboard counterpart to [`click_background_pid`], and it exists
 /// because the premise this crate was built on — "there is no per-app keyboard
 /// API worth trusting, so keyboard input must go through the global HID tap and
-/// steal focus" — turns out to be wrong. OpenAI's `SkyComputerUseService` builds
-/// keyboard events with `CGEventCreateKeyboardEvent` against a
-/// `kCGEventSourceStateHIDSystemState` source and posts them through the same
-/// per-pid route its clicks use
-/// (`SystemSoftware.CGEventAPI.createKeyboardEvent(source:virtualKey:keyDown:)`
-/// feeding `SynthesizedEvent.send(to:)`), with no global tap involved.
+/// steal focus" — turns out to be wrong. `CGEventCreateKeyboardEvent` against a
+/// `kCGEventSourceStateHIDSystemState` source can be posted through the same
+/// per-pid route the clicks here use, with no global tap involved.
 ///
 /// It is deliberately *not* wired into the `press_key` MCP tool yet.
 /// Keyboard input that silently lands in the wrong process is far more damaging
@@ -416,9 +412,7 @@ pub fn press_chord_background_pid(pid: i32, chord: &Chord) -> Result<()> {
 /// See [`press_chord_background_pid`] for why this exists and why nothing calls
 /// it yet. The mechanism is `CGEventKeyboardSetUnicodeString` on a keycode-0
 /// event, which is how you type a character that has no virtual keycode on the
-/// current layout — the same call OpenAI's
-/// `SystemSoftware.CGEventAPI.keyboardSetUnicodeString(_:stringLength:
-/// unicodeString:)` wraps for `SynthesizedEvent.type(string:)`.
+/// current layout.
 ///
 /// This is the path that would finally reach the targets `set_value` and
 /// `type_text` cannot: terminals, canvas editors and anything else that only
@@ -503,16 +497,16 @@ pub struct PidClick {
     pub count: u8,
 }
 
-/// Everything needed to send the reference implementation's *localized* form of
-/// an activation notice, rather than the bare one.
+/// Everything needed to send the *localized* form of an activation notice, rather
+/// than the bare one.
 ///
 /// `SynthesizedEvent.notifyAppActivated(windowID:windowBounds:activationPoint:)`
 /// behaves differently depending on whether the last two arguments are present.
 /// With them absent it emits only the `ApplicationActivated` event — which is all
 /// cua-rs used to send. With them present it emits that event *plus a mouse
 /// down/up pair* aimed at the window's own activation point and pinned to the
-/// window with `CGEventSetWindowLocation(point - bounds.origin)`
-/// (`sky_decomp.c:1678202-1678260`). That pair is the canonical "click a window
+/// window with `CGEventSetWindowLocation(point - bounds.origin)`. That pair is
+/// the canonical "click a window
 /// to make it key" gesture, and skipping it is why an activation notice alone
 /// left some controls — a chat app's header menu button, measured — still
 /// refusing the click that followed.
@@ -538,9 +532,9 @@ pub struct ActivationAssist {
 /// in well under a frame. A target that never agrees costs the full budget once,
 /// which is the right trade against posting a click the app will discard.
 ///
-/// Both numbers come from the reference implementation:
-/// `ApplicationUIElement.waitUntilAppBelievesItIsFrontmost(timeout:)` is called
-/// with `2.0` from the inactive-app path of `sendClick`.
+/// Two seconds is the ceiling because past that the click is not worth waiting
+/// for; 16 ms is one display frame, which is the finest granularity the answer
+/// can actually change at.
 const ACTIVATION_WAIT_TIMEOUT_MS: u64 = 2_000;
 const ACTIVATION_POLL_INTERVAL_MS: u64 = 16;
 
@@ -556,8 +550,7 @@ const ACTIVATION_POLL_INTERVAL_MS: u64 = 16;
 ///
 /// Timing out is not an error. Plenty of targets are already active, never
 /// publish the attribute, or simply do not care; a click is still worth
-/// attempting. The reference implementation makes the same call
-/// (`waitUntilAppBelievesItIsFrontmost` is `async -> ()`, not `throws`).
+/// attempting, so this reports the outcome and never fails.
 ///
 /// The predicate is injected rather than read here on purpose: answering "does
 /// this app believe it is frontmost" means reading the accessibility API, and
@@ -597,20 +590,20 @@ fn wait_until_believed_frontmost(believes_it_is_frontmost: &dyn Fn() -> bool) {
     }
 }
 
-/// The second half of the reference implementation's localized activation notice:
-/// a click on the window itself, at the point the window nominates.
+/// The second half of the localized activation notice: a click on the window
+/// itself, at the point the window nominates.
 ///
 /// This is what actually makes AppKit treat the window as key. The
 /// `ApplicationActivated` event tells the *application* it is active; a window
-/// only becomes key when something clicks it, which is why the reference emits
-/// this pair alongside the notice whenever it knows the window's bounds and
-/// activation point (`sky_decomp.c:1678202-1678260`).
+/// only becomes key when something clicks it, which is why this pair is emitted
+/// alongside the notice whenever the window's bounds and activation point are
+/// known.
 ///
 /// It is a real click, so it is only as safe as the point it is aimed at. The
 /// caller owns that check — see [`ActivationAssist`].
 ///
-/// Fresh event numbers are used here rather than the literal `1` and `2` the
-/// decompilation shows, because what AppKit needs from the field is uniqueness
+/// Fresh event numbers are used here rather than fixed literals, because what
+/// AppKit needs from the field is uniqueness
 /// and a down/up that belong together; reusing low constants across every click
 /// in the process would make consecutive gestures look like replays of one.
 fn post_window_focus_click(
@@ -761,10 +754,9 @@ fn post_mouse_event(
 /// Whether to deliver through the public `CGEventPostToPid` instead of the
 /// private SkyLight route, read once from `CUA_PUBLIC_POST`.
 ///
-/// The reference implementation posts everything through the *public* call
-/// (`SystemSoftware.CGEventAPI.postToPid`, reached from `SynthesizedEvent.send`),
-/// which is the same API §1 of DESIGN.md records as non-functional. Both
-/// observations can hold: the measurement that condemned the public route sent an
+/// The public call is the same API §1 of DESIGN.md records as non-functional, yet
+/// it does work once an event is built properly. Both observations can hold: the
+/// measurement that condemned the public route sent an
 /// event with no AppKit header, no fresh timestamp and no activation notice, so it
 /// was never evidence about the route itself. Now that those are all in place the
 /// comparison is finally meaningful, and it matters — if the public route works,
@@ -790,9 +782,8 @@ fn use_public_post() -> bool {
 /// immediately after being told the opposite. Suppressing it kept the menu bar
 /// intact across the click.
 ///
-/// Leaving the target believing it is active is the lesser problem, and it is
-/// what the reference implementation does too — it deactivates in a separate
-/// `deactivateFocusEnforcer()` lifecycle step rather than after every click. The
+/// Leaving the target believing it is active is the lesser problem: deactivation
+/// belongs to a session-shaped lifecycle step rather than to every click. The
 /// belief is corrected by real AppKit events as soon as the user touches
 /// anything, and the *real* frontmost app was never changed in the first place.
 ///

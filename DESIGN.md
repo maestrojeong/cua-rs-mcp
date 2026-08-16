@@ -30,31 +30,19 @@ message and acts on it.
 
 ### This was verified, not assumed
 
-The decision was informed by disassembling OpenAI's shipped implementation
-(`com.openai.sky.CUAService`, the backend of Codex's bundled computer-use
-plugin). Its undefined-symbol table is the whole argument:
+A computer-use tool can be built entirely out of accessibility actions: the
+whole capability is reachable through `AXUIElementPerformAction`,
+`AXUIElementSetAttributeValue` and `AXUIElementCopyAttributeValue`, and every AX
+symbol that requires is available in the public `objc2-application-services`
+crate. "Does not steal focus" is then not a feature flag but the absence of
+event-posting code, which is a property a reader can check rather than trust.
 
-```text
-CGEventPost                0      AXUIElementPerformAction      1
-CGEventPostToPid           0      AXUIElementSetAttributeValue  1
-CGEventCreateMouseEvent    0      AXUIElementCopyAttributeValue 2
-CGEventTapCreate           0      AXObserverCreate              1
-IOHIDPostEvent             0      SCStream                      5
-CGEventGetFlags            1  ← reads modifier state only
-```
-
-Zero event-posting symbols. Their "does not steal focus" claim is not a feature
-flag, it is the absence of that code. All 29 AX symbols they link are available
-in the public `objc2-application-services` crate, which is what made an
-independent implementation viable in the first place.
-
-This table documents Codex's *input* path: it posts events through public
-CoreGraphics/IOHID APIs and never raises a window. cua-rs keeps that public-API
-path as its reliable click tier, but it additionally ports one piece of private
-SPI for a *quieter* tier — the SkyLight `SLEventPostToPid` recipe, dlopened
-lazily and confined to `cua-hid` (see the end of §6). That is a deliberate,
-documented reversal of the "no private API" rule; if the framework cannot be
-loaded, the click fails explicitly rather than falling back to shared input.
+cua-rs keeps a public-API event path as its reliable click tier, and additionally
+ports one piece of private SPI for a *quieter* tier — the SkyLight
+`SLEventPostToPid` recipe, dlopened lazily and confined to `cua-hid` (see the end
+of §6). That is a deliberate, documented reversal of the "no private API" rule;
+if the framework cannot be loaded, the click fails explicitly rather than falling
+back to shared input.
 
 ### The cost, stated plainly
 
@@ -81,7 +69,7 @@ and it is written into the README rather than hidden.
 Three options, none free:
 
 1. **`AXUIElementPostKeyboardEvent`** — app-scoped, in the crate, deprecated, no
-   modifier-chord support. OpenAI does not link it. Rejected.
+   modifier-chord support. Rejected.
 2. **AX-only `press_key`** — background-safe semantic verbs remain; arbitrary
    chords are refused. Chosen in 0.3.1.
 3. **AX where a verb exists, HID behind an explicit flag otherwise.** Removed
@@ -130,13 +118,49 @@ Two secondary reasons:
   window, only that disposable process fails and the MCP server returns a
   screenshot warning while preserving the AX tree and connection.
 
-### An open menu blocks window capture, and there is no safe fallback
+### Some windows refuse to be captured, and there is no safe fallback
 
-Measured on KakaoTalk: while an `NSMenu` is up, `screencapture -l<id>` fails with
-`could not create image from window` for that app's windows, and the *same*
-window id captures fine seconds later once the menu closes. `on_screen` is not
-the discriminator — every window of the app reported `on_screen=false` in both
-the failing and the succeeding case.
+Measured on KakaoTalk: `screencapture -l<id>` fails with `could not create image
+from window` for a window that captured fine moments earlier, while a sibling
+window of the same app still captures. Twice the failing window had an `NSMenu`
+or a modal up and closing it restored capture, so the warning names an open menu
+when the tree contains one — but that correlation is **not established as the
+rule**. Those measurements were taken while ScreenCaptureKit on the machine was
+in a degraded state (see below), which can make capture fail broadly, and the
+condition has not been re-measured against a healthy one.
+
+`on_screen` is not the discriminator, and worse, it is not always true: with a
+sick `replayd`, `SCShareableContent` reported `isOnScreen=false` for *every*
+window in the system including the visibly frontmost one. `killall replayd`
+restored it. Check that before concluding anything about a particular window —
+it nearly produced a bug report against this crate's own `on_screen` field.
+
+### ScreenCaptureKit instead of `screencapture` buys nothing here
+
+The modern alternative is `SCScreenshotManager.captureImageWithFilter` over
+`SCContentFilter(desktopIndependentWindow:)`, which is the API behind the
+screen-sharing indicator macOS shows for tools that use it. Measured head to head
+against `screencapture -l` on five windows, with a signed probe holding its own
+Screen Recording grant: **the two agree on every window.** ScreenCaptureKit
+succeeded exactly where `screencapture` succeeded and failed exactly where it
+failed (`-3811` on all three retries). The block is at the window layer, not in
+the API.
+
+So the rewrite is not worth it, and the cost is precisely §7: a signed bundle
+with a Team ID and its own user-granted Screen Recording entry. A tool willing to
+raise the target app before capturing never has to photograph an occluded window
+and can afford that path anyway; §1's cursor-and-focus contract forbids us the
+same move.
+
+Two smaller measurements from the same probe, worth keeping:
+
+- A second `SCScreenshotManager` capture *in one process* fails with `-3811`
+  whatever window it names, while the first succeeds. Comparing windows requires
+  one process each.
+- `SCContentFilter` can abort the process outright — `Assertion failed:
+  (did_initialize) CGS_REQUIRE_INIT` inside `SLGetDisplaysWithRect` — before any
+  capture is attempted. That is an uncatchable `SIGABRT`, so if this path is ever
+  adopted it stays behind the isolated worker regardless.
 
 The obvious fallback is to capture the window's screen *region* instead, and it
 does succeed while the menu is open. It was rejected after measuring what comes
@@ -540,83 +564,6 @@ or verified live
 - [ ] Retina: `scale` ≈ 2.0; external 1x display: ≈ 1.0
 - [ ] window moved between snapshot and action: index still hits the right control
 
----
-
-## 8b. Calibration against a shipping implementation
-
-macOS ships a working, signed instance of exactly this problem: OpenAI's
-`SkyComputerUseService` (`com.openai.sky.CUAService`), the native helper behind
-Codex's Computer Use. Its `AccessibilitySupport` and `ComputerUse` Swift modules
-were read symbol-by-symbol from a full decompilation and used as ground truth for
-the input path. What follows is what differed, and what was changed here as a
-result.
-
-| | reference (`SkyComputerUseService`) | cua-rs before | now |
-|---|:--|:--|:--|
-| mouse event construction | `-[NSEvent mouseEventWithType:…eventNumber:clickCount:pressure:]` → `-[NSEvent CGEvent]` | `CGEventCreateMouseEvent`, private fields patched on afterwards | matches reference |
-| event number | monotonic `SynthesizedEvent.nextEventNumber`, one per down/up pair | never set, so always 0 | monotonic counter in `cua-hid::nsevent` |
-| click count | `clickCount:` argument, counting up across a gesture | `kCGMouseEventClickState` stamped after the fact | carried by the `NSEvent` header |
-| window identity | `windowNumber:` argument | field 51 stamped after the fact | carried by the `NSEvent` header |
-| timestamp | `setTimestamp(DispatchTime.now().uptimeNanoseconds)` immediately before each post | never set | `CLOCK_UPTIME_RAW`, read immediately before each post |
-| activation | `SyntheticAppFocusEnforcer.enforceActiveState(for:)` + synthesized `notifyAppActivated` / `notifyAppDeactivated` | none, by policy | synthesized `ApplicationActivated`/`Deactivated` notices; real activation still refused |
-| waiting for activation to land | `waitUntilAppBelievesItIsFrontmost(2.0)`, polled | fixed 12 ms sleep | polls the target's `AXFrontmost` to the same 2 s ceiling |
-| keeping a background menu open | `SystemFocusStealPreventer` process taps whose callback returns NULL, registered per target pid *and* menu pid | none | not built — see §10 |
-| holding focus during a session | `clickEventTap`, listen-only, re-activating the target with `NSRunningApplication.activate` when something else takes focus | none, by policy | not built — see §10 |
-| menu lifecycle | `ComputerUseAppController` tracks `_currentlyOpenedMenu` / `_currentlyFocusedMenuBarItem` and feeds the menu's pid to suppression | none — only `sendClick` was reproduced | not built |
-| post route | public `CGEventPostToPid` | private `SLEventPostToPid` | unchanged — see below |
-| deactivation | `deactivateFocusEnforcer()`, a lifecycle step | `ApplicationDeactivated` after *every* click | not sent per click — see below |
-| keyboard | `CGEventCreateKeyboardEvent` + `keyboardSetUnicodeString`, posted per-pid | global HID tap only; arbitrary keys refused outright | per-pid path written, gated (see §10) |
-| cursor feedback | `ComputerUseCursor`, a spring-animated overlay window; the visible "mouse" is drawn, not the system pointer | none | not built |
-
-Three of these deserve more than a table row.
-
-**Balancing every click with a deactivation was actively harmful.** Telling the
-target it went inactive immediately after telling it the opposite is not a
-no-op: measured on KakaoTalk, the chat window's own menu-bar item ("채팅")
-disappeared the instant that notice landed, and stayed gone. The control was
-still mid-gesture. Suppressing the notice kept the menu bar intact across the
-click. Leaving the target believing it is active is the smaller cost, it is what
-the reference does, and the real frontmost app was never touched either way.
-
-**Window level is not a reliability signal, and treating it as one broke
-clicks.** `is_plausible_target` required level 0. KakaoTalk publishes chat-room
-windows at level 3 (`NSFloatingWindowLevel`), so they were dropped from the
-candidate set; the click path then matched a *different* window of the same
-process and stamped that window's number onto the event, which the target
-discarded. The symptom — "this control ignores synthetic clicks" — pointed at
-the event, and the cause was the window lookup. The ceiling is now level 3, with
-menus, status items and overlays still excluded because they live far above it.
-
-**The construction order was backwards, and that was the bug.** A `CGEvent`
-synthesized from scratch has no AppKit identity: `-[NSEvent eventNumber]` reads
-back 0, the window number is 0, `-[NSEvent window]` is nil. Custom-drawn
-`NSView`s that hit-test and count clicks themselves read those and conclude the
-event is not a real click. Stamping the private fields afterwards does not help,
-because AppKit rebuilds its `NSEvent` from the event record's own header rather
-than from fields a caller patched in. Building the `NSEvent` first inverts the
-dependency: AppKit fills in the header it will later validate. The measured
-symptom this explains is a chat app's conversation-list row accepting a click
-from the reference implementation and ignoring an otherwise identical one from
-here.
-
-**The public post route works.** The reference uses `CGEventPostToPid`, the very
-call §1 and `post_click_to_pid` record as non-functional. Both observations can
-be true at once: the earlier measurement posted an event that was missing the
-AppKit header, the fresh timestamp, and the activation notice, so it is not
-evidence about the route. `SLEventPostToPid` is kept for now because it is what
-the current recipe was verified against, but the private-SPI dependency is no
-longer *justified* by the public route failing, and dropping it is a live option.
-
-**The visible cursor is a lie, in both implementations.** The reference's
-`createVirtualCursorIfNeeded` builds a `ComputerUseCursor` — an overlay window
-with its own spring-physics parameters (`springResponseScaler`,
-`scootStretchResponse`, `springDampingFraction`). What a user watching the screen
-sees glide across and click is that overlay, not the system pointer, which never
-moves. This matters for calibration: "OpenAI's version moves the real mouse and
-that is why it works" is false, and the actual difference was the event header.
-
----
-
 ## 9. Deliberately not built
 
 | | Why |
@@ -649,60 +596,37 @@ the obvious next safety feature.
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.
 
-**The reference does use real activation, just not where we looked.** An earlier
-reading of the symbol table concluded it never calls
-`NSRunningApplication.activate`, and §1 still repeats that its undefined-symbol
-table contains no event-posting calls. Both statements were too strong. Its
-`clickEventTap` is `kCGAnnotatedSessionEventTap` with `kCGEventTapOptionListenOnly`
-— the raw options word at `0x100e8a730` is `{placement: 0, options: 1}` — and its
-callback passes every event through unchanged (`sky_decomp.c:1670393-1670405`).
-What that callback *does* is watch for another process taking focus and answer by
-calling `activateWithOptions(0)` on the target (`sky_decomp.c:1670407-1670547`).
+**Menu-opening controls: solved, and the fix was two bugs rather than a
+mechanism.** KakaoTalk's chat-room hamburger was the standing case — no AX
+actions, so a synthesized click is the only route, and for a long time it did
+nothing. Neither missing piece was exotic:
 
-So the model is not "never disturb focus". It is "hold the target frontmost for
-the duration of a session, and put it back if something takes it away". That
-reframes the one measurement where the reference appeared to drive a background
-app: the observer could not confirm real frontmost state at the time, and this
-tap would have re-activated the target within a frame of the test raising another
-window. Treat "the reference works in the background" as unproven.
+- `is_plausible_target()` required `layer == 0`, which excluded the app's own
+  floating chat windows at layer 3. The cap is now 3.
+- An `ApplicationDeactivated` notice was sent after *every* click, which
+  destroyed the key-window state the next click depended on. It is gone by
+  default, and `CUA_DEACTIVATE_AFTER_CLICK=1` restores it for comparison.
 
-**Menu-opening controls are still unsolved.** KakaoTalk's chat-room hamburger is
-the standing case: it advertises no AX actions, so a synthesized click is the
-only route, and it opens for the reference implementation at coordinates cua-rs
-also computes correctly. What has been ruled out, each by measurement rather than
-argument: the coordinate; the AppKit event header; the timestamp; the ordering of
-the focus notices; whether the target believes it is frontmost (`AXFrontmost`
-does flip, in about 150 ms); the private versus public per-pid post route (both
-behave the same); and — the most informative one — moving the real pointer onto
-the control and clicking it there, which also does nothing. A real HID click
-failing is what rules out "menu tracking needs the cursor over the control" and
-says the missing piece is around the click rather than in it.
+With both fixed the menu opens reliably, its items are readable in the tree, and
+`press_key escape` on the `AXMenu` closes it. Ruled out along the way, each by
+measurement rather than argument: the coordinate; the AppKit event header; the
+timestamp; the ordering of the focus notices; whether the target believes it is
+frontmost (`AXFrontmost` does flip, in about 150 ms); and the private versus
+public per-pid post route.
 
-Two candidates remain, both from the reference and neither built here:
-
-- **Menu-dismissal suppression.** Not the `clickEventTap` — that one is
-  listen-only and passes events through. It is `SystemFocusStealPreventer`,
-  which installs *process* taps on the target pid and, separately, on the menu's
-  own pid, whose callback returns NULL for the events that would close the menu
-  (`sky_decomp.c:1675580-1675665`). This is a real filter on input, which is the
-  boundary §9 draws deliberately, so it is a decision rather than a task.
-- **Menu lifecycle tracking.** `ComputerUseAppController` keeps
-  `_currentlyOpenedMenu` and `_currentlyFocusedMenuBarItem`, and the menu pid it
-  hands to suppression comes from there. Only `sendClick` was reproduced here;
-  the controller layer above it was not, and a menu pid cannot be supplied
-  without it.
-
-Until one of those is taken on, treat menus as observable but not operable, and
-note that `AXShowMenu` via `perform_secondary_action` reaches some controls with
-none of this machinery — though not this one, which exposes no actions at all.
+What remains unsolved is one step further in: an `AXMenuItem` does not reliably
+act on the first `AXPress`. The first press selected it and the second opened the
+dialog, observed once. `return_state` makes that visible — the diff reported
+exactly one changed line, `(selected)` — so it is measurable now, but it has not
+been characterized.
 
 **The per-pid keyboard path is written but unproven.**
 `press_chord_background_pid` and `type_text_background_pid` exist in `cua-hid`
-and nothing calls them. They follow the reference implementation's construction
-(`CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
-`CGEventKeyboardSetUnicodeString` for characters with no keycode, posted per-pid),
-which invalidates this crate's founding assumption that keyboard input must go
-through the global tap and steal focus. They stay gated because a keystroke that
+and nothing calls them. Their construction —
+`CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
+`CGEventKeyboardSetUnicodeString` for characters with no keycode, posted per-pid —
+invalidates this crate's founding assumption that keyboard input must go through
+the global tap and steal focus. They stay gated because a keystroke that
 lands in the wrong process is far worse than a click that does not land: it types
 into whatever the user is editing. Verifying them needs the same
 control-and-measure treatment the click path got, against a target where a miss

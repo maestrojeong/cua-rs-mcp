@@ -1,7 +1,7 @@
 //! Why does a menu button ignore a click that every other control accepts?
 //!
-//! A lot has been ruled out on the way here: the coordinate is the one the
-//! reference implementation uses, the event carries a real AppKit header, the
+//! A lot has been ruled out on the way here: the coordinate is confirmed against
+//! the control's own frame, the event carries a real AppKit header, the
 //! timestamp is fresh, the focus notices land (`AXFrontmost` flips), and the
 //! private and public per-pid post routes behave identically.
 //!
@@ -16,8 +16,7 @@
 //! Measured so far on KakaoTalk's chat-room header menu: **neither opens it**.
 //! `warp` failing is the more informative half — it disproves "menu tracking
 //! needs the real pointer under the control", which was the leading theory, and
-//! means the remaining difference is in what the reference does *around* the
-//! click rather than in the click itself.
+//! means the remaining difference is *around* the click rather than in it.
 //!
 //! Two real bugs did fall out of running it, both now fixed in the library: the
 //! window-level filter excluded floating-level windows (so the click was stamped
@@ -38,8 +37,8 @@ use cua_ax::{attr, require_trusted, Element};
 ///
 /// Deliberately not filtered by role. The first version of this probe only
 /// looked for roles containing "Menu" and reported "no menu" — but the
-/// reference implementation describes what it opens as a top-level element
-/// titled 메뉴 carrying `AXCancel`, whose role is not documented. Filtering on a
+/// control opens a top-level element titled 메뉴 carrying `AXCancel`, whose role
+/// is not documented. Filtering on a
 /// guessed role means a menu that *did* open reads as a failure, which is the
 /// most expensive kind of wrong answer here.
 fn app_children(app: &Element) -> Vec<String> {
@@ -107,9 +106,8 @@ fn real_frontmost() -> Option<libc::pid_t> {
 /// Make `pid` genuinely frontmost and wait for the window server to agree.
 ///
 /// This is `NSRunningApplication.activate`, the thing the rest of cua-rs refuses
-/// to call. The reference implementation does call it — its focus tap answers a
-/// focus steal with `activateWithOptions(0)` — so this arm measures whether real
-/// activation is what the menu has been waiting for.
+/// to call. This arm exists only to measure whether real activation is what the
+/// menu has been waiting for.
 fn really_activate(pid: libc::pid_t) -> bool {
     let Some(app) =
         objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)

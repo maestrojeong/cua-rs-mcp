@@ -410,11 +410,10 @@ impl ActionResult {
 /// Work out whether this app's front window can safely be clicked in order to
 /// make it key, and where.
 ///
-/// The reference implementation pairs its `ApplicationActivated` notice with a
-/// click on the window's own `AXActivationPoint`, which is what actually makes
-/// AppKit treat the window as key rather than merely telling the application it
-/// is active. Reproducing that means synthesizing a real click at a point the app
-/// chose, so it is gated on two checks:
+/// An `ApplicationActivated` notice has to be paired with a click on the window's
+/// own `AXActivationPoint` for AppKit to treat the window as key, rather than
+/// merely telling the application it is active. That means synthesizing a real
+/// click at a point the app chose, so it is gated on two checks:
 ///
 /// 1. the window publishes an activation point at all — a guessed title-bar point
 ///    would be exactly the kind of coordinate that lands on a close button;

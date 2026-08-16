@@ -4,10 +4,9 @@
 //!
 //! The tool names here (`list_apps`, `get_app_state`, `click`, `type_text`,
 //! `press_key`, `scroll`, `drag`, `set_value`, `select_text`,
-//! `perform_secondary_action`) are deliberately identical to the ones OpenAI's
-//! bundled Codex computer-use plugin exposes. That surface has become the
-//! de-facto vocabulary for this capability on macOS, and models have seen it.
-//! Inventing a prefixed dialect would buy nothing and cost recognition.
+//! `perform_secondary_action`) deliberately match the vocabulary that has become
+//! de-facto standard for this capability on macOS, which models have already
+//! seen. Inventing a prefixed dialect would buy nothing and cost recognition.
 //!
 //! # The one invariant
 //!
