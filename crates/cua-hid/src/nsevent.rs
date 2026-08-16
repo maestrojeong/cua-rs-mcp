@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType};
 use objc2_core_graphics::{CGEvent, CGEventFlags};
-use objc2_foundation::NSPoint;
+use objc2_foundation::{NSPoint, NSString};
 
 /// The AppKit spelling of a set of CG event flags.
 ///
@@ -148,6 +148,45 @@ pub(crate) fn mouse_event(
         event_number,
         click_count,
         pressure,
+    )?;
+    event.CGEvent()
+}
+
+/// Build a key event through AppKit and hand back its `CGEventRef`.
+///
+/// The keyboard counterpart to [`mouse_event`], and it exists for one reason
+/// the mouse path already had: `window_number`. A `CGEvent` built with
+/// `CGEventCreateKeyboardEvent` has no AppKit identity, so `-[NSEvent window]`
+/// is nil on it and its window number is 0. That is fine for a key aimed at an
+/// app's first responder, which is how the shipped keyboard tier uses it — but
+/// a pop-up menu is a *window*, and "which window is this key for" is the one
+/// question a windowless event cannot answer.
+///
+/// `characters` and `chars_ignoring_modifiers` are what AppKit hands to
+/// `-[NSResponder interpretKeyEvents:]` and what a menu's type-select compares
+/// against. They are separate arguments because they genuinely differ under a
+/// modifier: ⌥E produces `´` for the first and `e` for the second.
+pub(crate) fn key_event(
+    down: bool,
+    modifiers: NSEventModifierFlags,
+    window_number: isize,
+    characters: &str,
+    chars_ignoring_modifiers: &str,
+    key_code: u16,
+) -> Option<Retained<CGEvent>> {
+    let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+        if down { NSEventType::KeyDown } else { NSEventType::KeyUp },
+        NSPoint::new(0.0, 0.0),
+        modifiers,
+        // Re-stamped with a fresh uptime reading just before posting, exactly
+        // as `mouse_event`'s is.
+        0.0,
+        window_number,
+        None,
+        &NSString::from_str(characters),
+        &NSString::from_str(chars_ignoring_modifiers),
+        false,
+        key_code,
     )?;
     event.CGEvent()
 }

@@ -692,6 +692,125 @@ pub fn press_chord_background_pid(pid: i32, chord: &Chord) -> Result<()> {
     Ok(())
 }
 
+/// The characters AppKit should report for a chord: `(characters,
+/// charactersIgnoringModifiers)`.
+///
+/// `-[NSEvent characters]` is not derivable from a keycode by anything outside
+/// the input method, so this is a deliberate, partial reconstruction of it —
+/// enough for the keys a menu cares about. Three cases:
+///
+/// - a caller-named literal (`press_key x`) is used verbatim, for the same
+///   reason [`press_chord_background_pid`] stamps it onto the Unicode string:
+///   the caller asked for a character, not for whatever the current input
+///   source makes of that keycode;
+/// - a navigation or editing key becomes its `NSxxxFunctionKey` constant, which
+///   is the private-use code point AppKit itself puts in `characters` for it —
+///   an arrow key is `U+F700..U+F703`, not an empty string;
+/// - anything else falls back to the single-character name the key table knows
+///   it by, so `cmd+t` reports `"t"`.
+///
+/// Empty for a key this does not model — a function key, a modifier — which is
+/// honest rather than approximate: `characters` is documented to be empty for a
+/// modifier key, and no menu reads F13.
+///
+/// Pure and unit-tested; posts nothing.
+pub fn key_characters(chord: &Chord) -> (String, String) {
+    // `NSUpArrowFunctionKey` and friends, from `NSEvent.h`. Spelled out rather
+    // than computed because the block is not contiguous in a useful way.
+    const FUNCTION_KEYS: [(u16, u32); 13] = [
+        (126, 0xF700), // up
+        (125, 0xF701), // down
+        (123, 0xF702), // left
+        (124, 0xF703), // right
+        (114, 0xF746), // help
+        (115, 0xF729), // home
+        (119, 0xF72B), // end
+        (116, 0xF72C), // page up
+        (121, 0xF72D), // page down
+        (117, 0xF728), // forward delete
+        (36, 0x000D),  // return
+        (76, 0x0003),  // enter (ETX, which is what AppKit reports)
+        (53, 0x001B),  // escape
+    ];
+    const CONTROL_KEYS: [(u16, char); 3] = [(48, '\t'), (49, ' '), (51, '\u{8}')];
+
+    let literal = chord
+        .literal
+        .map(String::from)
+        .or_else(|| {
+            FUNCTION_KEYS
+                .iter()
+                .find(|(code, _)| *code == chord.key)
+                .and_then(|(_, ch)| char::from_u32(*ch))
+                .map(String::from)
+        })
+        .or_else(|| {
+            CONTROL_KEYS
+                .iter()
+                .find(|(code, _)| *code == chord.key)
+                .map(|(_, ch)| String::from(*ch))
+        })
+        .or_else(|| {
+            key_table()
+                .iter()
+                .filter(|(name, code)| **code == chord.key && name.chars().count() == 1)
+                .map(|(name, _)| (*name).to_string())
+                .next()
+        })
+        .unwrap_or_default();
+    // The two strings differ only under a modifier that changes the glyph — ⌥E
+    // gives `´` and `e` — and reconstructing that would mean reimplementing the
+    // active keyboard layout. Reporting the same string for both is the honest
+    // approximation: it is right for every unmodified key and for ⌘-chords,
+    // which is what a menu reads.
+    (literal.clone(), literal)
+}
+
+/// Send a key chord to one process, stamped with the window it is meant for.
+///
+/// # Status: experimental, and see DESIGN §10 for what it was measured to do
+///
+/// [`press_chord_background_pid`] builds its events with
+/// `CGEventCreateKeyboardEvent`, which produces an event with no AppKit
+/// identity: window number 0, `-[NSEvent window]` nil. That is correct for a
+/// key aimed at an application's first responder, and it is the shipped path.
+///
+/// A pop-up menu is not a first responder, though — it is a window running its
+/// own tracking loop, and `windowNumber` is the field that says which window an
+/// event belongs to. This builds the event through
+/// `-[NSEvent keyEventWithType:…windowNumber:…]` instead, so the number can be
+/// the menu's own, and reconstructs `characters` with [`key_characters`]
+/// because AppKit will not derive it for a synthesized event.
+///
+/// Same delivery route as everything else here: stamped for the target pid and
+/// posted with `SLEventPostToPid`. Nothing touches the shared keyboard.
+pub fn press_chord_in_window_pid(pid: i32, window_number: isize, chord: &Chord) -> Result<()> {
+    if !skylight::is_available() {
+        return Err(HidError::PrimitiveUnavailable("SLEventPostToPid"));
+    }
+    let (characters, ignoring) = key_characters(chord);
+    let modifiers = nsevent::appkit_modifiers(chord.flags);
+
+    for down in [true, false] {
+        let event = nsevent::key_event(
+            down,
+            modifiers,
+            window_number,
+            &characters,
+            &ignoring,
+            chord.key,
+        )
+        .ok_or(HidError::NoSource)?;
+        // The CG record carries its own flags, read by anything that looks at
+        // `CGEventGetFlags` rather than at the AppKit header.
+        CGEvent::set_flags(Some(&event), chord.flags);
+        CGEvent::set_timestamp(Some(&event), nsevent::uptime_nanos());
+        post_raw_to_pid(pid, nsevent::as_raw(&event))?;
+        std::thread::sleep(std::time::Duration::from_millis(12));
+    }
+    Ok(())
+}
+
 /// Type literal text into one process without touching the shared keyboard.
 ///
 /// # Status: reachable from the MCP surface as of the pid-first keyboard tier
@@ -748,9 +867,13 @@ pub fn type_text_background_pid(pid: i32, text: &str) -> Result<()> {
 /// fields are all meaningless here; only the target pid and a fresh timestamp
 /// apply.
 fn post_keyboard_event(pid: i32, event: &CFRetained<CGEvent>) -> Result<()> {
-    let ptr = CFRetained::as_ptr(event).as_ptr() as *mut c_void;
-
     CGEvent::set_timestamp(Some(event), nsevent::uptime_nanos());
+    post_raw_to_pid(pid, CFRetained::as_ptr(event).as_ptr() as *mut c_void)
+}
+
+/// Stamp a raw `CGEventRef` for `pid` and post it. The half of
+/// [`post_keyboard_event`] that does not care how the event was built.
+fn post_raw_to_pid(pid: i32, ptr: *mut c_void) -> Result<()> {
     skylight::set_integer_field(ptr, skylight::TARGET_PID, pid as i64)
         .then_some(())
         .ok_or(HidError::PrimitiveUnavailable(
