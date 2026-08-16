@@ -976,15 +976,91 @@ fn frame_contains(frame: &CGRect, x: f64, y: f64) -> bool {
         && y < frame.origin.y + frame.size.height
 }
 
-/// An element's best on-screen point for a drawn cursor: its own
-/// `AXActivationPoint` when it has one — not always the geometric centre, for
-/// a wide list row or a control with a large transparent hit area — falling
-/// back to the frame centre. `None` when the element publishes neither.
-fn element_point(el: &Element) -> Option<(f64, f64)> {
-    if let Some(p) = el.activation_point() {
-        return Some((p.x, p.y));
+/// Pull an aim point back into the part of an element the window actually shows.
+///
+/// Returns the point unchanged when it is already inside the window. Otherwise
+/// the centre of the element's visible region — the intersection of the
+/// element's frame with the window's — and, when those do not overlap at all,
+/// the point unchanged so the caller gets the honest "outside the window"
+/// refusal instead of a silently invented coordinate.
+///
+/// This exists because a scrollable element's frame is not its viewport: an
+/// `AXWebArea`'s frame is the whole document, and a long list's frame covers
+/// every row, so the centre of either can be far outside the window showing it.
+fn clamp_into_window(
+    element_frame: Option<CGRect>,
+    window: &cua_capture::WindowInfo,
+    x: f64,
+    y: f64,
+) -> (f64, f64) {
+    let w = &window.frame;
+    if frame_contains(w, x, y) {
+        return (x, y);
     }
-    el.frame().map(|f| {
+    let Some(e) = element_frame else {
+        return (x, y);
+    };
+    let left = e.origin.x.max(w.origin.x);
+    let top = e.origin.y.max(w.origin.y);
+    let right = (e.origin.x + e.size.width).min(w.origin.x + w.size.width);
+    let bottom = (e.origin.y + e.size.height).min(w.origin.y + w.size.height);
+    if right <= left || bottom <= top {
+        return (x, y);
+    }
+    let clamped = ((left + right) / 2.0, (top + bottom) / 2.0);
+    tracing::debug!(
+        "aim ({x:.0}, {y:.0}) is outside window {}; using the centre of the element's visible \
+         region ({:.0}, {:.0}) instead",
+        window.id,
+        clamped.0,
+        clamped.1
+    );
+    clamped
+}
+
+/// An element's best on-screen point to aim an event at.
+///
+/// `AXActivationPoint` first, because it is the app's own answer and is not
+/// always the geometric centre — a wide list row, or a control with a large
+/// transparent hit area, puts it somewhere better than the middle. The frame
+/// centre otherwise. `None` when the element publishes neither.
+///
+/// # An activation point outside its own frame is not an activation point
+///
+/// Chromium publishes `AXActivationPoint = (0, 982)` for *every* element in the
+/// window — measured on Chrome, where a button whose frame is `15,239 194x34`
+/// reports that same corner point as its activation point, as does the web area
+/// containing it. Taken at face value it aims every pid-routed click, hover,
+/// drag and wheel event at one corner of the display, which is nowhere near the
+/// control and, on this machine, not even inside the browser's content. Nothing
+/// errors: the event is delivered, to the wrong place, and the caller is told
+/// `delivery: pid`.
+///
+/// The rule that catches it needs no app-specific knowledge. A point that
+/// activates an element has to be *on* that element, so an activation point
+/// outside the element's own frame is self-contradictory and gets discarded in
+/// favour of the frame centre. An element with no frame to check against keeps
+/// the benefit of the doubt, because then there is nothing better to use.
+fn element_point(el: &Element) -> Option<(f64, f64)> {
+    let frame = el.frame();
+    if let Some(p) = el.activation_point() {
+        match &frame {
+            Some(f) if !frame_contains(f, p.x, p.y) => {
+                tracing::debug!(
+                    "ignoring AXActivationPoint ({:.0}, {:.0}): outside the element's own frame \
+                     ({:.0},{:.0} {:.0}x{:.0})",
+                    p.x,
+                    p.y,
+                    f.origin.x,
+                    f.origin.y,
+                    f.size.width,
+                    f.size.height
+                );
+            }
+            _ => return Some((p.x, p.y)),
+        }
+    }
+    frame.map(|f| {
         (
             f.origin.x + f.size.width / 2.0,
             f.origin.y + f.size.height / 2.0,
@@ -1844,6 +1920,23 @@ pub enum ScrollAmount {
     Pages(u32),
     /// Exactly this many points of content. Always a wheel event.
     Points(u32),
+}
+
+/// Everything the wheel tier needs beyond the element it is aimed at.
+///
+/// One struct rather than four parameters because they are one request, and
+/// because `advertises` and `asked` only mean anything together with the
+/// direction and amount they qualify.
+struct WheelRequest {
+    dir: ScrollDir,
+    amount: ScrollAmount,
+    /// Whether the element advertised an accessibility scroll action. Only used
+    /// to word the refusal when there is no point to aim at.
+    advertises: bool,
+    /// A coordinate the caller named, in screen points. Honoured over the
+    /// element's own point: `resolve` used it only to find *which* element
+    /// covers it, and a scroll container often covers its whole extent.
+    asked: Option<(f64, f64)>,
 }
 
 /// Which mechanism a scroll used.
@@ -3264,7 +3357,30 @@ impl Inner {
                 Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
                     .with_overlay_target(self.overlay_target(info.pid)))
             }
-            ScrollTier::Wheel => self.wheel_scroll(&info, &el, desc, dir, amount, advertises),
+            ScrollTier::Wheel => {
+                // A caller who named a coordinate has said where they want the
+                // wheel, and that is better information than the element's own
+                // point: `resolve` only used the coordinate to find out *which*
+                // element covers it, and a scroll container is often covered by
+                // one element for its whole scrollable extent. Discarding it, as
+                // this used to, meant `Target::Point` scrolled somewhere the
+                // caller never asked about.
+                let asked = match target {
+                    Target::Point { x, y, .. } => Some((x as f64, y as f64)),
+                    Target::Index { .. } => None,
+                };
+                self.wheel_scroll(
+                    &info,
+                    &el,
+                    desc,
+                    WheelRequest {
+                        dir,
+                        amount,
+                        advertises,
+                        asked,
+                    },
+                )
+            }
         }
     }
 
@@ -3275,10 +3391,14 @@ impl Inner {
         info: &AppInfo,
         el: &Element,
         desc: String,
-        dir: ScrollDir,
-        amount: ScrollAmount,
-        advertises: bool,
+        req: WheelRequest,
     ) -> Result<ActionResult> {
+        let WheelRequest {
+            dir,
+            amount,
+            advertises,
+            asked,
+        } = req;
         let refuse = |reason: String| CoreError::PointerEventRefused {
             app: info.name.clone(),
             what: "scroll wheel event",
@@ -3289,16 +3409,27 @@ impl Inner {
                 "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
             ));
         }
-        let (x, y) = element_point(el).ok_or_else(|| {
+        let own = element_point(el).ok_or_else(|| {
             refuse(format!(
                 "this element advertises {}, and it publishes neither AXActivationPoint nor AXFrame, so there is no point to aim a wheel event at",
                 if advertises { "a scroll action but the caller asked in points" } else { "no scroll action" }
             ))
         })?;
         let live = self.live_snapshot_window(info).map_err(refuse)?;
+
+        // A scrollable element's frame is not its viewport. A web area's frame
+        // is the whole document and a long list's frame is all of its rows, so
+        // the centre of either can sit far below the window that shows it —
+        // measured on Chrome, where the aim came out at the bottom edge of the
+        // display. A wheel event delivered there scrolls nothing, and reports
+        // success. So the point is pulled back into the part of the element the
+        // window actually shows.
+        let (ax, ay) = asked.unwrap_or(own);
+        let (x, y) = clamp_into_window(el.frame(), &live, ax, ay);
+
         screen_point_inside(&live, x, y).map_err(|frame| {
             refuse(format!(
-                "the element's point ({x:.0}, {y:.0}) is outside the current frame of window {} ({frame}); the AX element and window snapshot drifted apart. Call get_app_state again",
+                "the wheel point ({x:.0}, {y:.0}) is outside the current frame of window {} ({frame}); the AX element and window snapshot drifted apart. Call get_app_state again",
                 live.id
             ))
         })?;
@@ -5020,6 +5151,60 @@ mod tests {
         let mut overlay = win(1, 7, 0.0, 0.0, 800.0, 600.0);
         overlay.layer = 25;
         assert!(best_window_match(&[overlay], 7, None).is_none());
+    }
+
+    // ── pulling an aim point back into the visible viewport ──────────────────
+
+    #[test]
+    fn a_point_already_inside_the_window_is_left_alone() {
+        let window = win(1, 7, 0.0, 100.0, 1000.0, 800.0);
+        let el = Some(rect(0.0, 100.0, 1000.0, 9000.0));
+        assert_eq!(clamp_into_window(el, &window, 500.0, 400.0), (500.0, 400.0));
+    }
+
+    #[test]
+    fn a_tall_containers_centre_is_pulled_into_the_viewport() {
+        // The measured shape: a web area whose frame is the whole document, so
+        // its centre is far below the window showing it.
+        let window = win(1, 7, 0.0, 100.0, 1000.0, 800.0);
+        let document = rect(0.0, 100.0, 1000.0, 9000.0);
+        // The element centre would be y = 100 + 4500 = 4600, off-screen.
+        let (x, y) = clamp_into_window(Some(document), &window, 500.0, 4600.0);
+        assert_eq!(x, 500.0, "horizontal overlap is the full width");
+        assert_eq!(y, 500.0, "vertical centre of the visible 100..900 band");
+        assert!(frame_contains(&window.frame, x, y));
+    }
+
+    #[test]
+    fn an_element_with_no_frame_keeps_the_point_it_was_given() {
+        // Nothing better to compute from, so the caller gets the honest
+        // out-of-window refusal downstream rather than an invented coordinate.
+        let window = win(1, 7, 0.0, 100.0, 1000.0, 800.0);
+        assert_eq!(clamp_into_window(None, &window, 5.0, 5000.0), (5.0, 5000.0));
+    }
+
+    #[test]
+    fn an_element_that_does_not_overlap_the_window_keeps_the_point() {
+        // Element and window disjoint: there is no visible region to aim at, so
+        // the point is left alone and the caller is refused with the real reason
+        // rather than silently redirected.
+        let window = win(1, 7, 0.0, 100.0, 1000.0, 800.0);
+        let elsewhere = Some(rect(2000.0, 2000.0, 100.0, 100.0));
+        assert_eq!(
+            clamp_into_window(elsewhere, &window, 2050.0, 2050.0),
+            (2050.0, 2050.0)
+        );
+    }
+
+    #[test]
+    fn a_partly_offscreen_element_is_aimed_at_the_part_that_shows() {
+        // A list scrolled so its top is above the window: the visible band is
+        // 100..600, so the aim is its centre rather than the element's.
+        let window = win(1, 7, 0.0, 100.0, 1000.0, 800.0);
+        let list = Some(rect(200.0, -400.0, 400.0, 1000.0));
+        let (x, y) = clamp_into_window(list, &window, 400.0, 100.0 - 300.0);
+        assert_eq!((x, y), (400.0, 350.0));
+        assert!(frame_contains(&window.frame, x, y));
     }
 
     /// The measured KakaoTalk arrangement: a chat window with its hamburger
