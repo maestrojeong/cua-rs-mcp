@@ -5,6 +5,208 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.7.0
+
+The mouse model widened, a safety layer arrived, and four coordinate bugs came
+out of finally measuring things that had been shipped as "built, not yet
+verified". Two capabilities were retired by measurement rather than added: the
+wheel scroll tier now refuses, and picking a row in a pop-up menu by coordinate
+is documented as impossible rather than merely unreliable.
+
+Read [DESIGN.md](DESIGN.md) §11 before relying on any new mouse capability. Each
+one now says whether it was measured on a real app, and three of them were.
+
+### The mouse model is no longer one left click
+
+`cua-hid`'s primitive went from "a left click with a count" to
+`{origin, destination, button, modifiers, click_count}`, and five capabilities
+are reachable end to end.
+
+| | status |
+|---|:--|
+| `button: right \| middle` | **measured** — a right-click opened a context menu on TextEdit's text view, detected as a new level-101 window |
+| `modifiers: cmd \| shift \| alt \| ctrl \| fn` | **measured** — a ⇧-click extended a selection an unmodified click leaves empty |
+| `drag` | **measured** — dragging 220 points across TextEdit left `AXSelectedText` spanning exactly that run. Down, interpolated `mouseDragged`, up; both ends in one window, either end an element or a bare pixel |
+| `hover` | **unproven.** Delivered; no app has been found whose hover state enters the tree. Your cursor does not move, so an app that polls the *real* pointer position cannot react at all |
+| wheel scroll tier | **refused.** See below |
+
+The modifier vocabulary is shared with `press_key`, so `cmd+shift` means the same
+thing written on a click as on a key.
+
+### The wheel tier is refused, because it does not scroll
+
+Measured against the window's own pixels: a pid-routed `scrollWheel` is delivered
+and moves nothing, on a native `AXScrollArea` holding a 400-line document and on
+Chromium web content, in both pixel and line units. The control arm is what makes
+that conclusive — a pid-routed `pagedown` keystroke scrolls the same window in the
+same run, so the failure is the scroll event, not the routing, the window number,
+the aim point, or the instrument.
+
+`scroll` therefore **errors** where it would have used that tier, and the error
+names `press_key` with `pagedown` / `pageup` / `down` / `up`, which does reach a
+scroller publishing no scroll action. Delivering it while documenting it as
+unreliable was the worse option: a caller told `delivery: pid` concludes the
+scroll happened and reads a stale tree as the new state, and a wrong belief costs
+more than an error. `CUA_WHEEL_SCROLL=1` restores delivery for re-running the
+experiment. Page scrolls through an advertised accessibility action are unchanged.
+
+### Pop-up menus: visible now, and only operable by shortcut
+
+A click on a control that advertises no accessibility action — a chat app's
+chat-room hamburger is the standing case — does open its menu. That was never the
+problem. The menu is a separate window at level 101 with **no accessibility
+representation at all**, so it was in neither the tree nor the screenshot, and
+`ui_changed` reported `no` while a 202x318 menu sat on screen.
+
+- `get_app_state` **and every action's own result** now list the app's transient
+  windows: id, level, frame, and whether each appeared while the action ran. In
+  the action's own response deliberately — a caller told one round trip later has
+  already concluded the control did nothing.
+- A new transient window makes `ui_changed` say `yes` on its own evidence.
+- The window screenshot already contains the menu: macOS photographs a window
+  together with the pop-up attached to it.
+- `click_in_window` may now be aimed at a pop-up, which works for a popover or
+  panel and is honestly labelled as **not** the way to pick a menu row.
+
+Picking a menu row by coordinate was measured twice on two rows: the event is
+delivered, the menu closes, and no item activates — including on a run where the
+human's pointer hovered a different row, so it selects none rather than the wrong
+one. A macOS menu tracks the *real* pointer, which cua-rs does not move, so this
+is §9's pointer-position case and permanent. **The item's keyboard shortcut does
+work**: `press_key cmd+t` activated `항상 위에 유지`, verified by the window
+moving from level 0 to level 3 and back. No OCR, and no parsing shortcuts out of
+the image — a misread `⌥⌘⌫` presses "leave the chat room".
+
+### Four coordinate bugs
+
+All four were silent: the event was delivered, the result said success, and the
+coordinate was wrong.
+
+- **Chromium's activation point is a lie.** It answers
+  `AXActivationPoint = (0, 982)` for every element in the window, and
+  `element_point` asked it first, so every pid-routed click, hover, drag and wheel
+  aimed at a Chrome element went to one corner of the display. An activation point
+  outside its own element's frame is self-contradictory and is now discarded for
+  the frame centre. No app-specific knowledge, no allow-list.
+- **A capture's `scale` was computed against a frame the image did not cover.**
+  Because macOS includes an attached pop-up in the picture, `width / frame.width`
+  read 2.37 px/pt for a window and 10.83 for a menu instead of 2.0 — so every
+  pixel-to-point conversion was wrong while a menu was up. The real extent is now
+  recovered by testing candidate rects against the pixel count.
+- **A scrollable element's frame is not its viewport.** A web area's frame is the
+  whole document, so its centre can be far outside the window; the aim is pulled
+  into the intersection.
+- **`Target::Point` was resolved and then discarded.** A caller who named a
+  coordinate to scroll at was scrolled at the element's point instead.
+
+### A keycode is not a character
+
+`press_key x` delivered `ㅌ` under a Korean 2-set input source, which is the
+correct answer to "the user pressed keycode 7" and the wrong answer to "the caller
+asked for x". The event was under-specified. `Chord` now carries the literal
+character and the event carries **both**: the real keycode, so an app reading
+`keyCode` for a game control or a shortcut still sees the physical key, plus the
+Unicode string AppKit hands to a text view. Not applied to a chord or a named key
+— `cmd+x` is Cut, and `escape` has no character to force.
+
+### `press_key` and `type_text`: where the keys actually went
+
+- Every keyboard result reports `focus: verified | unverified | mismatched`,
+  derived from the app's own `AXFocusedUIElement`. `AXFocused`'s write result is
+  reported instead of discarded. `CUA_KEY_STRICT_FOCUS=1` refuses on
+  `mismatched`.
+- `type_text` takes `mechanism: "ax" | "keystrokes"`. The default is unchanged —
+  one atomic, element-addressed `AXValue` write — and `keystrokes` sends real
+  per-pid key events for the targets that ignore `AXValue`, measured on TextEdit
+  and not yet on a terminal.
+- The read-back debt §10 owed since 0.6.0 is paid: three live tests address a text
+  element, send keys, and read the element's `AXValue` back, plus a negative test
+  that addresses element A and asserts element B did not receive it.
+  `cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1`.
+- Found by those tests: **a window that has never been clicked swallows
+  keystrokes silently.** An app can be frontmost while publishing no
+  `AXFocusedUIElement` at all; pid-routed keys then land nowhere and nothing
+  errors. That state is exactly what `focus: unverified` reports.
+- Also found: the staleness guard rejected *every* click on TextEdit's document
+  view, because the tree walk resolved a label through five attributes while the
+  live re-read compared only two.
+
+### A safety layer, and a scope
+
+Six gates, checked once in the single place every action already passes through,
+so a tool added later is gated by default.
+
+| gate | default | control |
+|---|:--|:--|
+| session scope | **off** | `CUA_ALLOWED_APPS=id,id` |
+| credential and security apps | on | `CUA_ALLOW_FORBIDDEN_TARGETS=1` |
+| destructive label or key | on | per-call `confirm_destructive: true` |
+| locked screen or screen saver | on | — |
+| yield to the human | **off** | `CUA_YIELD_TO_HUMAN=1`, `CUA_YIELD_IDLE_MS` |
+| HTTP bearer token | on in HTTP mode | `CUA_HTTP_TOKEN` |
+
+`CUA_ALLOWED_APPS` is the recommended posture and the only gate that is a scope
+rather than a heuristic: the other five enumerate danger and therefore admit every
+app nobody thought of. It narrows only — scoping a run *to* a password manager
+does not lift the floor — matches whole bundle identifiers so `com.apple` cannot
+mean every Apple app, refuses a process with no bundle id, and can only be set by
+the human who launched the server. There is deliberately no tool to widen it. An
+*empty* value refuses everything rather than reopening the scope, because
+`CUA_ALLOWED_APPS=$TYPO` expands to exactly that and a gate that opens on a
+misspelling fails in the wrong direction.
+
+`CUA_WHEEL_SCROLL=1` is the one switch here that turns on something known not to
+work, and exists so the wheel measurement can be re-run.
+
+Reads stay allowed on a blocked app, because a refusal you cannot explain is
+worse; the screenshot is the exception, since pixels reproduce the secret rather
+than describing it. The destructive classifier over-reports on purpose and covers
+Korean labels (삭제, 제거, 초기화, 나가기). Yield uses a listen-only tap that
+returns every event unchanged — it reads the shared input stream and never writes
+to it — and fails closed if the tap cannot be created.
+
+**HTTP mode now requires a bearer token.** Loopback is not an authorization
+boundary: any local process, including a web page, could previously drive the
+whole desktop. `/health` stays open.
+
+### The drawn cursor ships in the release
+
+`cua-overlay` is built, signed and uploaded alongside `cua-rs`, and `install.sh`
+puts it in the same directory. Until now the prebuilt release shipped `cua-rs`
+alone, so everyone who installed the documented way had no on-screen feedback at
+all. A pinned older `CUA_VERSION` without the asset still installs cleanly.
+
+Also fixed: the overlay was resolved as a sibling of `cua-rs` without following
+symlinks, so it was never found when `cua-rs` was reached through one — which is
+every `curl | sh` install.
+
+### Picture-in-picture: measured and declined
+
+Mirroring the driven window into an always-visible panel would be the complete
+answer to "you cannot see what the agent is doing". On the current capture path it
+tops out at **5–8 fps while holding ~39% of one core**: `screencapture -l` alone
+is 70–100 ms per frame. Clearing that needs `SCStream`, which needs a signed
+notarized bundle with its own Screen Recording grant — a second permission prompt
+and the end of the one-binary install. Declined, with the numbers and the one
+measurement that would change the answer, in DESIGN §12.
+
+### Internals
+
+- The listen-only input tap moved from `cua-core` to `cua-hid::humanwatch`.
+  "Only `cua-hid` links the event APIs" is checkable from five `Cargo.toml` files;
+  it had degraded to a claim about code. `cua-core` links `CGSession` alone.
+- `is_plausible_target()` still caps at level 3 — it answers which window a
+  snapshot is *of*, and a menu chosen there would stamp its number onto content
+  clicks. The new `is_addressable_target()` answers the different question of what
+  an event may be aimed at.
+- 107 → **212 tests**, all still passing with no permissions granted. One was
+  deleted rather than added: a coordinate-guard test asserted only that an
+  unresolvable app cannot succeed, while its name promised the generation guard
+  was covered. The ones
+  that need a grant or a GUI session are `#[ignore]`d and documented.
+- New probes: `scroll_check` (wheel versus keystroke, judged on pixels),
+  `mouse_verify`, `menu_life`, `keyboard_probe`.
+
 ## 0.6.0
 
 The tier order flipped. `click` and `press_key` now go through pid-routed
