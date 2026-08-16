@@ -25,17 +25,37 @@ flowchart LR
 
 There is no arrow between the lanes, and that is the whole product.
 
-| | HID-synthesis tools | cua-rs |
-|---|:--|:--|
-| click | move cursor, post mouse down/up | AX action; a process-routed event for custom controls |
-| type | post keys to whatever has focus | `AXUIElementSetAttributeValue` |
-| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated per-window capture |
-| your cursor / focus / Space | moves, changes, switches | **untouched** |
-| occluded or off-Space window | blank or stale capture | **captures** |
-| you working at the same time | input fights the agent | **works** |
+### Three ways to drive a Mac
 
-Not a runtime mode: there is no flag that warps the pointer or posts to the
-shared keyboard stream. Why, and what it costs, is in [DESIGN.md](DESIGN.md).
+"Synthesize input or use accessibility" is the wrong axis, because the
+interesting middle exists: you can synthesize an event and still deliver it to
+one process instead of the shared stream. What separates the approaches is not
+the API, it is **what they are willing to take from you**.
+
+| | shared input | per-process, plus focus | cua-rs |
+|---|:--|:--|:--|
+| how a click travels | cursor warp, then the global HID queue | synthesized event routed to one pid | AX action; a pid-routed event only where no AX action exists |
+| the pointer | moves | stays | stays |
+| keyboard focus | goes wherever the click lands | target is activated and held | unchanged |
+| your Space | can switch | can switch | never |
+| an occluded window | blank or stale capture | raised first, so never occluded | captured where it is |
+| you, working meanwhile | input collides | you lose focus | works |
+
+The middle column is a real design, not a strawman — routing per pid is what
+cua-rs does too for controls that expose no AX action. The difference is the
+second half: it activates the target and keeps it frontmost, which is a
+reasonable trade when a human is not sitting there, and the wrong one when they
+are.
+
+[trycua/cua](https://github.com/trycua/cua/tree/main/libs/cua-driver)'s driver is
+a superset of all three — AX actions, SkyLight per-pid delivery, a global HID
+queue for scroll, and `CGWarpMouseCursorPosition` — so it can drive more than
+this can. Breadth is the trade it makes; background-only is the trade made here.
+
+So cua-rs is best described by what it will not do. There is no flag that warps
+the pointer, posts to the shared keyboard stream, or raises a window: those paths
+are absent, and [DESIGN.md](DESIGN.md) covers what that costs — no chords, no
+drag, no canvas.
 
 ## Install
 
@@ -200,8 +220,8 @@ gives raw bindings with no safe layer.
 ## Prior art
 
 - [**trycua/cua**](https://github.com/trycua/cua/tree/main/libs/cua-driver) —
-  larger, cross-platform, further along. Its docs are the best free writing on
-  this problem domain.
+  larger, cross-platform, further along, and a superset of the approaches above.
+  Its docs are the best free writing on this problem domain.
 - [**lahfir/agent-desktop**](https://github.com/lahfir/agent-desktop) — Rust AX
   engine, CLI rather than MCP.
 - [**minghinmatthewlam/computer-use-mcp**](https://github.com/minghinmatthewlam/computer-use-mcp) —
