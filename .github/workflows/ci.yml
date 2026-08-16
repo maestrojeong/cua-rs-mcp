@@ -20,6 +20,24 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      # Runs BEFORE the workspace commands, and with a target dir of its own per
+      # crate, because a workspace build is exactly what hides this class of bug.
+      # Cargo unifies features across the whole graph, so a crate that uses an
+      # optional dependency feature without declaring it still compiles as long as
+      # some sibling asks for the same feature. `cua-overlay` shipped that way in
+      # 0.4.2 through 0.5.0: it called `NSRunningApplication::processIdentifier`,
+      # which objc2-app-kit gates on "libc", while only cua-core and cua-hid
+      # declared it. Every workspace build passed and `cargo build -p cua-overlay`
+      # did not. A separate CARGO_TARGET_DIR matters as much as the `-p`: sharing
+      # one lets an earlier unified build leave usable artifacts behind.
+      - name: Each crate builds on its own features
+        run: |
+          for crate in cua-ax cua-capture cua-hid cua-core cua-mcp cua-overlay; do
+            echo "::group::$crate"
+            CARGO_TARGET_DIR="target/isolated/$crate" cargo build -p "$crate"
+            echo "::endgroup::"
+          done
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

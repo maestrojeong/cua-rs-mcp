@@ -5,6 +5,87 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.5.1
+
+### The drawn cursor was not drawing at all
+
+0.4.2 fixed "the arrow stays visible over another app after a Space switch" by
+polling `NSWorkspace.frontmostApplication()` and hiding whenever the pinned pid
+was not frontmost. That gate is unsatisfiable here. cua-rs exists to drive
+windows the human is *not* looking at and never steals focus (DESIGN §9), so the
+pinned pid is essentially never the frontmost app — and the check runs in the
+same loop iteration that applies the command, before `advance()` and before any
+paint. The arrow was suppressed before its first frame: not a flicker, zero
+frames, on every action against a background window. The feature has been inert
+since 0.4.2.
+
+The gate now asks about the **window** instead of about who holds the keyboard.
+Each tick it looks the pinned CGWindowID up in
+`CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly)` and keeps drawing
+only while that id is present *and* still owned by the pinned pid. Measured on
+one machine with Terminal frontmost throughout: a background app's ordinary
+layer-0 window was in the on-screen list, so a background target draws; a
+KakaoTalk window that had been closed was absent while its pid lived on, so a
+closed, minimized, or off-Space target stops drawing. Matching the owner pid too
+is what keeps a recycled window id from pointing the arrow at a stranger.
+
+That also closes a hole the pid check could never see: the pinned pid could stay
+frontmost while the pinned *window* was closed or moved to another Space, and
+nothing was watching the window itself.
+
+### Hiding did not erase
+
+Independently, every hide path left the arrow on screen. `advance()` returned
+`false` whenever the marker was invisible — correct as "nothing to animate", but
+the main loop uses that return value as "call `setNeedsDisplay:`", so the view was
+never invalidated, `drawRect:` was never called, and the last painted arrow simply
+stayed. The explicit `hide` command, a command with no target window, and the
+visibility gate were all affected; the gate had been firing correctly all along
+and had no way to reach the screen.
+
+The view now records what its last paint actually rendered and keeps requesting a
+repaint until an erase has really happened, rather than assuming that
+`setNeedsDisplay:` — which AppKit coalesces and defers — took effect inside the
+run-loop slice that asked for it. An idle overlay still costs no redraws.
+
+Verified by pixels, driving the installed binary by hand and capturing its own
+window: a background target painted the arrow, `hide` produced a blank frame, and
+a nonexistent window id produced a frame byte-identical to the blank one.
+
+### The stdin protocol required a field it documented as absent
+
+The module documentation listed `move <x> <y> <window-id>` while the parser read
+an optional fourth `pid`. A hand-typed three-argument line parsed happily into a
+*visible* marker with no pid — which silently disarmed the visibility gate for
+exactly the manual use the line protocol exists to support. `pid` is now required
+and documented as required.
+
+Parsing is strict rather than forgiving, because every lenient default here had a
+failure attached. Missing or unparseable coordinates defaulted to `0` and drew a
+confident arrow in the corner; a non-finite coordinate never satisfied the spring's
+settle test, so the view would redraw forever and hand non-finite points to
+`NSBezierPath`; and window id `0` is AppKit's documented "order in front of
+everything at my level", the one placement this process must never request. All of
+these are now refused, and a malformed line is dropped whole instead of
+half-applied.
+
+### `cargo build -p cua-overlay` did not compile
+
+`NSRunningApplication::processIdentifier` is gated behind objc2-app-kit's `libc`
+feature, which `cua-core` and `cua-hid` declare and `cua-overlay` did not. Cargo
+unifies features across a workspace, so every workspace build supplied it and the
+crate compiled; built on its own it failed, from 0.4.2 through the tagged and
+released 0.5.0. CI only ever built the workspace.
+
+The frontmost check is gone, so the call is too, and the feature is not needed
+after all. CI now builds each crate separately with its own `CARGO_TARGET_DIR`
+*before* the workspace commands, which is the only arrangement that can catch this
+class — a shared target directory lets an earlier unified build leave usable
+artifacts behind. Confirmed against `git archive` of the previous release: the new
+step fails there. It immediately earned its place by catching a second instance in
+this very change, where trimming the now-unused features also removed the one
+`NSApplicationActivationPolicy` needs.
+
 ## 0.5.0
 
 ### `click_in_window`: a click with no element behind it
@@ -93,6 +174,11 @@ every way ordering can fail at once — Space switch, full-screen, timing — an
 fails in the safe direction: a false positive costs one hidden arrow that returns
 on the next command, a false negative is an arrow drawn over someone else's work.
 The `move`/`click` protocol therefore carries a `pid` alongside the window id.
+
+> **Superseded by 0.5.1, and wrong.** "A false positive costs one hidden arrow"
+> was the mistake: against a background window the check is *always* positive, so
+> the cost was the entire feature, and it left the arrow stranded anyway because
+> hiding never reached the screen. See 0.5.1.
 
 Notably **not** included: the focus-stealing machinery a shipped implementation
 uses for this (a preventer process tap, re-activating the target). That takes

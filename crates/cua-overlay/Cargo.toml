@@ -25,8 +25,11 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
     "NSApplication",
+    # Not for `NSRunningApplication` itself, which this crate no longer touches:
+    # `NSApplicationActivationPolicy` and `-setActivationPolicy:` live behind this
+    # feature, and the overlay needs Accessory policy to stay out of the Dock and
+    # the app switcher.
     "NSRunningApplication",
-    "NSWorkspace",
     "NSWindow",
     "NSView",
     "NSResponder",
@@ -36,4 +39,20 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSBezierPath",
     "NSGraphicsContext",
 ] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFRunLoop", "CFBase"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+    "CFRunLoop",
+    "CFBase",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+# `CGWindowListCopyWindowInfo` is how the visibility gate asks whether the pinned
+# window is still composited on the active Space. Nothing here draws or captures:
+# CGWindow is a query surface, and this crate deliberately has no image feature.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGWindow",
+] }
