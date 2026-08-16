@@ -96,12 +96,19 @@ Lines with `[N]` are targetable; the rest is context. `element_token` bundles
 the snapshot, index and role, so acting on a stale handle errors instead of
 mis-clicking. `x`/`y` also works, resolved against the snapshot's geometry.
 
+Pass `snapshot_id` whenever you act on a **coordinate** rather than an element.
+A stale index can be caught by the role it used to have; a stale pixel cannot be
+caught by anything — it is still inside the window and still covering something,
+just not what you looked at. `snapshot_id` is the only guard that catches it,
+and `click`, `click_in_window`, `drag` and `hover` all honour it.
+
 | Tool | |
 |---|:--|
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
 | `find` · `wait_for` | search the snapshot; poll until text appears or goes |
 | `click` | a pid-routed event; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count` |
 | `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
+| — | every action returns what it did — verb, target, `delivery`, and a tree diff by default. Nothing is fire-and-forget |
 | `click_in_window` | last resort: a bare point, no element, nothing verified |
 | `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call |
 | `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
@@ -122,15 +129,17 @@ one of them.
 | any key or chord | yes, pid-routed |
 | right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed — **built, not yet verified on a real app** |
 | drag | yes: a real down, interpolated moves and an up, both ends in one window — **built, not yet verified on a real drag source** |
-| hover | yes, a synthesized `mouseMoved` — but your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react |
+| hover | a synthesized `mouseMoved` — **built, unproven**, and your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react at all |
 | scrolling something with no AX scroll verb (Electron list, canvas, web content) | yes, a wheel event at the element's point — **built, not yet verified** |
 | canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
 | terminals | reading yes; typing no — `set_value`/`type_text` write `AXValue`, which terminals ignore; `press_key` reaches them but one key or chord at a time |
 
 "Built, not yet verified" means the events are constructed and delivered on the
 same pid route `click` uses, the logic behind them is unit-tested without any
-grant, and nobody has yet watched a real app accept one. [DESIGN.md](DESIGN.md)
-§11 lists exactly which runs are owed.
+grant, and nobody has yet watched a real app accept one. Distrust `hover` and
+the wheel scroll hardest: they rest entirely on reasoning by analogy with the
+click path. [DESIGN.md](DESIGN.md) §11 lists what is owed and names the
+experiment that would settle each one.
 
 `set_value` replaces and `type_text` appends via one atomic `AXValue` write; an
 app that only reacts to real key events ignores both. `click` and `press_key`
@@ -152,7 +161,7 @@ the workspace to get both.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 128 tests, no permissions needed
+cargo test --workspace          # 132 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

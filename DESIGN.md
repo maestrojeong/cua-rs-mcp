@@ -62,8 +62,8 @@ AX cannot express everything:
 | **drag** | — | no verb exists; delivered as a real down/drag/up gesture by the pid tier (§11). Not yet verified against a real drag source |
 | **right click where the element advertises nothing** | `AXShowMenu` | works *where the element advertises it*; where it does not, a real `rightMouseDown`/`rightMouseUp` pair by the pid tier |
 | **modifier click** (⌘-click, ⇧-click) | — | no verb exists — `AXPress` is "activate this", with no room for a held key. Pid tier only |
-| **hover** | — | no verb exists; a synthesized `mouseMoved` by the pid tier. Cannot reach an app that polls the real cursor (§11) |
-| **scroll by a distance** | — | `AXScroll*ByPage` is whole pages only; a `scrollWheel` event covers the rest, and covers elements that advertise no scroll action at all |
+| **hover** | — | no verb exists; a synthesized `mouseMoved` by the pid tier. Implemented and **unproven** — and permanently unable to reach an app that polls the real cursor (§11) |
+| **scroll by a distance** | — | `AXScroll*ByPage` is whole pages only; a `scrollWheel` event covers the rest, and covers elements that advertise no scroll action at all. Implemented and **unproven** (§11) |
 | pixel-only surfaces | — | nothing to address — reachable anyway, see below |
 
 Those rows are softer than they look. "No verb exists" is a statement about
@@ -87,7 +87,11 @@ design and the verification status, which is worth stating here too rather than
 burying: the parsing, geometry, interpolation and tier selection are
 unit-tested without any grant, and the gestures themselves have **not** been
 walked against a real drag source, a real hover-revealed control, or a real
-Electron list. They are built, they are reachable, and they are unmeasured.
+Electron list. They are built, they are reachable, and they are unmeasured. The
+hover and the wheel scroll are the two to distrust hardest: nothing anywhere
+corroborates that a synthesized per-pid `mouseMoved` or `scrollWheel` drives a
+real app, so they rest on reasoning alone. §11 names the experiment that would
+settle each.
 
 The honest ceiling is now: cua-rs drives *structured* UI extremely well, can be
 aimed at an unstructured surface when the caller accepts responsibility for the
@@ -657,13 +661,19 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
 - [ ] `drag` with one end a bare pixel draws a selection rectangle on a canvas
 - [ ] a drag whose ends are in two different windows is refused, not delivered
 - [ ] a `drag` interrupted mid-move still releases the button (no stuck gesture)
-- [ ] `hover` reveals a tooltip or a hover-only button, and it is in the diff
+- [ ] `hover` on a Mail message row makes its hover buttons appear *in the tree*
+      (a tooltip is a worse test — it may never enter the tree at all, so its
+      absence would prove nothing)
 - [ ] `hover` on an app that polls `NSEvent.mouseLocation` does nothing — confirm
       the failure is the documented one and not a delivery bug
 - [ ] `button: right` opens a context menu on a control advertising no AX actions
 - [ ] `modifiers: cmd` on a link opens a new tab; `shift` extends a selection
 - [ ] `scroll` on an Electron list moves it, and reports `delivery: pid`
-- [ ] `scroll` on a native `AXScrollArea` still reports `delivery: ax`
+- [ ] `scroll pixels=N` on a native `AXScrollArea` moves `AXValue` by the
+      expected fraction — the only check that catches an inverted delta sign
+- [ ] `scroll` on a native `AXScrollArea` in pages still reports `delivery: ax`
+- [ ] a coordinate cited against an older `snapshot_id` is refused by
+      `click_in_window`, `drag` and `hover` alike
 - [ ] cursor is byte-identical before and after each of the above
 
 **Tree**
@@ -914,7 +924,19 @@ no coordinate, no window pinning, no aim to get wrong. The controls that need a
 real right click are precisely the ones that advertise no actions at all, which
 is the same population `click` needed the pid tier for in the first place.
 
-**Modifiers.** `parse_modifiers` shares its table with `parse_chord`, so `cmd`,
+**Modifiers.** On macOS a held modifier is not a garnish on a click, it is a
+*different command*. ⌘-click opens a link in a new background tab in Safari and
+every Chromium browser, and opens a Finder item in a new window. ⇧-click extends
+a selection from the anchor to the clicked row in every list, table and text
+view AppKit ships. ⌥-click reveals the alternate item in a great many menus,
+expands an entire outline subtree in Finder, and duplicates instead of moving in
+a drag. An agent that can only send a plain click cannot select a range of
+messages, cannot open a link without navigating away from the page it is
+reading, and has to reach every alternate action through a context menu that may
+not exist. None of that is an accessibility problem — it is one bit of event
+state that the primitive had no field for.
+
+`parse_modifiers` shares its table with `parse_chord`, so `cmd`,
 `command`, `meta` and `super` mean the same thing on a click as they do in
 `press_key` and neither can grow an alias the other lacks. The flags go into the
 `NSEvent` factory *and* onto the `CGEvent` afterwards, because
@@ -963,10 +985,22 @@ receives. So the moves are interpolated, and two constants say how:
 Both are reasoned rather than measured, and both are one constant each in
 `cua-hid` if a real app disagrees.
 
-**Hover.** One `mouseMoved` at a point, no press, and — unlike a click — no
+**Hover.** A surprising amount of macOS UI does not exist until the pointer is
+over it, and none of it is in the accessibility tree beforehand: the delete and
+archive buttons on a Mail message row, a Finder column's expand triangle, a
+tooltip that carries the only full text of a truncated label, a menu bar item's
+submenu, the value readout on a chart. An agent reading the tree sees a row with
+no buttons on it and concludes correctly that there is nothing to press —
+because at that moment there is not. Without a way to move the pointer, that UI
+is not merely hard to reach, it is invisible, and no amount of better tree
+walking finds it.
+
+So: one `mouseMoved` at a point, no press, and — unlike a click — no
 activation-assist click on the window's own activation point, because a caller
 asking to hover has not asked to press anything. The activation *notices* are
-still sent.
+still sent. `return_state` is on by default here more meaningfully than
+anywhere else: the post-action diff *is* the result, since what appeared is the
+entire point of the call.
 
 This is the one capability with a limit that is not a missing feature. The event
 says the pointer arrived; the pointer did not. An app reading
@@ -980,9 +1014,13 @@ this project exists not to do, so the tool description says so plainly instead.
 where it applies. `AXScroll*ByPage` needs no coordinate, lets the app decide what
 a page of its own content is, and cannot be swallowed by whatever subview
 happens to sit under a point. But it only exists on elements that advertise it,
-and the elements an agent most often needs to scroll advertise nothing at all —
-an Electron list, a canvas, a web area inside a native shell — which was a
-refusal rather than a mechanism. So: a page request on an element that
+and the elements an agent most often needs to scroll advertise nothing at all.
+Measured populations from §5's own numbers: Slack's 367 elements are mostly
+inside an `AXWebArea`, Chrome's 413 likewise, and a web area publishes no
+`AXScroll*ByPage`. A custom-drawn list, a map, a chart, a code editor's text
+view — same. So the single most common thing an agent wants to do to a
+long-running app's main content pane was a refusal rather than a mechanism, and
+"scroll down to see the rest" is not an exotic request. So: a page request on an element that
 advertises the verb uses it and reports `delivery: ax`; anything else is a
 `scrollWheel` event at the element's point and reports `delivery: pid`, with the
 verb line naming which and why.
@@ -1001,21 +1039,92 @@ window number) is what a view validates a *click* against, while
 `CGEventCreateScrollWheelEvent2` fills correctly. The window routing, the pid
 stamp and the fresh timestamp are applied exactly as they are to a mouse event.
 
+### A coordinate has to cite the state it was chosen from
+
+Everything in this section is coordinate-first. A drag is two points, a hover is
+one, and the wheel tier aims at a point even when it started from an element —
+so the weakest guard in the system became the most load-bearing one at exactly
+the moment this shipped.
+
+The staleness argument in §3 was made about *indices*, and the mechanism that
+came out of it — `snapshot_id`, generational, mismatch is a hard error — was
+only ever applied to them. Points were addressed two other ways and neither
+carried it. `Target::Point` (a screen coordinate, hit-tested against the
+snapshot's frames) accepted a `snapshot_id` and **ignored it**, which is worse
+than not offering the field: the guard reads as present and is not.
+`click_in_window` checked that the window id came from this app's most recent
+read, which proves the caller is aiming at a window it has *seen* and says
+nothing about the *state* it saw — a window id survives any number of re-reads,
+so a pixel picked off screenshot 3 was accepted verbatim against snapshot 9.
+
+Why that is worse for a pixel than for an index, and not merely equally bad: a
+stale index can often be caught by something. The role changed, or the text the
+element used to show is gone — §3's `TokenRoleMismatch` and `TargetChanged` are
+both built on that. A stale coordinate offers nothing to catch. The point is
+still inside the window, it still names a real place, and the place is still
+occupied; it is simply occupied by something else now. There is no inspection
+that distinguishes a good point from a bad one, so the generation number is not
+a convenience here, it is the only available evidence.
+
+So every coordinate-addressed action — `click` with `x`/`y`, `click_in_window`,
+and both ends of a `drag`, and a `hover` destination — now honours
+`snapshot_id`, and `WindowPixel` carries the pixel and the generation as one
+value so the two cannot be passed separately and one of them forgotten again.
+It stays opt-in, like the index guard and for the same reason: the overwhelming
+flow is read-then-act inside one turn, and requiring it would add a failure mode
+where there is no risk. What changed is that a caller who supplies it now gets
+what it says.
+
+### Every action still returns a result
+
+Worth stating as an invariant rather than leaving it as an accident of how these
+were written: none of the new actions is fire-and-forget. `drag`, `hover` and
+the wheel tier of `scroll` each return the same `ActionResult` a click does —
+the verb that ran (naming the tier, the button, the modifiers, the interpolated
+step count), what was aimed at, `delivery`, `ui_changed`, and by default the
+post-action tree diff.
+
+That matters most for exactly the actions added here, because they are the least
+verifiable ones. A click on a named element can be confirmed by re-reading that
+element. A drag onto a pixel and a hover over one have no element to re-read,
+so the diff is the only feedback that exists — and for a hover it is not
+feedback about the action, it *is* the action's output, since the revealed UI is
+what was wanted. An action here that returned nothing would leave the caller
+with a blind retry loop over a gesture that may have already taken effect, which
+is the failure mode §10 says is worse than reporting a timeout.
+
 ### What the widened model has not been shown to do
 
-Everything above is reachable and none of it is measured. The permission-free
-tests cover what can be tested without a grant — the modifier and button
-vocabularies, the interpolation's endpoints and monotonicity, the step-count
-bounds, the wheel-delta signs, the scroll tier choice, the page sizing, and
-every argument-validation refusal — and that is a statement about the logic, not
-about whether a real app accepts the events.
+Everything above is reachable and none of it is measured on a real app. The
+permission-free tests cover what can be tested without a grant — the modifier
+and button vocabularies, the interpolation's endpoints and monotonicity, the
+step-count bounds, the wheel-delta signs, the scroll tier choice, the page
+sizing, the coordinate generation guard, and every argument-validation refusal.
+That is a statement about the logic. It is not evidence that any app accepts the
+events, and it should not be read as one.
 
-Specifically **unverified**: that a Finder or Mail list reorders under `drag`;
-that a hover-revealed control appears under `hover` on any app; that an Electron
-list scrolls under the wheel tier; that a right click opens a context menu on a
-control with no AX actions; that ⌘-click opens a link in a new tab. Each is one
-manual run away and none of them has been run. §8's checklist is where they
-belong once they have been.
+Two of these deserve a stronger warning than the rest, because for them there is
+no corroboration available anywhere: **hover and the wheel tier**. The click and
+key paths were at least built against a recipe that had been observed to work
+elsewhere, and their §10 measurements exist. Nobody here has seen a synthesized
+per-pid `mouseMoved` or `scrollWheel` drive anything. The construction is
+reasoned — the same window stamping, the same pid route, the same fresh
+timestamp that make a click land — and reasoning is not a measurement. Treat
+both as *implemented and unproven*, in the strong sense: if they do not work at
+all on the first app tried, that is a plausible outcome and not a surprise.
+
+What would prove each, concretely:
+
+| | the experiment |
+|---|:--|
+| `hover` | an app whose hover state is readable *in the tree*, not just on screen — a Mail message row publishes its hover buttons as new `AXButton` children, so `hover` on the row and then `get_app_state` either shows them or does not. A tooltip is a worse test: it may be drawn without ever entering the tree, so its absence proves nothing |
+| wheel tier | anything with a readable scroll position. A native `AXScrollArea` publishes `AXValue` as a 0–1 fraction — scroll it by an exact `pixels` amount and read the value back. That also cross-checks the delta *sign*, which is the easiest thing here to have backwards and is invisible on a symmetric list |
+| `drag` | Finder's icon view, which persists icon positions: drag one icon and re-read its `AXPosition`. A list reorder is the more useful case but a worse first test, since a failed reorder and a refused drag look identical |
+| right click | a control with no AX actions at all — §10's chat-app hamburger is the standing example — where a menu appearing is unambiguous, because there is no `AXShowMenu` that could have done it |
+| ⌘-click | a browser link, where the tab count before and after is a count rather than a judgement |
+| all of them | `CGEvent(source: nil).location` byte-identical before and after, which is the §8 coexistence check the whole project rests on |
+
+None of these has been run. §8's checklist carries them so that stays visible.
 
 ### Chords
 
