@@ -60,6 +60,9 @@ cua-rs permissions      # never prompts
 System Settings → Privacy & Security → Accessibility (then Screen Recording),
 add the **host** app, restart it.
 
+Note that cua-rs refuses to *act* on System Settings itself, along with Keychain
+Access and password managers — see [Safety](#safety). Reading them still works.
+
 ## Connect
 
 ```json
@@ -72,8 +75,34 @@ Or Streamable HTTP for a client that attaches to an already-running server:
 cua-rs 9331     # http://127.0.0.1:9331/mcp  ·  /health
 ```
 
-Loopback only, always. It exposes full desktop control and has no authentication
-of its own.
+Loopback only, always — and loopback is not an authorization boundary, so `/mcp`
+also requires a bearer token. Set `CUA_HTTP_TOKEN` to pin one, or let the server
+generate one and print it on stderr at startup:
+
+```text
+INFO cua_mcp: generated a bearer token for this run. Clients must send
+              `Authorization: Bearer 9f3c…` to /mcp. Set CUA_HTTP_TOKEN to pin your own.
+```
+
+`/health` stays open, so a supervisor can probe a server it has no credential
+for. stdio mode needs no token: the client already owns the process.
+
+## Safety
+
+Five gates. Each refusal names what to pass or change, so an agent can resolve
+it in one round trip. [DESIGN.md §7a](DESIGN.md) has the reasoning.
+
+| | default | how to change it |
+|---|:--|:--|
+| **Credential and security apps are never driven.** Keychain Access, the Passwords app, 1Password / Bitwarden / LastPass / Dashlane / KeePass and friends, System Settings, login and unlock prompts. Matched on bundle identifier, not display name. | on | `CUA_ALLOW_FORBIDDEN_TARGETS=1` |
+| **Reading them is still allowed** — `get_app_state`, `find`, `list_apps` — because a blocked app you cannot even look at is one you cannot explain. The screenshot is withheld, though: pixels reproduce the secret rather than describing it. | on | same flag |
+| **Destructive controls need confirming.** A target whose label reads as Delete / Remove / Erase / Reset / Move to Trash / Don't Save / 삭제 / 제거 / 초기화 / 나가기 is refused, as is `cmd+delete` and a bare `delete` outside a text field. | on | pass `confirm_destructive: true` on that call |
+| **Nothing is delivered to a locked screen** or one running its screen saver. Reads continue. | on | — |
+| **Yield to the human.** When enabled, cua-rs stops acting on an app while the human is using it, rather than fighting them for the window. Uses a listen-only event tap that returns every event unchanged — it reads the input stream and never writes to it. | **off** | `CUA_YIELD_TO_HUMAN=1`, `CUA_YIELD_IDLE_MS` (default 3000) |
+
+The label classifier deliberately over-reports: a false positive costs one extra
+call, a false negative costs a deleted conversation. If a refusal looks wrong,
+confirming is the right answer.
 
 ## Use
 
@@ -106,7 +135,7 @@ and `click`, `click_in_window`, `drag` and `hover` all honour it.
 |---|:--|
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
 | `find` · `wait_for` | search the snapshot; poll until text appears or goes |
-| `click` | a pid-routed event; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count` |
+| `click` | a pid-routed event, no `AXPress`/`AXPick`/`AXConfirm` attempt; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count`, `confirm_destructive` for a Delete-shaped target |
 | `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
 | — | every action returns what it did — verb, target, `delivery`, and a tree diff by default. Nothing is fire-and-forget |
 | `click_in_window` | last resort: a bare point, no element, nothing verified |
@@ -174,7 +203,7 @@ the workspace to get both.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # no permissions needed
+cargo test --workspace          # 184 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 
 # read-back tests for the keyboard path: needs an Accessibility grant,
@@ -185,7 +214,7 @@ cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1
 ```text
 cua-ax        safe AXUIElement wrapper + budgeted tree walker
 cua-capture   window discovery + crash-isolated per-window PNG
-cua-core      app resolution, one native worker thread, snapshots
+cua-core      app resolution, one native worker thread, snapshots, safety gates
 cua-hid       process-routed input — the only crate that synthesizes events
 cua-mcp       the server, binary `cua-rs`
 cua-overlay   the drawn cursor

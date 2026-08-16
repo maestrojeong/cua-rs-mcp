@@ -643,8 +643,165 @@ Signing state, then, is a Gatekeeper question rather than a TCC one:
   Deliberately not pursued — it buys one download path, not fewer permission
   prompts.
 
-**Screen lock.** Not handled yet. Mutating tools should return a recoverable
-error while locked rather than failing opaquely.
+**Screen lock.** Handled — see §7a, which is where the whole safety layer now
+lives. Mutating tools return a recoverable error while locked; reads continue.
+
+---
+
+## 7a. The safety layer
+
+Everything above answers "can cua-rs reach this control". This section answers
+"should it". The two questions live in separate files —
+`cua-core/src/safety.rs` holds all of the policy, and `session.rs` calls it from
+one place — because the delivery path is judged on whether the event lands and a
+refusal is judged on whether a human reading the transcript afterwards agrees
+with it.
+
+| gate | default | flag | what it refuses |
+|---|:--|:--|:--|
+| forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots |
+| destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something |
+| screen lock | **on** | — | every action while the session is locked or the saver is up |
+| yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using |
+| HTTP bearer token | **on** | `CUA_HTTP_TOKEN` sets it | any `/mcp` request without `Authorization: Bearer` |
+
+All four action gates are checked once, in `Inner::acting`, which every action
+already passes through. That is deliberate: a tool added later is gated by
+default instead of by somebody remembering, and the order (session → app →
+element) means the error names the most fundamental reason rather than the last
+one checked. Refusing a click on "Delete" as destructive when the real problem
+is that the screen has been locked for an hour sends the agent down the wrong
+path.
+
+### Reading is allowed; acting is not; photographing is not either
+
+The blocklist refuses actions and permits `get_app_state`, `find`, `wait_for`
+and `list_apps`. The split follows what each operation can do wrong.
+
+An action is irreversible and mis-aimable. cua-rs resolves a target from a tree
+it walked milliseconds ago, and §10 already records that its own
+change-detection is a heuristic; in a password manager the gap between the
+control cua-rs meant and its neighbour is the gap between reading a vault and
+emptying it. A tree read is bounded by what accessibility publishes, which is
+what any screen reader on the machine already sees, and it is what makes a
+refusal diagnosable at all — an agent that cannot even call `list_apps` on a
+blocked app cannot explain to its user why it stopped.
+
+The screenshot is the exception, and it is the interesting one. Pixels are the
+one read that reproduces the secret rather than describing the UI around it, so
+`get_app_state` on a forbidden target returns the tree, drops the image, and
+says so in a warning. That keeps the app observable enough to reason about and
+closes the most direct exfiltration path.
+
+### Bundle identifiers, not names
+
+Matching is on the bundle id. A display name is text an app chooses — shipping
+one called "Keychain Access" is trivial — and, in the direction that actually
+matters here, the real Keychain Access is called something else in every
+non-English locale. A name-based list would fall open on the maintainer's own
+machine.
+
+Three groups are listed with three different reasons, because the error message
+quotes the reason: credential stores (Keychain Access, Passwords, the major
+third-party managers), System Settings, and login/unlock/authorization surfaces.
+System Settings is blocked *whole* rather than per-pane: the bundle id is all
+this gate can see, and the process that holds Privacy & Security, FileVault and
+Login Items is the same process that holds the wallpaper picker. Refusing the
+app is over-broad and honest; pretending to know which pane is open would be
+neither.
+
+Behind the curated list is a substring rule on the bundle id — `password`,
+`keychain`, `authenticator`, `bitwarden`, and a handful more. No list of
+third-party password managers can stay complete, and missing one is the worst
+failure this module has. A bundle id is not marketing text: a developer writing
+`password` into their reverse-DNS identifier is telling us what the app is for.
+The false positive it will eventually produce costs one environment variable.
+
+### Destructive labels: a parameter, not a prompt
+
+§10 named this as "the obvious next safety feature". It is a heuristic over the
+target's label, help text and — only when the element is not writable — its
+value, plus the key itself on `press_key`.
+
+The confirmation is an explicit `confirm_destructive: true` argument rather than
+an interactive prompt, because an MCP server has no channel to a human. The
+refusal names the exact parameter that clears it, which turns the decision into
+two lines of transcript a person can scroll back to. A prompt would have to be
+answered by the model anyway, invisibly.
+
+The classifier is tuned to over-refuse. A false positive costs one round trip
+with an error that says precisely what to send; a false negative costs a deleted
+conversation. Two details fall out of that:
+
+- **English stems, matched at word starts.** `delet`, `remov`, `eras`,
+  `discard`, `reset`, `trash`, `revok`, `clear` and friends, so `Delete`,
+  `Deletes` and `Deleting` all match from one entry. Word-start rather than
+  substring is the single place precision wins, and it wins cheaply: it stops
+  `Presets` matching `reset` and `Undelete` matching `delete`, neither of which
+  removes anything.
+- **Korean as plain substrings.** 삭제, 제거, 지우, 초기화, 버리, 휴지통, 비우기,
+  탈퇴, 나가기, 저장 안. Korean has no word boundary to anchor to, and the
+  `Presets` problem does not arise, so the looser rule is the right one. This is
+  not an afterthought: the maintainer works in Korean apps and KakaoTalk is a
+  standing test target, where 나가기 leaves a chat room and takes its history
+  with it.
+
+A text field's own *contents* are never classified. Otherwise `set_value` on a
+note reading "remind me to delete the old files" would be refused, and no
+confirmation could make that sensible.
+
+`press_key` classifies the key as well, because a Delete carries its meaning in
+the key rather than in the element: any modified Delete or Backspace (`cmd+delete`
+is Move to Trash almost everywhere), and a bare Delete anywhere that is not a
+text entry field — including anywhere cua-rs could not identify the element at
+all, which is the fail-closed reading.
+
+`click_in_window` gets no confirmation parameter. There is no element behind its
+point, so there is no label to judge, and offering a confirmation that classifies
+nothing would be a promise the tool cannot keep. The other three gates still
+apply to it.
+
+### Screen lock: a read at the boundary, not an observer
+
+`CGSessionCopyCurrentDictionary()["CGSSessionScreenIsLocked"]`, plus a check for
+`com.apple.ScreenSaver.Engine` in the running-app list. Both are public, and
+both are cheap enough to do at every action.
+
+The alternative was a distributed-notification observer for the screensaver
+start/stop pair. It was rejected for the reason §4 exists: an observer needs a
+run loop, and it caches an answer that can go stale between the notification and
+the action. A direct read cannot be stale, costs a dictionary copy against an AX
+round trip that already costs milliseconds, and adds no thread. The saver check
+is a running-app scan rather than a notification for the same reason.
+
+The lock read fails **open** deliberately: `CGSessionCopyCurrentDictionary`
+returns nothing at all to a process with no window-server session, and reading
+that as "locked" would make cua-rs permanently refuse in exactly the headless
+setups where a lock cannot happen. The absent-key case is likewise unlocked,
+which is what the window server means by it.
+
+Reads continue while locked. They return whatever the app still publishes, which
+may be a lock screen or nothing; refusing them would break polling loops for no
+gain, since a read cannot change anything a human will later be surprised by.
+
+### HTTP: loopback is not authorization
+
+The Streamable HTTP transport used to rely on binding to `127.0.0.1`. That keeps
+the network out and keeps nothing else out: every process on the machine can
+reach loopback, and so can any page in the user's browser, since JavaScript will
+happily `fetch("http://127.0.0.1:9331/mcp")` on behalf of whatever site is
+loaded. On the other side of that request is full desktop control. Loopback is a
+*reachability* boundary and was being used as an *authorization* boundary.
+
+So: one bearer token, compared in constant time, required on `/mcp`. Supplied
+via `CUA_HTTP_TOKEN` or generated per run from `/dev/urandom` and printed on
+stderr at startup. `/health` stays open — a supervisor needs it before it holds
+any credential, and closing it would make "the server is down" and "my token is
+wrong" the same observation. The 401 does not distinguish a wrong token from a
+missing one.
+
+Both boundaries are kept. The bind check still refuses anything but loopback,
+because a token is not a reason to put this on a network.
 
 ---
 
@@ -765,6 +922,22 @@ or verified live
 - [ ] Retina: `scale` ≈ 2.0; external 1x display: ≈ 1.0
 - [ ] window moved between snapshot and action: index still hits the right control
 
+**Safety gates** — the classification itself is unit-tested and needs no grants;
+these are the wiring, which does
+- [x] `press_key delete` on a non-text element is refused, and the same call
+      with `confirm_destructive: true` goes through (verified live on Terminal)
+- [x] `CUA_YIELD_TO_HUMAN=1`: a click on the app the human is typing in is
+      refused, naming the idle window; the tap starts and tears down cleanly
+      (verified live)
+- [ ] `CUA_YIELD_TO_HUMAN=1` with no Accessibility grant → every action refused
+      with the "tap unavailable" message, not silently unguarded
+- [ ] a click on Keychain Access / 1Password is refused; `get_app_state` on it
+      still returns a tree, with the screenshot withheld and a warning
+- [ ] `CUA_ALLOW_FORBIDDEN_TARGETS=1` lifts both
+- [ ] lock the screen mid-session: the next action is refused, `find` still works
+- [ ] HTTP mode: `/mcp` is 401 without the token and works with it; `/health`
+      answers either way (covered by an `#[ignore]`d test that binds a port)
+
 ## 9. Deliberately not built
 
 | | Why |
@@ -776,7 +949,50 @@ or verified live
 | menu invocation | needs temporary activation + focus restore; easy to get wrong |
 | Spaces handling | off-Space windows are observation-only, matching prior art |
 | per-app leases | needed once two agents share one machine |
-| yield-to-human detection | requires watching real input, which needs an event tap |
+| ~~yield-to-human detection~~ | **built, opt-in, `CUA_YIELD_TO_HUMAN=1` — see below** |
+
+### The yield-to-human row changed, and why
+
+That row read "requires watching real input, which needs an event tap", and the
+implied conclusion was that an event tap is the same kind of thing as posting to
+the shared input stream. It is not, and the distinction is one word in the API.
+
+A tap created with `kCGEventTapOptionListenOnly` is not in the delivery path. It
+cannot swallow, delay, rewrite or reorder an event; the callback's return value
+is ignored, and macOS forwards the original regardless. cua-rs's tap goes
+further and returns every event unchanged anyway, so the code reads the way the
+promise does. What this project refuses to do is *write* to the shared cursor
+and keyboard — that is what steals focus, that is what makes an agent contend
+with the human for one channel, and none of it is what a listen-only tap does.
+
+It is still a policy reversal, because the process now reads a stream it
+previously did not open, and a reader who checked "no event tap" as a proxy for
+"no interference" deserves to be told the proxy changed rather than to discover
+a `CGEventTapCreate` call. So it ships **off by default**, behind
+`CUA_YIELD_TO_HUMAN=1`.
+
+What the tap records is a timestamp, and nothing else — not the key, not the
+position, not the app. One atomic store, no allocation, no lock, no framework
+call, on a thread that is not the single AX worker (it owns its own run loop,
+polled in 250 ms slices so teardown is a flag and a join rather than a
+cross-thread `CFRunLoopStop` against a `!Send` handle).
+
+The gate's real question — "is the human working in the app I am about to
+drive" — is answered at the action boundary instead, by pairing that timestamp
+with `NSWorkspace.frontmostApplication`. cua-rs never activates an app, so an
+app it is driving is frontmost only because the human put it there; input
+arriving while that is true is theirs. Input arriving while something else is
+frontmost is the human working elsewhere, which is the case this whole project
+exists to run alongside — and the reason the naive "any input at all" rule would
+have been unusable.
+
+Two consequences worth stating. The gate clears itself after
+`CUA_YIELD_IDLE_MS` (default 3000) of quiet, which is what the refusal tells the
+caller to wait for; there is no separate resume call, because a latch with no UI
+to clear it is a deadlock. And if the flag is set but the tap cannot be created
+— no Accessibility grant, typically — every action is refused rather than
+silently unguarded. A yield gate that cannot see is worse than no gate, because
+it promises a property it is not providing.
 
 ---
 
@@ -800,9 +1016,16 @@ covers — it compares the *element*, not a string built from it.
 invalidates indices each time. Correct, but awkward; keying snapshots by window
 would fix it.
 
-**No approval gates.** Nothing distinguishes pressing "Cancel" from pressing
-"Delete All". A destructive-label heuristic requiring explicit confirmation is
-the obvious next safety feature.
+**The approval gate is a heuristic, and heuristics on labels are shallow.**
+"Cancel" and "Delete All" are now distinguished (§7a), but only by what the
+control says about itself. A button labelled "OK" in a dialog whose *title* says
+"Delete 4 items?" is not caught, because the classifier reads the target and not
+its context; nor is a menu item whose destructive meaning lives in the row it
+was invoked from. Widening it to the ancestor chain is the obvious next step and
+would need a rule for how far up to look before every button in a settings
+window inherits the word "Reset" from a section header. Until then the gate
+stops the labelled cases, which are most of them, and `snapshot_id` plus
+`element_token` remain the defence against acting on the wrong element at all.
 
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.

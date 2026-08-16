@@ -188,6 +188,7 @@ impl Scratch {
                 target(area.index, snapshot_id),
                 cua_core::MouseOptions::default(),
                 false,
+                false,
             )
             .expect("click the text area");
         std::thread::sleep(Duration::from_millis(300));
@@ -220,7 +221,13 @@ fn open_find_bar(scratch: &Scratch) -> Line {
     let area = require_role(&tree, "AXTextArea");
     scratch
         .cua
-        .press_key("TextEdit", target(area.index, snapshot_id), "cmd+f", false)
+        .press_key(
+            "TextEdit",
+            target(area.index, snapshot_id),
+            "cmd+f",
+            false,
+            false,
+        )
         .expect("cmd+f");
     std::thread::sleep(Duration::from_millis(700));
     let (_, tree) = snapshot(&scratch.cua);

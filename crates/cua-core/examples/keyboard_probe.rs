@@ -112,6 +112,7 @@ fn main() {
             },
             cua_core::MouseOptions::default(),
             false,
+            false,
         );
         println!("click           = {clicked:?}");
         println!(

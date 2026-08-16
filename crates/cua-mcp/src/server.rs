@@ -242,12 +242,25 @@ impl MouseArgs {
     }
 }
 
+/// Note on `confirm_destructive`, which three of the acting tools carry.
+///
+/// It is a parameter and not a prompt: an MCP server has no channel to a human,
+/// so the only place the decision can be made visible is the transcript the
+/// human can scroll back through. The refusal names the field, so clearing it
+/// costs one round trip and no guessing.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ClickArgs {
     #[serde(flatten)]
     target: ActionArgs,
     #[serde(flatten)]
     mouse: MouseArgs,
+    /// Set to true to proceed when the target's label reads as destructive
+    /// (Delete, Remove, Erase, Reset, Move to Trash, Don't Save, 삭제, 제거,
+    /// 초기화, 나가기, …). Without it such a click is REFUSED and the error
+    /// names this field. The classifier deliberately over-reports — confirming
+    /// a false positive is the right answer and costs one round trip.
+    #[serde(default)]
+    confirm_destructive: bool,
     /// Click count. `2` for a double-click, for targets that open on
     /// double-click and merely select on single-click — chat and file lists,
     /// typically. Anything above 1 skips the accessibility path entirely
@@ -524,6 +537,11 @@ struct PressKeyArgs {
     target: ActionArgs,
     /// Background-safe semantic key: `return`, `escape`, `up`, or `down`.
     key: String,
+    /// Set to true to proceed when the key or its target reads as destructive.
+    /// `cmd+delete` always counts; a bare `delete` counts everywhere except a
+    /// text field, where it is one character.
+    #[serde(default)]
+    confirm_destructive: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -532,6 +550,9 @@ struct SecondaryActionArgs {
     target: ActionArgs,
     /// AX action name, e.g. `AXShowMenu`, `AXRaise`, `AXIncrement`.
     action: String,
+    /// Set to true to proceed when the target's label reads as destructive.
+    #[serde(default)]
+    confirm_destructive: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -726,7 +747,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. Pass button=right for a real rightMouseDown/rightMouseUp pair (a context menu on a control that advertises no AXShowMenu), button=middle for a middle click, and modifiers=\"cmd\" / \"shift\" / \"alt\" / \"ctrl\" (or a combination like \"cmd+shift\") to hold keys down for the press — that is how you open a link in a new tab, extend a selection to a row, or reach an app's alternate ⌥ action. There is no real-pointer fallback."
+        description = "Activate an element without moving the system cursor. Uses AXPress, AXPick, or AXConfirm when the element supports one; otherwise builds real AppKit mouse events (NSEvent, carrying a fresh event number, the true click count and the target's window number) and routes them to the target process through SkyLight, reporting `delivery: pid`. A synthesized ApplicationActivated notice wraps the click so custom-drawn views that only act when their app is active still accept it — the real frontmost app, keyboard focus and Space never change. Frame-bearing controls can receive an `element_index` even when they advertise no AX actions. Prefer `element_index` from the latest get_app_state; x/y is resolved to an element first. Pass count=2 for a target that only opens on a double-click; accessibility has no click count, so double-clicks use pid delivery. Pass button=right for a real rightMouseDown/rightMouseUp pair (a context menu on a control that advertises no AXShowMenu), button=middle for a middle click, and modifiers=\"cmd\" / \"shift\" / \"alt\" / \"ctrl\" (or a combination like \"cmd+shift\") to hold keys down for the press — that is how you open a link in a new tab, extend a selection to a row, or reach an app's alternate ⌥ action. There is no real-pointer fallback. SAFETY: a target whose label reads as destructive (Delete, Remove, Erase, Reset, Move to Trash, Don't Save, 삭제, 제거, 초기화, 나가기, …) is refused unless you also pass confirm_destructive=true; credential managers, Keychain Access, System Settings and login surfaces are refused outright; nothing is delivered while the screen is locked."
     )]
     async fn click(
         &self,
@@ -743,8 +764,9 @@ impl CuaServer {
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
         let mouse = mouse.with_count(a.count.unwrap_or(1).clamp(1, 3));
+        let confirm = a.confirm_destructive;
         match self
-            .native(move |c| c.click(&app, target, mouse, want_state))
+            .native(move |c| c.click(&app, target, mouse, want_state, confirm))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -949,7 +971,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set."
+        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. SAFETY: `cmd+delete`, and a bare `delete`/`backspace` anywhere that is not a text field, are refused unless you also pass confirm_destructive=true."
     )]
     async fn press_key(
         &self,
@@ -962,8 +984,9 @@ impl CuaServer {
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
         let key = a.key.clone();
+        let confirm = a.confirm_destructive;
         match self
-            .native(move |c| c.press_key(&app, target, &key, want_state))
+            .native(move |c| c.press_key(&app, target, &key, want_state, confirm))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -972,7 +995,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions."
+        description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions. SAFETY: as with `click`, a destructive-looking target needs confirm_destructive=true."
     )]
     async fn perform_secondary_action(
         &self,
@@ -985,8 +1008,9 @@ impl CuaServer {
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
         let action = a.action.clone();
+        let confirm = a.confirm_destructive;
         match self
-            .native(move |c| c.perform_action(&app, target, &action, want_state))
+            .native(move |c| c.perform_action(&app, target, &action, want_state, confirm))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -1273,7 +1297,12 @@ impl rmcp::ServerHandler for CuaServer {
              you can drive a background window while the user keeps working in another one. \
              Indices are only valid until \
              the next get_app_state for that app; pass snapshot_id to make staleness an error \
-             instead of a mis-click."
+             instead of a mis-click. Actions pass through four safety gates: apps that hold \
+             credentials or system security state are never driven (reading them is still \
+             allowed, minus screenshots), a target whose label reads as destructive needs \
+             confirm_destructive=true, nothing is delivered while the session is locked, and — \
+             if the operator enabled it — cua-rs stands down on an app the human is using. \
+             Every refusal names what to pass or change."
                 .to_string(),
         );
         info

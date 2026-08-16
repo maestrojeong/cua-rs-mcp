@@ -48,6 +48,13 @@ pub enum CoreError {
     #[error(transparent)]
     Capture(#[from] cua_capture::CaptureError),
 
+    /// A safety gate declined to let this action happen. See [`crate::safety`]
+    /// for what the gates are and how each one is cleared; the message always
+    /// names the way out, because a refusal an agent cannot resolve just
+    /// becomes a retry loop.
+    #[error(transparent)]
+    Refused(#[from] crate::safety::Refused),
+
     /// The agent acted on an index from a snapshot that has since been replaced.
     ///
     /// Reported loudly and specifically rather than being silently remapped:
@@ -1245,6 +1252,10 @@ struct Inner {
     /// empty" and "the app refused to build one" have to be told apart in the
     /// response rather than guessed at by the caller.
     enablement: HashMap<ProcessKey, cua_ax::Enablement>,
+    /// The listen-only input tap behind `CUA_YIELD_TO_HUMAN`, shared with
+    /// [`Cua`] so the tap is torn down when the last handle goes away rather
+    /// than leaking for the life of the process. Inert unless the flag is set.
+    human: std::sync::Arc<crate::safety::HumanWatch>,
 }
 
 /// Identifies a process incarnation, not just a pid slot.
@@ -1307,18 +1318,29 @@ pub struct Cua {
     /// single-threaded AX worker — there is no reason to serialize a stdin
     /// write behind tree walks and clicks.
     overlay: std::sync::Arc<Overlay>,
+    /// Held only to keep the yield-to-human tap alive for as long as any handle
+    /// to this server is. Dropping the last one stops the tap's thread.
+    _human: std::sync::Arc<crate::safety::HumanWatch>,
 }
 
 impl Cua {
     /// Spawn the worker thread.
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        // Started before the worker so the first action already knows whether
+        // the tap is up, rather than racing it. A no-op unless
+        // `CUA_YIELD_TO_HUMAN=1`.
+        let human = std::sync::Arc::new(crate::safety::HumanWatch::start());
+        let worker_human = human.clone();
         std::thread::Builder::new()
             .name("cua-native".into())
             // AX tree walks recurse and some apps are pathologically deep.
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                let mut inner = Inner::default();
+                let mut inner = Inner {
+                    human: worker_human,
+                    ..Inner::default()
+                };
                 while let Ok(job) = rx.recv() {
                     // One malformed tree must not take down the worker and with
                     // it every future tool call, so each job is isolated.
@@ -1334,6 +1356,7 @@ impl Cua {
         Self {
             tx,
             overlay: std::sync::Arc::new(Overlay::new()),
+            _human: human,
         }
     }
 
@@ -1409,16 +1432,23 @@ impl Cua {
     ///
     /// `return_state` re-reads the window afterwards and attaches the result;
     /// see [`PostActionState`] for why that is worth a round trip.
+    ///
+    /// `confirm_destructive` clears the label gate in [`crate::safety`] for
+    /// this one call. It is a parameter rather than a prompt because an MCP
+    /// server has no channel to a human, and it is per-call rather than a mode
+    /// because the point is to put the decision in the transcript.
     pub fn click(
         &self,
         app: &str,
         target: Target,
         mouse: MouseOptions,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        let gate = crate::safety::Gate::at("click", &target).confirmed(confirm_destructive);
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| i.click(&app, target, mouse))
+            inner.acting(&app, gate, return_state, |i| i.click(&app, target, mouse))
         })
     }
 
@@ -1439,8 +1469,15 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        // `elementless`, even when both ends resolve to elements: the
+        // destructive-label heuristic classifies the thing being *pressed*, and
+        // a drag presses nothing — its consequence lives in where it is
+        // dropped, which no label describes. The app blocklist, the screen-lock
+        // guard and the yield check all still apply, and they are the gates that
+        // matter for a gesture.
+        let gate = crate::safety::Gate::elementless("drag");
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.drag(&app, from.clone(), to.clone(), mouse, snapshot_id)
             })
         })
@@ -1459,8 +1496,11 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        // Hover presses nothing at all, so the label heuristic has nothing to
+        // classify; the app blocklist, lock guard and yield check still run.
+        let gate = crate::safety::Gate::elementless("hover");
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.hover(&app, at.clone(), modifiers, snapshot_id)
             })
         })
@@ -1481,8 +1521,14 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        // No element, so no label, so no destructive classification is possible
+        // here at all — see `safety::Gate::elementless`. The other three gates
+        // still apply.
+        let gate = crate::safety::Gate::elementless("click_in_window");
         self.exec_action(true, move |inner| {
-            inner.acting(&app, return_state, |i| i.click_in_window(&app, at, mouse))
+            inner.acting(&app, gate, return_state, |i| {
+                i.click_in_window(&app, at, mouse)
+            })
         })
     }
 
@@ -1496,8 +1542,11 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let value = value.to_string();
+        let gate = crate::safety::Gate::at("set_value", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.set_value(&app, target, &value))
+            inner.acting(&app, gate, return_state, |i| {
+                i.set_value(&app, target, &value)
+            })
         })
     }
 
@@ -1514,8 +1563,11 @@ impl Cua {
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
+        let gate = crate::safety::Gate::at("scroll", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.scroll(&app, target, dir, amount))
+            inner.acting(&app, gate, return_state, |i| {
+                i.scroll(&app, target, dir, amount)
+            })
         })
     }
 
@@ -1536,11 +1588,12 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        let gate = crate::safety::Gate::at("type_text", &target);
         // `false` is the drawn cursor's "no click ring", the same as
         // `press_key`: keystrokes are not a click whichever mechanism carries
         // them.
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.type_text(&app, target, &text, mechanism)
             })
         })
@@ -1558,25 +1611,35 @@ impl Cua {
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        let gate = crate::safety::Gate::at("select_text", &target);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.select_text(&app, target, &text, prefix.as_deref(), suffix.as_deref())
             })
         })
     }
 
     /// Press a key, through AX when the key has a verb and HID otherwise.
+    ///
+    /// The key is classified as well as the element: `cmd+delete` is Move to
+    /// Trash regardless of what the row it lands on is called.
     pub fn press_key(
         &self,
         app: &str,
         target: Target,
         key: &str,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let key = key.to_string();
+        let gate = crate::safety::Gate::at("press_key", &target)
+            .with_key(&key)
+            .confirmed(confirm_destructive);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.press_key(&app, target, &key))
+            inner.acting(&app, gate, return_state, |i| {
+                i.press_key(&app, target, &key)
+            })
         })
     }
 
@@ -1587,11 +1650,14 @@ impl Cua {
         target: Target,
         action: &str,
         return_state: bool,
+        confirm_destructive: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let action = action.to_string();
+        let gate = crate::safety::Gate::at("perform_secondary_action", &target)
+            .confirmed(confirm_destructive);
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| {
+            inner.acting(&app, gate, return_state, |i| {
                 i.perform_action(&app, target, &action)
             })
         })
@@ -1744,7 +1810,7 @@ fn page_points(element_height: Option<f64>) -> i32 {
 // ── worker-side implementation ───────────────────────────────────────────────
 
 impl Inner {
-    fn get_app_state(&mut self, query: &str, opts: StateOptions) -> Result<AppState> {
+    fn get_app_state(&mut self, query: &str, mut opts: StateOptions) -> Result<AppState> {
         cua_ax::require_trusted()?;
         let info = apps::resolve_app(query)?;
         let app_el = Element::for_pid(info.pid);
@@ -1768,6 +1834,16 @@ impl Inner {
         }
 
         let mut warnings = Vec::new();
+
+        // Reading a forbidden app stays allowed; photographing one does not.
+        // The tree describes the UI holding a secret, while the pixels are the
+        // secret. See `crate::safety` for the whole read/act split.
+        if opts.include_screenshot {
+            if let Some(why) = crate::safety::screenshot_refusal(&info) {
+                opts.include_screenshot = false;
+                warnings.push(why);
+            }
+        }
 
         // Prefer the focused window, fall back to main, then to the first one.
         // A minimized-only app has none of these, which is a real state and not
@@ -2055,10 +2131,52 @@ impl Inner {
     /// Failing to re-read is not an error. The action already happened, and
     /// reporting it as a failure because the follow-up read did not work would
     /// invite a caller to retry something that already took effect.
-    fn acting<F>(&mut self, query: &str, return_state: bool, act: F) -> Result<ActionResult>
+    /// The snapshot's own description of the element an action is aimed at.
+    ///
+    /// Read from the stored snapshot rather than from the live element: the
+    /// destructive heuristic has to judge the control the *caller* chose, which
+    /// is the one the tree showed them. `None` when nothing can be resolved,
+    /// which the gate treats as "unknown" rather than "harmless"; the action's
+    /// own resolution then reports the real reason.
+    fn safety_candidate(&self, query: &str, target: &Target) -> Option<crate::safety::Candidate> {
+        let info = apps::resolve_app(query).ok()?;
+        let snap = self.snapshots.get(&info.pid)?;
+        let node = match *target {
+            Target::Index { index, .. } => snap.nodes.get(index)?,
+            // `snapshot_id` is the staleness guard the action itself enforces;
+            // classifying a label needs only the geometry, so it is ignored
+            // here rather than duplicating the refusal.
+            Target::Point { x, y, .. } => hit_test(&snap.nodes, x, y)?,
+        };
+        Some(crate::safety::Candidate {
+            role: node.role.clone(),
+            label: node.label.clone(),
+            value: node.value.clone(),
+            help: node.help.clone(),
+            settable: node.settable,
+            description: describe_node(node),
+        })
+    }
+
+    fn acting<F>(
+        &mut self,
+        query: &str,
+        gate: crate::safety::Gate,
+        return_state: bool,
+        act: F,
+    ) -> Result<ActionResult>
     where
         F: FnOnce(&mut Self) -> Result<ActionResult>,
     {
+        // Every gate, once, at the one place every action passes through.
+        // Putting it here rather than in each action means a tool added later
+        // is gated by default instead of by remembering. An app that will not
+        // resolve is left to the action, which reports that better.
+        if let Ok(info) = apps::resolve_app(query) {
+            let candidate = gate.target().and_then(|t| self.safety_candidate(query, t));
+            crate::safety::guard(&info, &self.human, &gate, candidate.as_ref())?;
+        }
+
         let before = if return_state {
             Some(self.rendered_current_tree(query))
         } else {
