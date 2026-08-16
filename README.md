@@ -7,76 +7,62 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![platforms](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
 
-cua-rs is a macOS computer-use MCP server that drives native apps through the
-**Accessibility API** instead of synthesizing mouse and keyboard input. On the
-default path nothing moves your pointer, nothing steals keyboard focus, nothing
-switches your Space: an agent can work in a background window while you keep
-typing in another, on the same Mac at the same time. One Rust binary, no
-Node.js, no Python.
-
-Some custom-drawn controls advertise no accessibility action. For those,
-cua-rs routes a stamped mouse event directly to the target process through
-macOS SkyLight. This `delivery: pid` path does not move the system cursor or
-raise the target window. There is no pointer-warp fallback.
+A macOS computer-use MCP server that drives native apps through the
+**Accessibility API** — addressing a UI element instead of moving a pointer to a
+coordinate. Nothing moves your cursor, takes your keyboard focus, or switches
+your Space, so an agent can work in a background window while you keep typing in
+another. One Rust binary.
 
 ```mermaid
 flowchart LR
-    A["Agent"] --> M["cua-rs MCP<br/>persistent Rust process"]
-    M -->|"AXUIElementPerformAction"| S["Slack<br/>(background)"]
-    M -->|"window id"| C["one-shot macOS<br/>capture process"]
-    C -->|"window PNG"| S
-    H["You"] -.->|"real cursor + keyboard"| T["Terminal<br/>(foreground)"]
-    style H fill:#e8f5e9,stroke:#43a047
-    style A fill:#e3f2fd,stroke:#1e88e5
+    subgraph agent["agent's lane — no cursor, no keyboard focus"]
+        A["Agent"] -->|MCP| M["cua-rs"] -->|"addresses an element"| B["any app<br/>background window"]
+    end
+    subgraph human["your lane — untouched"]
+        H["You"] -->|"real cursor + keyboard"| F["whatever you are in<br/>foreground"]
+    end
 ```
 
-## Contents
+There is no arrow between the lanes, and that is the whole product.
 
-[Quick start](#quick-start) · [Why cua-rs?](#why-cua-rs) ·
-[Connect a client](#connect-an-mcp-client) · [Targeting](#how-targeting-works) ·
-[Tools](#tools) · [Known limits](#known-limits) ·
-[The drawn cursor](#the-drawn-cursor) · [Development](#development) ·
-[Prior art](#prior-art)
+| | HID-synthesis tools | cua-rs |
+|---|:--|:--|
+| click | move cursor, post mouse down/up | AX action; a process-routed event for custom controls |
+| type | post keys to whatever has focus | `AXUIElementSetAttributeValue` |
+| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated per-window capture |
+| your cursor / focus / Space | moves, changes, switches | **untouched** |
+| occluded or off-Space window | blank or stale capture | **captures** |
+| you working at the same time | input fights the agent | **works** |
 
-## Quick start
+Not a runtime mode: there is no flag that warps the pointer or posts to the
+shared keyboard stream. Why, and what it costs, is in [DESIGN.md](DESIGN.md).
 
-**1. Install** — macOS arm64 downloads a prebuilt binary.
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/cua-rs-mcp/main/install.sh | sh
 cua-rs --help
 ```
 
-To pin a release instead of following `latest`:
+Pin a release with `CUA_VERSION=v0.4.2`, or build from source with
+`cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp`.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/cua-rs-mcp/main/install.sh | CUA_VERSION=v0.4.2 sh
-```
+> Downloading the binary by hand from the Releases page? Clear the quarantine
+> flag or it hangs instead of erroring: `xattr -d com.apple.quarantine ./cua-rs`.
+> The installer above does this for you.
 
-Or from source:
+## Grant permissions
 
-```bash
-cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp
-```
-
-> **Downloaded the binary by hand from the Releases page?** Clear the quarantine
-> flag first, or it will hang on launch rather than erroring:
-> `xattr -d com.apple.quarantine ./cua-rs`. The `curl | sh` installer above
-> handles this for you.
-
-**2. Grant permissions** — two of them, and **they attach to the process that
-launches `cua-rs`, not to `cua-rs` itself**. macOS credits the request to the
-responsible process, so a grant given to iTerm does not carry over to Claude
-Desktop, Cursor, or Codex CLI.
-
-The upside of that rule: **upgrading `cua-rs` never costs you a re-approval.**
-The grant was never on this binary. Verified by running a byte-mutated copy from
-an unrelated path — it still holds both grants.
+Two grants, and **they attach to the process that launches `cua-rs`, not to
+`cua-rs` itself** — macOS credits the responsible process, so a grant given to
+iTerm does not carry to Claude Desktop, Cursor, or Codex CLI. The upside: a
+`cua-rs` upgrade never costs a re-approval, because the grant was never on this
+binary.
 
 | Grant | Needed for | Without it |
 |---|:--|:--|
 | Accessibility | reading UI structure, every action | nothing works |
-| Screen Recording | window screenshots; last-moment window validation for custom-control `delivery: pid` clicks | tree and AX actions still work; no images or pid-routed fallback |
+| Screen Recording | screenshots, and last-moment window validation for process-routed clicks | tree and AX actions still work; no images |
 
 ```bash
 cua-rs permissions      # never prompts
@@ -87,94 +73,29 @@ cua-rs permissions      # never prompts
 System Settings → Privacy & Security → Accessibility (then Screen Recording),
 add the **host** app, restart it.
 
-**3. Run** — stdio for a client that launches the server:
-
-```bash
-cua-rs
-```
-
-**4. Verify** — point an MCP client at it and drive an app:
-
-```text
-list_apps                            # find the exact name to pass
-get_app_state  → { "app": "Notes" }  # tree + screenshot, assigns [N] handles
-click          → { "app": "Notes", "element_index": "12" }
-```
-
-The workflow is always: `get_app_state`, act on an index, then re-read when you
-need to confirm.
-
-## Why cua-rs?
-
-Almost every computer-use tool for macOS drives the machine by *pretending to be
-a human*: warp the cursor with `CGWarpMouseCursorPosition`, then post synthetic
-events into the global HID tap with `CGEventPost`. It works — and it is a
-shared, single-writer channel. There is exactly one cursor and one keyboard
-focus on a Mac, so an agent driving it that way is **competing with the person
-sitting at it**.
-
-cua-rs delivers actions *directly to the target UI element* instead.
-
-| | HID-synthesis tools | cua-rs |
-|---|:--|:--|
-| click | move cursor, post mouse down/up | AX action, then pid-routed SkyLight event for custom controls |
-| type | post key events to whatever has focus | `AXUIElementSetAttributeValue(AXValue)` |
-| scroll | post wheel events at a point | `AXScrollDownByPage` |
-| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated macOS per-window capture |
-| your cursor | moves | **untouched** |
-| where the agent is acting | your own moving cursor shows it | **a separate drawn arrow**, if `cua-overlay` is running — see [The drawn cursor](#the-drawn-cursor) |
-| your keyboard focus | changes | **unchanged** |
-| your active Space | can switch | **never switches** |
-| occluded / off-Space window | blank or stale capture | **captures correctly** |
-| window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
-| you working simultaneously | input fights the agent | **works** |
-
-Every process-routed event implementation lives in `cua-hid`; shared cursor and
-keyboard synthesis are not wired into the server. The dependency graph keeps
-AX and capture independent from the private input implementation:
-
-```console
-$ grep -rln 'CGEvent::post' crates/*/src/*.rs
-crates/cua-hid/src/lib.rs
-
-$ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
-0
-```
-
-The coexistence property is not a runtime mode: cua-rs has no `--allow-hid`
-option and no product path that warps the pointer or posts keyboard events.
-
-## Connect an MCP client
+## Connect
 
 ```json
-{
-  "mcpServers": {
-    "cua": { "command": "cua-rs" }
-  }
-}
+{ "mcpServers": { "cua": { "command": "cua-rs" } } }
 ```
 
-Or Streamable HTTP, for a client that connects to an already-running server:
+Or Streamable HTTP for a client that attaches to an already-running server:
 
 ```bash
-cua-rs 9331
-# streamable HTTP: http://127.0.0.1:9331/mcp
-# health:          http://127.0.0.1:9331/health
+cua-rs 9331     # http://127.0.0.1:9331/mcp  ·  /health
 ```
 
-cua-rs refuses to bind anywhere but loopback. It exposes full desktop control
-and has no authentication of its own, so a reachable port would hand your
-machine to the network.
+Loopback only, always. It exposes full desktop control and has no authentication
+of its own, so a reachable port would hand your machine to the network.
 
-## How targeting works
+## Use
 
-`get_app_state` walks one window's accessibility tree and captures it in the
-same moment, then numbers everything actionable:
+`get_app_state` first, always: it walks one window, captures it in the same
+moment, and numbers everything actionable. Those numbers are what actions take.
 
 ```text
 Notes (pid 41277)  snapshot_id=1
 window: Groceries
-elements: 214 total, 38 actionable
 
 AXWindow "Groceries"
   AXToolbar
@@ -182,262 +103,70 @@ AXWindow "Groceries"
     [7] AXTextField:SearchField "Search" (editable)
   [12] AXOutline "Notes"
     [13] AXRow "Groceries" (selected)
-    [14] AXRow "Reading list"
   [21] AXTextArea = "milk\neggs" (editable, focused)
-
-(96 structural or empty elements omitted)
 ```
-
-Lines with `[N]` are targetable. Lines without one are context — present so the
-model can see structure, but not clickable, which stops it from trying to press
-a scroll area. Layout wrappers collapse rather than indent, so `AXGroup` chains
-thirty levels deep cost nothing.
-
-```json
-{ "app": "Notes", "element_index": "3" }
-```
-
-### Stale handles fail loudly
-
-Indices are valid only until the next `get_app_state` for that app. Index 42 in
-an old snapshot is a *different element* than index 42 in the current one, so
-honoring it silently would click the wrong thing — the one failure mode here
-that a retry cannot fix and the user cannot see.
-
-`element_token` is the stricter form, and it costs nothing extra. The snapshot
-prints one per line: join the snapshot id, the index and the role.
 
 ```json
 { "app": "Notes", "element_token": "1-3-AXButton" }
 ```
 
-It carries what a bare index leaves implicit, so acting on a stale snapshot, or
-on an index whose element is now a different kind of thing, is an error rather
-than a mis-click:
+Lines with `[N]` are targetable; the rest is context, so a model does not try to
+press a scroll area. `element_token` bundles the snapshot, index and role, which
+makes acting on a stale handle an error instead of a mis-click — the one failure
+mode a retry cannot fix and you cannot see. `x`/`y` also works, resolved against
+the snapshot's own geometry, but an index names an element while a point only
+names a place.
 
-```text
-element_token points at index 3, which was a AXButton when the token was issued
-and is a AXRow now. Call get_app_state again and take a fresh token.
-```
-
-With a bare `element_index`, pass `snapshot_id` to get the same protection:
-
-```json
-{ "app": "Notes", "element_index": "42", "snapshot_id": 1 }
-```
-
-```text
-element_index 42 refers to snapshot 1, but the current snapshot for this app
-is 3. Call get_app_state again and use a fresh index.
-```
-
-Recommended for anything destructive.
-
-### Coordinates are resolved against the snapshot
-
-`x`/`y` is accepted, and it is resolved by hit-testing the element frames of the
-latest snapshot — preferring an actionable element, then the smallest, then the
-deepest. A point covering nothing is an error, never a guess.
-
-That means coordinates need a *current* snapshot. An index names an element, so
-it survives an action; a point names a place, and the thing that occupied it may
-have moved. After an action taken with `return_state: false`, a coordinate is
-refused rather than resolved against pre-action geometry.
-
-Not a fallback for reading the tree: `AXUIElementCopyElementAtPosition` was
-measured to answer `AXMenuBar` for every point in a background app, and every app
-cua-rs drives is backgrounded, so the snapshot's own geometry is the only
-trustworthy source.
-
-### Ambiguity is reported, never guessed
-
-```text
-`notes` is ambiguous: it matches Notes (com.apple.Notes),
-Notes Pro (com.other.NotesPro). Use the bundle identifier instead.
-```
-
-Silently picking one of two matching apps is how an agent types a message into
-the wrong window. App names resolve through six tiers — exact bundle id, exact
-name, bundle path basename, bundle-id suffix, name prefix, name substring — and
-`Slack` never loses to `Slack Helper (GPU)`.
-
-## Tools
-
-Names follow the vocabulary that has become de-facto standard for this
-capability on macOS. Models have already seen it; a private dialect would cost
-recognition and buy nothing.
-
-| Tool | Purpose |
+| Tool | |
 |---|:--|
-| `check_permissions` | grant status; never prompts |
-| `list_apps` | running apps, frontmost first |
 | `get_app_state` | **call first** — tree + screenshot from one snapshot |
-| `click` | activate an element (`AXPress` → `AXPick` → `AXConfirm`) |
-| `set_value` | write a text element's value |
-| `scroll` | page a scroll area |
-| `type_text` | append text, preserving what is there |
-| `select_text` | select a substring, with prefix/suffix anchors |
-| `press_key` | Return / Escape / arrows via AX; arbitrary chords are refused |
-| `perform_secondary_action` | any AX verb: `AXShowMenu`, `AXRaise`, `AXIncrement` |
-| `find` | search the snapshot by text |
-| `wait_for` | poll until text appears or disappears |
+| `find` · `wait_for` | search the snapshot; poll until text appears or goes |
+| `click` | `AXPress` → `AXPick` → `AXConfirm` |
+| `set_value` · `type_text` · `select_text` | write, append, select a substring |
+| `press_key` | Return / Escape / arrows via AX; chords are refused |
+| `scroll` · `perform_secondary_action` | page a scroll area; any AX verb |
+| `list_apps` · `check_permissions` | running apps; grant status |
 
-`get_app_state` knobs: `include_screenshot` (drop it on follow-up calls — it is
-the expensive part), `max_image_dim`, `max_elements`, `verbose` (show the
-filtered-out containers and frame geometry when a control seems missing),
-`skeleton` + `scope_element_id` (below).
+Actions re-read the window and return a delta by default, so acting and looking
+cost one round trip instead of two. **Read it as a textual delta, not as proof:**
+lines are compared without index or indentation — which is what stops an app that
+regroups its own subtrees from reporting hundreds of lines as change — so two
+identically-worded rows are interchangeable and a selection moving between them
+shows as nothing. It is reliable for structure arriving or leaving, like a menu
+opening. To know one element's state, read that element.
 
-### Every action reports what changed
+For a dense app, `skeleton: true` summarizes big subtrees, then
+`scope_element_id` spends the whole budget inside one of them.
 
-Actions re-read the window afterwards and answer with a delta against the tree
-from before — on by default. It is strictly cheaper than the `get_app_state` that
-would otherwise follow: one tree walk either way, but one round trip instead of
-two, and a few lines instead of the whole outline.
-
-```text
-SkyLight pid-routed 1-click at (949, 145) on [7] AXButton
-delivery: pid
-
-state after (snapshot_id=4, 319 elements):
-  appeared (19):
-  +     [22] AXMenu "_NS:244"
-  +       [85] AXMenuItem "Invite to chat"
-  +       [99] AXMenuItem "Chat settings"
-  +       [100] AXMenuItem "Leave chat"
-```
-
-Pass `return_state: false` for a run of actions whose intermediate states nobody
-will read — filling three fields before submitting, say.
-
-**Read it as a textual delta, not as proof.** Lines are compared without their
-index or indentation, so that an app which regroups its own subtrees on a click
-does not report hundreds of lines as change — and the cost of that is identity.
-Two rows reading exactly the same are interchangeable: if a selection moves from
-one to the other, the delta is empty although something changed. An empty delta
-means "no line-level difference", not "nothing happened". To know one specific
-element's state, read that element.
-
-It is reliable for structure arriving or leaving — a menu opening, a dialog
-replacing a pane, a row appearing — which is the common case, and the one that
-used to be invisible.
-
-The delta is also refused rather than faked when the two snapshots are not
-comparable: a different window, a scoped read, different walk caps, a walk that
-did not finish, or a snapshot some earlier action already invalidated. You get the
-reason and a fresh `snapshot_id` instead of a diff that would be arithmetically
-correct and useless.
-
-### Dense apps: skeleton, then drill in
-
-A Slack or VS Code window can expose thousands of elements. `skeleton=true`
-summarizes large deep subtrees instead of expanding them, so the overall map
-stays cheap:
-
-```text
-[0] AXWindow:StandardWindow "(5) Home • Threads - Chrome"
-  AXGroup "(5) Home • Threads - Chrome"
-    [5] AXGroup  (+40 elements — pass scope_element_id=5 to expand)
-  [2] AXButton:CloseButton
-  [3] AXButton:FullScreenButton
-  [4] AXButton:MinimizeButton
-
-(skeleton: 40 elements collapsed into their containers; pass
- scope_element_id=N to expand one, or skeleton=false for everything)
-```
-
-Then spend the whole element budget inside just that subtree:
-
-```json
-{ "app": "Google Chrome", "scope_element_id": "5" }
-```
-
-The window and its direct children never collapse — that is the map an agent
-orients itself with. Only depth 2 and below, and only subtrees big enough that a
-summary line is cheaper than the elements it replaces.
-
-## Known limits
+## Limits
 
 Honest ones, not a roadmap.
 
-| Case | Works? |
+| | |
 |---|:--|
-| buttons, menus, checkboxes, tabs, list rows | yes |
-| text fields, search fields, text areas | yes |
-| Electron apps (Slack, VS Code, Discord) | yes — but the tree builds lazily, so the first read can be nearly empty; call `get_app_state` again |
-| Return, Escape, stepper arrows | yes — `AXConfirm` / `AXCancel` / `AXIncrement` |
-| arbitrary chords (`⌘⇧P`, `f5`) | **no** — shared keyboard input is not synthesized |
-| canvas apps (Figma internals, games) | **no** — no AX elements to act on |
-| terminals | mostly no |
-| drag | **no** — macOS AX has no semantic drag |
+| buttons, menus, tabs, rows, text fields | yes |
+| Electron apps | yes — the tree builds lazily, so read twice |
+| Return, Escape, stepper arrows | yes, as AX verbs |
+| arbitrary chords (`⌘⇧P`), drag | **no** — no AX verb exists |
+| canvas apps, terminals | **no** — nothing to address |
 
-`set_value` **replaces** rather than appends; `type_text` appends. Apps that only
-react to real key events will ignore both.
-
-### Process-routed click fallback
-
-When an element has no `AXPress`, `AXPick`, or `AXConfirm`, `click` uses the
-cua-driver-derived `SLEventPostToPid` recipe. Results say `delivery: pid`. If
-SkyLight is unavailable or event construction fails, the action returns an
-error instead of moving the pointer.
-
-The event carries the target pid, window id, and window-local coordinates, so
-an occluding window or another Space cannot redirect it to an unrelated app.
-Immediately before posting, cua-rs re-enumerates that exact window and requires
-the same `(CGWindowID, pid)`, then recomputes window-local coordinates from its
-live frame. A closed/recycled window or an AX point that drifted outside it
-fails closed and asks for a fresh snapshot. The route neither activates the
-target app nor duplicates the event through the public process-post API.
-Every action result carries `delivery: ax` or `delivery: pid`, so callers can
-distinguish semantic accessibility actions from process-routed input.
-
-Every action result carries `delivery: ax` or `delivery: pid`, so a caller can
-tell a semantic accessibility action from process-routed input.
+`set_value` replaces, `type_text` appends, and an app that only reacts to real
+key events will ignore both. Controls with no AX action at all get a mouse event
+routed to the target process by window id, reported as `delivery: pid`; if that
+is unavailable the action fails rather than touching your pointer.
 
 ## The drawn cursor
 
-The AX path leaves nothing on screen — which is the point, but it also means a
-human watching has no way to tell an agent is doing anything. `cua-overlay` is
-a second, separate binary: a borderless transparent window, click-through,
-that draws an arrow wherever an action just landed and a click ring when it
-was a `click`. It never receives input itself, never takes focus, and never
-moves your real cursor — it is purely something to look at.
+The AX path leaves nothing on screen, which is the point — and also means you
+cannot see the agent working. `cua-overlay` is a separate binary that draws an
+arrow where an action landed: click-through, never focused, never your real
+cursor. It is ordered just above the target window, and hides itself whenever
+that app is not frontmost, so it cannot end up floating over your work.
 
-The overlay is ordered immediately above the exact target `CGWindowID`, not at
-a global always-on-top level. If another app covers the target window, it also
-covers the agent cursor. When a target window id cannot be resolved, the
-overlay hides instead of appearing above unrelated windows.
+<p align="center"><img src="assets/cursor-demo.png" width="640" alt="A mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
 
-Ordering alone is not trusted, because it stops meaning anything the moment the
-target window is not on the current Space — and the overlay joins every Space, so
-that moment arrives whenever you switch. It therefore also polls the frontmost
-application each frame and hides the arrow whenever the app it is pinned to is
-not frontmost, without asking why. That covers Space switches, full-screen apps
-and ordering races with one rule, and it fails in the safe direction: a false
-positive costs one hidden arrow that returns on the next action, a false negative
-is an arrow drawn over someone else's work.
-
-<p align="center"><img src="assets/cursor-demo.png" width="720" alt="The drawn cursor: a mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
-
-The shape is Lucide's `mouse-pointer-2` (MIT), the same one Figma and Notion
-already use to show where someone else is pointing, mirrored so it leans the
-one way a real macOS pointer never does — a glance is enough to tell it apart
-from yours. It is a plain filled path, not an image, so there is no asset to
-ship or scale.
-
-`cua-rs` looks for `cua-overlay` next to its own executable and spawns it the
-first time an action resolves a point to show. If it is not there, nothing
-breaks: marking the overlay is best-effort by design, so a missing binary
-just means no arrow, never a failed tool call.
-
-**The prebuilt release does not include it yet.** `install.sh` and the
-GitHub Release both ship `cua-rs` alone, so installing that way gives you a
-fully working server with no drawn cursor. To get one today, build both
-binaries from source and keep them in the same directory:
-
-```bash
-cargo build --release --workspace
-ls target/release/cua-rs target/release/cua-overlay   # both present
-```
+`cua-rs` spawns it if it sits next to the binary. **The prebuilt release ships
+`cua-rs` alone**, so build the workspace to get both.
 
 ## Development
 
@@ -448,74 +177,45 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ```text
-crates/cua-ax        safe AXUIElement wrapper, budgeted tree walker, AxNode
-crates/cua-capture   SCK window discovery + crash-isolated per-window PNG
-crates/cua-core      app resolution, worker thread, snapshot generations
-crates/cua-hid       pid-routed private input; no shared-cursor product path
-crates/cua-mcp       rmcp server, binary `cua-rs`
-crates/cua-overlay   the drawn cursor, binary `cua-overlay` — see above
+cua-ax        safe AXUIElement wrapper + budgeted tree walker
+cua-capture   window discovery + crash-isolated per-window PNG
+cua-core      app resolution, one native worker thread, snapshots
+cua-hid       process-routed input — the only crate that synthesizes events
+cua-mcp       the server, binary `cua-rs`
+cua-overlay   the drawn cursor
 ```
 
-Two design constraints worth knowing before touching the code:
+Two constraints worth knowing before touching it: every native call runs on one
+thread, because `AXUIElement` handles are honestly `!Send`; and every tree walk
+is budgeted, because an AX tree can be unbounded and is not guaranteed acyclic.
+[DESIGN.md](DESIGN.md) has the reasoning, the measurements, and the known weak
+spots.
 
-**All native work runs on one thread.** `Element` wraps a
-`CFRetained<AXUIElement>` and is honestly `!Send` — AX calls are synchronous IPC
-into another process's run loop. Instead of `unsafe impl Send` on FFI handles,
-`cua-core` funnels every native call onto one long-lived thread and blocks on a
-reply channel. It also serializes tool calls by construction.
-
-**Everything is budgeted.** An AX tree can be effectively unbounded
-(virtualized 100k-row tables) and is not guaranteed acyclic, so an uncapped walk
-is a hang, not a slow path. The walk is breadth-first on purpose: depth-first
-burns the whole element budget inside the first sidebar and never reaches the
-main content.
-
-CI runs on macOS runners only — every crate links AppKit, ApplicationServices
-and ScreenCaptureKit — and has neither grant, so it exercises the
-permission-free logic plus an MCP handshake smoke test. Anything touching a live
-UI is verified by hand.
-
-### `cua-ax` stands alone
-
-`cua-ax` is publishable on its own, and it is the piece the Rust ecosystem is
-actually missing. [`accessibility-sys`](https://crates.io/crates/accessibility-sys)
-has not shipped an API change since March 2025 despite ~177k downloads and 11
-dependent crates, and every existing Rust project driving macOS UI is either
-stuck on it or hand-rolling raw `core-foundation`.
+`cua-ax` is publishable on its own, and is the piece the Rust ecosystem is
+missing — [`accessibility-sys`](https://crates.io/crates/accessibility-sys) has
+not shipped an API change since March 2025, and
 [`objc2-application-services`](https://crates.io/crates/objc2-application-services)
-provides modern raw bindings but no safe layer. `cua-ax` is that layer, and it
-covers all 29 AX symbols a complete computer-use implementation needs.
+gives raw bindings with no safe layer.
 
 ## Prior art
 
-cua-rs is not the first Rust MCP server for macOS computer use, and this README
-would be dishonest if it implied otherwise.
-
 - [**trycua/cua**](https://github.com/trycua/cua/tree/main/libs/cua-driver) —
-  `cua-driver` (MIT) is larger, cross-platform and further along. Its `docs/`
-  and `Skills/cua-driver/MACOS.md` are the best free documentation of this
-  problem domain that exists. Read them.
+  larger, cross-platform, further along. Its docs are the best free writing on
+  this problem domain.
 - [**lahfir/agent-desktop**](https://github.com/lahfir/agent-desktop) — Rust AX
-  engine, headless-by-default, CLI rather than MCP.
+  engine, CLI rather than MCP.
 - [**minghinmatthewlam/computer-use-mcp**](https://github.com/minghinmatthewlam/computer-use-mcp) —
   same positioning, in Swift.
 
-What this project does differently:
+Chromium content degrades under any AX-only tool; the intended answer is to hand
+the web to [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) over CDP
+rather than fight `AXManualAccessibility`.
 
-1. **Modern `objc2` stack.** `objc2 0.6` + `objc2-application-services 0.3`
-   rather than `core-foundation` / `accessibility-sys`.
-2. **A reusable crate, not a monolith.** `cua-ax` ships on its own.
-3. **Chromium delegated, not coaxed.** Every AX-only tool degrades on Electron
-   and Chromium content. The intended answer here is to hand that to
-   [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) over CDP rather
-   than fight `AXManualAccessibility` — a composition the sibling servers make
-   natural:
-
-   | | |
-   |---|:--|
-   | [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) | web, over CDP |
-   | [bash-rs](https://github.com/maestrojeong/bash-rs-mcp) | shell, backgrounded |
-   | **cua-rs** | native macOS apps, over AX |
+| | |
+|---|:--|
+| [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) | web, over CDP |
+| [bash-rs](https://github.com/maestrojeong/bash-rs-mcp) | shell, backgrounded |
+| **cua-rs** | native macOS apps, over AX |
 
 ## License
 
