@@ -668,7 +668,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Read one app's front window: returns its accessibility tree and, by default, a screenshot taken from the same moment. For a dense app, pass skeleton=true first: large deep subtrees collapse to `(+N elements — pass scope_element_id=K to expand)`, which keeps the overall map cheap, then call again with scope_element_id=K to spend the whole element budget inside just that subtree. This MUST be called before acting on an app, because it assigns the `element_index` handles that click/set_value/scroll refer to. Lines starting with `[N]` are actionable targets; lines without a bracket are context only. Does not activate the app, move the cursor, or change focus, so it is safe to call while the user is working."
+        description = "Read one app's front window: returns its accessibility tree and, by default, a screenshot taken from the same moment. For a dense app, pass skeleton=true first: large deep subtrees collapse to `(+N elements — pass scope_element_id=K to expand)`, which keeps the overall map cheap, then call again with scope_element_id=K to spend the whole element budget inside just that subtree. This MUST be called before acting on an app, because it assigns the `element_index` handles that click/set_value/scroll refer to. Lines starting with `[N]` are actionable targets; lines without a bracket are context only. If the app has a menu or popover open, it is listed separately under `transient UI` — that is a different window with NO accessibility representation, so it never appears in the tree and has to be read from the screenshot and driven by shortcut or window coordinate. Does not activate the app, move the cursor, or change focus, so it is safe to call while the user is working."
     )]
     async fn get_app_state(
         &self,
@@ -732,11 +732,35 @@ impl CuaServer {
             header.push_str(&format!("warning: {w}\n"));
         }
 
-        let mut blocks = vec![ContentBlock::text(format!("{header}\n{}", state.tree))];
+        let popups = render_popups(&state.popups);
+        let mut blocks = vec![ContentBlock::text(format!(
+            "{header}{popups}\n{}",
+            state.tree
+        ))];
         if let Some(shot) = state.screenshot {
+            // The extent is stated, not assumed. `screencapture -l<id>`
+            // photographs the window group, so with a menu open the image covers
+            // the union of the window and the menu — bigger than the window, and
+            // with the scale to match. A caller converting a pixel back to a
+            // point has to divide by *this* scale and measure from *this*
+            // origin, so both are printed rather than left to be inferred from
+            // the window frame.
+            let grew = shot.frame.size.width > shot.window_frame.size.width
+                || shot.frame.size.height > shot.window_frame.size.height;
             blocks.push(ContentBlock::text(format!(
-                "screenshot: {}x{} px, {:.2} px per point",
-                shot.width, shot.height, shot.scale
+                "screenshot: {}x{} px, {:.2} px per point, covering {:.0},{:.0} {:.0}x{:.0} points{}",
+                shot.width,
+                shot.height,
+                shot.scale,
+                shot.frame.origin.x,
+                shot.frame.origin.y,
+                shot.frame.size.width,
+                shot.frame.size.height,
+                if grew {
+                    "  (LARGER than the window itself: macOS captures a window together with the pop-up UI attached to it, so this one image already contains the menu — there is no separate screenshot to ask for. Subtract the origin above, not the window's, when turning a pixel into a point)"
+                } else {
+                    ""
+                }
             )));
             blocks.push(ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&shot.png),
@@ -830,7 +854,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "LAST RESORT: click a bare point inside a window, with no element behind it. Use this ONLY for custom-drawn surfaces that genuinely publish no children — maps, charts, canvases, game views — after `click` and `find` have shown there is no element to address. It is not a retry for a `click` that failed and it is never chosen automatically, because a point that covers nothing is indistinguishable from a typo. x and y are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), NOT screen coordinates: they are re-anchored to the window's live position just before the event is sent, so moving the window between the read and the click is harmless. Delivery is the same pid-routed SkyLight path as `click` — the cursor, keyboard focus, frontmost app and Space are untouched — but the result is labelled `pid (no element)` because NOTHING WAS VERIFIED. There is no element to inspect afterwards, so a success means only that the events were delivered to that pixel of that window; whether anything was there, and whether it was the right thing, is entirely the caller's aim. Requires that the most recent get_app_state of this app read this same window_id."
+        description = "Click a bare point inside a window, with no element behind it. TWO USES. (1) TRANSIENT UI — a pop-up this app has open, reported as `transient UI open above this app's content`. That is a separate window at layer 101 which accessibility does not describe at all: no elements, no indices, `find` matches nothing in it, `click` has nothing to address, so a window-local coordinate is the only addressing that exists and this tool accepts the pop-up's own window_id. READ THIS BEFORE USING IT ON A MENU: on a standard macOS menu the event is delivered and the menu DISMISSES WITHOUT SELECTING ANYTHING — measured on KakaoTalk, twice, on two different rows. A menu tracks the real pointer to decide what is highlighted, and cua-rs never moves the real pointer. Use press_key with the item's own keyboard shortcut instead (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘, …), which is measured to activate the item; cua-rs does not read those shortcuts out of the image for you, so look at the screenshot. This tool remains the right one for a pop-up that is not a menu — a popover or panel with ordinary event-driven views — and for dismissing a menu when `escape` does not. x/y are measured from the POP-UP's own top-left corner, and the screenshot already contains the menu (macOS captures a window together with the pop-up attached to it, so there is no separate image to fetch). (2) LAST RESORT for ordinary windows: use it ONLY for custom-drawn surfaces that genuinely publish no children — maps, charts, canvases, game views — after `click` and `find` have shown there is no element to address. There, it is not a retry for a `click` that failed and it is never chosen automatically, because a point that covers nothing is indistinguishable from a typo. x and y are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), NOT screen coordinates: they are re-anchored to the window's live position just before the event is sent, so moving the window between the read and the click is harmless. Delivery is the same pid-routed SkyLight path as `click` — the cursor, keyboard focus, frontmost app and Space are untouched — but the result is labelled `pid (no element)` because NOTHING WAS VERIFIED. There is no element to inspect afterwards, so a success means only that the events were delivered to that pixel of that window; whether anything was there, and whether it was the right thing, is entirely the caller's aim. Requires that the most recent get_app_state of this app read this same window_id, OR that window_id is a pop-up this same app currently has open (which cua-rs reported to you when it opened)."
     )]
     async fn click_in_window(
         &self,
@@ -971,7 +995,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. SAFETY: `cmd+delete`, and a bare `delete`/`backspace` anywhere that is not a text field, are refused unless you also pass confirm_destructive=true."
+        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. THIS IS HOW YOU DRIVE AN OPEN MENU, and the only way measured to work. When a pop-up is up — cua-rs reports it as `transient UI open above this app's content` — accessibility cannot see inside it, and a coordinate click was measured to dismiss the menu without selecting anything, because the menu tracks the real pointer and cua-rs never moves it. Menu items nearly always draw their own key equivalent beside them (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘,, ⌥⌘⌫); read one off the screenshot and press it here. It goes through the app's own key handling, so it activates the item the app associates with that chord rather than a pixel you aimed at — verified on KakaoTalk, where ⌘T on the open chat-room menu toggled the window's always-on-top state. An item with no shortcut may not be reachable at all. cua-rs does not parse those shortcuts out of the image and will not do it for you — read them yourself. `escape` dismisses an open menu. SAFETY: `cmd+delete`, and a bare `delete`/`backspace` anywhere that is not a text field, are refused unless you also pass confirm_destructive=true — and note that a menu shortcut can be destructive too (⌥⌘⌫ leaves a KakaoTalk chat room), so read what the item says before pressing it."
     )]
     async fn press_key(
         &self,
@@ -1092,6 +1116,49 @@ impl CuaServer {
     }
 }
 
+/// Render the transient UI an app has up, or nothing at all when it has none.
+///
+/// Printed as its own block rather than folded into the tree, because it is not
+/// part of the tree and saying otherwise would be the lie this feature exists to
+/// stop. A pop-up is a separate window with no accessibility representation:
+/// there are no element indices inside it, `find` will not match its items, and
+/// `click` has nothing to address. What it has is a window id and a frame, and
+/// those are exactly what `click_in_window` takes.
+fn render_popups(popups: &[cua_core::TransientWindow]) -> String {
+    if popups.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\ntransient UI open above this app's content (topmost first):\n");
+    for p in popups {
+        s.push_str(&format!(
+            "  window_id={} layer={} at {:.0},{:.0} size {:.0}x{:.0} points{}\n",
+            p.id,
+            p.layer,
+            p.frame.origin.x,
+            p.frame.origin.y,
+            p.frame.size.width,
+            p.frame.size.height,
+            match p.appeared {
+                Some(true) => "  <- OPENED just now",
+                Some(false) => "  (was already open)",
+                None => "",
+            }
+        ));
+    }
+    s.push_str(
+        "  Accessibility cannot see inside these: no elements, no indices, and `find` will not \
+         match their contents. Read them from the screenshot, which already includes them. \
+         TO ACTIVATE AN ITEM, USE press_key WITH THE ITEM'S OWN KEYBOARD SHORTCUT (⌘I, ⌘Y, ⌘B, \
+         ⌘T, ⌥⌘, …) — measured to work on a real menu. click_in_window against the pop-up's \
+         window_id is accepted and the event is delivered, but on a standard macOS menu it was \
+         measured to DISMISS the menu without selecting anything: the menu tracks the real \
+         pointer, which cua-rs will not move. So a coordinate is the fallback for pop-ups that \
+         are not menus, not the way to pick a menu row. An item with no shortcut may not be \
+         reachable at all. press_key `escape` dismisses the menu.\n",
+    );
+    s
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "granted"
@@ -1148,6 +1215,10 @@ fn render_action(r: &cua_core::ActionResult) -> String {
     } else if r.ui_changed != cua_core::Observed::Changed {
         s.push_str("  (heuristic only — the tree diff below is the real answer)");
     }
+    // Before the tree diff, deliberately. When an action opens a menu the diff
+    // is the least informative part of the answer — the window it describes did
+    // not change, because everything that happened happened somewhere else.
+    s.push_str(&render_popups(&r.popups));
     if let Some(focus) = &r.focus {
         s.push_str(&render_focus(focus));
     }

@@ -147,7 +147,7 @@ and `click`, `click_in_window`, `drag` and `hover` all honour it.
 | `click` | a pid-routed event, no `AXPress`/`AXPick`/`AXConfirm` attempt; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count`, `confirm_destructive` for a Delete-shaped target |
 | `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
 | — | every action returns what it did — verb, target, `delivery`, and a tree diff by default. Nothing is fire-and-forget |
-| `click_in_window` | last resort: a bare point, no element, nothing verified |
+| `click_in_window` | a bare point, no element, nothing verified — last resort on a canvas, and the only addressing a pop-up window has |
 | `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call. `type_text` takes `mechanism: "keystrokes"` for targets that ignore `AXValue` |
 | `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
 | `scroll` · `perform_secondary_action` | pages through AX, or a wheel event where there is no AX verb; any AX verb |
@@ -164,6 +164,8 @@ one of them.
 | | |
 |---|:--|
 | buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
+| **seeing a pop-up menu a click opened** | yes. It is a separate window with no accessibility representation, so it is never in the tree; `get_app_state` and every action's own result list it — id, level, frame, and whether it just appeared — and the window screenshot already contains it, because macOS photographs a window together with the pop-up attached to it |
+| **picking a row in that menu** | **only by its keyboard shortcut.** `press_key` with the item's own key equivalent (⌘I, ⌘T, ⌥⌘,) is measured to activate it. A `click_in_window` coordinate is delivered and *dismisses* the menu without selecting anything — a menu tracks the real pointer, and cua-rs does not move the real pointer. Reading the item labels and their shortcuts off the screenshot is yours; cua-rs does no OCR |
 | any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed |
 | right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed — **built, not yet verified on a real app** |
 | drag | yes: a real down, interpolated moves and an up, both ends in one window — **built, not yet verified on a real drag source** |
@@ -221,7 +223,7 @@ window, and nothing when you are not.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 184 tests, no permissions needed
+cargo test --workspace          # 205 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 
 # read-back tests for the keyboard path: needs an Accessibility grant,

@@ -139,9 +139,28 @@ pub struct WindowShot {
     /// divide to go back. Includes both the display's backing scale and any
     /// downscale [`capture_window`] applied.
     pub scale: f64,
-    /// The window's frame in global points, as ScreenCaptureKit reports it.
-    /// This is the origin that AX coordinates are relative to.
+    /// The screen rect this image actually covers, in global points. Subtract
+    /// its origin from an AX point and multiply by [`WindowShot::scale`] to get
+    /// a pixel in `png`.
+    ///
+    /// Usually the requested window's own frame, and deliberately **not**
+    /// assumed to be. `screencapture -l<id>` photographs the window *group*:
+    /// while a pop-up menu is open, asking for either the parent window's id or
+    /// the menu's returns the same image, covering the union of the two. On
+    /// KakaoTalk that was a parent at `46,86 924x770` plus a menu at
+    /// `938,599 202x318`, and both ids returned one 2188x1662 image — exactly
+    /// `1094x831` points at 2x. Taking the requested window's frame as the
+    /// extent made `scale` read 2.37 for the parent and 10.83 for the menu
+    /// instead of 2.0, so every pixel-to-point conversion against that image was
+    /// wrong while a menu was up. See [`WindowShot::window_frame`].
     pub frame: CGRect,
+    /// The frame of the window that was actually asked for.
+    ///
+    /// Differs from [`WindowShot::frame`] exactly when the image came back
+    /// larger than the window — the caller can compare the two to find out that
+    /// something else of this app is in the picture, and where the window it
+    /// asked about sits inside it.
+    pub window_frame: CGRect,
 }
 
 /// A window as seen by ScreenCaptureKit.
@@ -183,6 +202,22 @@ pub struct WindowInfo {
 /// exactly like "this control ignores synthetic clicks".
 const MAX_ORDINARY_WINDOW_LEVEL: i64 = 3;
 
+/// `kCGMainMenuWindowLevel`. The system menu bar itself, never a pop-up.
+const MAIN_MENU_WINDOW_LEVEL: i64 = 24;
+
+/// `kCGStatusWindowLevel` — status items, and the level cua-rs's own
+/// drawn-cursor overlay uses.
+///
+/// Excluded from the pop-up rule in both directions. A menu-bar extra is not a
+/// thing an agent opened, and cua-rs must never report or click its own overlay:
+/// that would be the tool reading its own drawing back as if it were the app's.
+/// Per-pid filtering already keeps the overlay out, since it is a separate
+/// process; this is the second lock on the same door.
+const OVERLAY_WINDOW_LEVEL: i64 = 25;
+
+/// Smallest side, in points, a window can have and still be worth addressing.
+const MIN_TARGET_SIDE: f64 = 40.0;
+
 impl WindowInfo {
     /// Whether this looks like a real document/content window rather than
     /// chrome.
@@ -195,9 +230,53 @@ impl WindowInfo {
     /// Negative levels are desktop and wallpaper backing stores, which are
     /// never a target either.
     pub fn is_plausible_target(&self) -> bool {
-        (0..=MAX_ORDINARY_WINDOW_LEVEL).contains(&self.layer)
-            && self.frame.size.width >= 40.0
-            && self.frame.size.height >= 40.0
+        (0..=MAX_ORDINARY_WINDOW_LEVEL).contains(&self.layer) && self.is_big_enough()
+    }
+
+    /// Whether this looks like transient UI an app put up above its own
+    /// content: a pop-up menu, a context menu, a menu the menu bar opened.
+    ///
+    /// This is the other half of the window world, and until now cua-rs had no
+    /// name for it. Measured on KakaoTalk: clicking a chat window's hamburger
+    /// creates a second window of the same process at level 101, 202x318, on
+    /// screen within ~50 ms and still there 2.5 s later. Accessibility does not
+    /// describe it at all — the application element has only its two
+    /// `AXMenuBar` children, and a hit test inside the menu's own frame returns
+    /// the menu bar as a fallback. The window server is the only thing that can
+    /// see it, so the window list is the only place it can be reported from.
+    ///
+    /// Above ordinary content, on screen, and big enough to hold a control. The
+    /// menu bar and the status level are cut out by name rather than by height,
+    /// because a status item is not a pop-up an action opened and the overlay is
+    /// cua-rs's own.
+    pub fn is_transient_popup(&self) -> bool {
+        self.on_screen
+            && self.layer > MAX_ORDINARY_WINDOW_LEVEL
+            && self.layer != MAIN_MENU_WINDOW_LEVEL
+            && self.layer != OVERLAY_WINDOW_LEVEL
+            && self.is_big_enough()
+    }
+
+    /// Whether a pid-routed event may be stamped with this window's number.
+    ///
+    /// Wider than [`WindowInfo::is_plausible_target`], and the gap between them
+    /// is deliberate. That predicate answers "is this the window the
+    /// accessibility tree is describing", which chooses what a snapshot is *of*
+    /// and must stay narrow: a menu picked there would have its number stamped
+    /// onto clicks meant for content, which is the failure the level cap was
+    /// raised to fix in the first place. This one answers a different question —
+    /// "may the caller aim at this window on purpose" — and a pop-up has to
+    /// answer yes, because accessibility cannot see inside one and a
+    /// window-local coordinate is the only way in.
+    ///
+    /// Desktop and wallpaper levels, the menu bar, the status level and anything
+    /// too small to hold a control stay refused under both.
+    pub fn is_addressable_target(&self) -> bool {
+        self.is_plausible_target() || self.is_transient_popup()
+    }
+
+    fn is_big_enough(&self) -> bool {
+        self.frame.size.width >= MIN_TARGET_SIDE && self.frame.size.height >= MIN_TARGET_SIDE
     }
 }
 
@@ -247,11 +326,23 @@ pub fn capture_window(window_id: CGWindowID, max_dim: u32) -> Result<WindowShot>
 
     // Re-enumerate immediately before capture. Besides providing the live
     // frame, this rejects a closed/recycled window before invoking a tool.
-    let frame = list_windows()?
-        .into_iter()
+    // Costs p50 ~28 ms with a couple of hundred windows live, which is why the
+    // same list is also mined for the pop-ups that may end up in the image
+    // rather than enumerated a second time below.
+    let live = list_windows()?;
+    let window = live
+        .iter()
         .find(|window| window.id == window_id)
-        .ok_or(CaptureError::WindowGone(window_id))?
-        .frame;
+        .ok_or(CaptureError::WindowGone(window_id))?;
+    let frame = window.frame;
+    let pid = window.pid;
+    // Every pop-up of the same app is a candidate for having been swept into
+    // the image, because `screencapture -l<id>` photographs the window group.
+    let attached: Vec<CGRect> = live
+        .iter()
+        .filter(|w| w.pid == pid && w.id != window_id && w.is_transient_popup())
+        .map(|w| w.frame)
+        .collect();
     if !valid_capture_frame(frame) {
         return Err(CaptureError::InvalidFrame {
             window_id,
@@ -287,13 +378,75 @@ pub fn capture_window(window_id: CGWindowID, max_dim: u32) -> Result<WindowShot>
         (width, height) = png_dimensions(&png)?;
     }
 
+    let (covered, scale) = capture_extent(frame, &attached, width, height);
     Ok(WindowShot {
         png,
         width,
         height,
-        scale: width as f64 / frame.size.width,
-        frame,
+        scale,
+        frame: covered,
+        window_frame: frame,
     })
+}
+
+/// Work out which screen rect the returned pixels actually cover.
+///
+/// `screencapture -l<id>` does not promise one window's bounds; it returns the
+/// window and whatever is attached to it, and the caller only finds out from the
+/// pixel count. So rather than assume, this tests the hypotheses against the
+/// image: a capture of rect `r` must have the same pixels-per-point
+/// horizontally and vertically, and only the right `r` does. The requested frame
+/// is tried first, then the frame unioned with each same-app pop-up, then with
+/// all of them.
+///
+/// When nothing fits, the requested frame is returned with the horizontal ratio,
+/// which is the behaviour this replaced. A guess is not improved by refusing to
+/// make one, but it is improved by only making it when the evidence is absent.
+fn capture_extent(frame: CGRect, attached: &[CGRect], width: u32, height: u32) -> (CGRect, f64) {
+    /// Ratios this far apart are not the same number. Rounding at the edges of a
+    /// capture is worth a fraction of a percent; a wrong extent is worth tens.
+    const RATIO_TOLERANCE: f64 = 0.01;
+
+    let mut candidates = Vec::with_capacity(attached.len() + 2);
+    candidates.push(frame);
+    for popup in attached {
+        candidates.push(union(frame, *popup));
+    }
+    if attached.len() > 1 {
+        candidates.push(attached.iter().fold(frame, |acc, p| union(acc, *p)));
+    }
+
+    let mut best: Option<(f64, CGRect, f64)> = None;
+    for rect in candidates {
+        if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+            continue;
+        }
+        let sx = width as f64 / rect.size.width;
+        let sy = height as f64 / rect.size.height;
+        let error = (sx - sy).abs() / sx.max(sy);
+        if best.as_ref().is_none_or(|(e, _, _)| error < *e) {
+            best = Some((error, rect, (sx + sy) / 2.0));
+        }
+    }
+
+    match best {
+        Some((error, rect, scale)) if error <= RATIO_TOLERANCE => (rect, scale),
+        _ => (frame, width as f64 / frame.size.width),
+    }
+}
+
+fn union(a: CGRect, b: CGRect) -> CGRect {
+    let min_x = a.origin.x.min(b.origin.x);
+    let min_y = a.origin.y.min(b.origin.y);
+    let max_x = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+    let max_y = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+    CGRect {
+        origin: objc2_core_foundation::CGPoint { x: min_x, y: min_y },
+        size: objc2_core_foundation::CGSize {
+            width: max_x - min_x,
+            height: max_y - min_y,
+        },
+    }
 }
 
 fn valid_capture_frame(frame: CGRect) -> bool {
@@ -505,6 +658,123 @@ mod tests {
         )));
     }
 
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect {
+            origin: objc2_core_foundation::CGPoint { x, y },
+            size: objc2_core_foundation::CGSize { width, height },
+        }
+    }
+
+    fn window(layer: i64, width: f64, height: f64) -> WindowInfo {
+        WindowInfo {
+            id: 1,
+            title: None,
+            pid: 1,
+            bundle_id: None,
+            app_name: None,
+            frame: rect(0.0, 0.0, width, height),
+            on_screen: true,
+            layer,
+        }
+    }
+
+    #[test]
+    fn a_popup_is_recognised_above_the_ordinary_levels_only() {
+        // The boundary, from both sides. Level 3 is `kCGFloatingWindowLevel`
+        // *and* `kCGTornOffMenuWindowLevel`, so it stays ordinary content: an
+        // app's floating chat window is not transient UI a click just opened.
+        assert!(!window(3, 800.0, 600.0).is_transient_popup());
+        assert!(window(4, 800.0, 600.0).is_transient_popup());
+        // The measured case: KakaoTalk's chat-room hamburger menu.
+        assert!(window(101, 202.0, 318.0).is_transient_popup());
+    }
+
+    #[test]
+    fn the_menu_bar_the_overlay_and_the_desktop_are_not_popups() {
+        assert!(
+            !window(24, 1512.0, 300.0).is_transient_popup(),
+            "the system menu bar is not a pop-up an action opened"
+        );
+        assert!(
+            !window(25, 800.0, 600.0).is_transient_popup(),
+            "cua-rs must never read its own drawn-cursor overlay back as app UI"
+        );
+        assert!(
+            !window(-2147483623, 1512.0, 982.0).is_transient_popup(),
+            "desktop backing stores are below ordinary content, not above it"
+        );
+        for w in [window(24, 1512.0, 300.0), window(25, 800.0, 600.0)] {
+            assert!(!w.is_addressable_target(), "and none of them is clickable");
+        }
+    }
+
+    #[test]
+    fn a_popup_has_to_be_on_screen_and_big_enough() {
+        let mut offscreen = window(101, 202.0, 318.0);
+        offscreen.on_screen = false;
+        assert!(
+            !offscreen.is_transient_popup(),
+            "a menu nobody can see is not one a caller can click"
+        );
+
+        assert!(
+            !window(101, 39.0, 318.0).is_transient_popup(),
+            "below the size floor on either side"
+        );
+        assert!(!window(101, 202.0, 39.0).is_transient_popup());
+        assert!(
+            window(101, 40.0, 40.0).is_transient_popup(),
+            "the floor itself is allowed"
+        );
+    }
+
+    #[test]
+    fn the_capture_extent_is_read_off_the_pixels_not_assumed() {
+        // Measured on KakaoTalk: parent window 46,86 924x770 with its menu at
+        // 938,599 202x318, and `screencapture -l<id>` returned the same
+        // 2188x1662 image for *either* id. That is the union, 1094x831 points
+        // at 2x — and taking the requested frame as the extent would have
+        // reported the parent at 2.37 px/pt and the menu at 10.83.
+        let parent = rect(46.0, 86.0, 924.0, 770.0);
+        let menu = rect(938.0, 599.0, 202.0, 318.0);
+
+        let (covered, scale) = capture_extent(parent, &[menu], 2188, 1662);
+        assert_eq!((covered.size.width, covered.size.height), (1094.0, 831.0));
+        assert!((scale - 2.0).abs() < 1e-9, "scale was {scale}");
+
+        // Asking for the menu returns the same picture, and must describe it
+        // the same way.
+        let (covered, scale) = capture_extent(menu, &[parent], 2188, 1662);
+        assert_eq!((covered.origin.x, covered.origin.y), (46.0, 86.0));
+        assert!((scale - 2.0).abs() < 1e-9, "scale was {scale}");
+    }
+
+    #[test]
+    fn a_window_with_no_popup_open_keeps_its_own_frame() {
+        let frame = rect(46.0, 86.0, 924.0, 770.0);
+        let (covered, scale) = capture_extent(frame, &[], 1848, 1540);
+        assert_eq!((covered.size.width, covered.size.height), (924.0, 770.0));
+        assert!((scale - 2.0).abs() < 1e-9);
+
+        // A pop-up that is open but was plainly not in this picture must not
+        // rewrite the extent either.
+        let elsewhere = rect(2000.0, 2000.0, 202.0, 318.0);
+        let (covered, _) = capture_extent(frame, &[elsewhere], 1848, 1540);
+        assert_eq!(covered.origin.x, 46.0);
+        assert_eq!(covered.size.width, 924.0);
+    }
+
+    #[test]
+    fn an_unexplainable_image_falls_back_to_the_requested_frame() {
+        // No hypothesis fits, so the old behaviour stands rather than a
+        // union being adopted on no evidence.
+        let frame = rect(0.0, 0.0, 800.0, 600.0);
+        let popup = rect(100.0, 100.0, 200.0, 200.0);
+        let (covered, scale) = capture_extent(frame, &[popup], 999, 111);
+        assert_eq!(covered.size.width, 800.0);
+        assert!((scale - 999.0 / 800.0).abs() < 1e-9);
+    }
+
     #[test]
     fn png_dimensions_read_ihdr_without_decoding_pixels() {
         let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
@@ -568,13 +838,22 @@ mod tests {
             "floating-level content windows are ordinary targets"
         );
 
+        // A pop-up menu is still not the window an accessibility tree is
+        // describing — that is what this predicate answers, and answering yes
+        // here would let a menu be chosen as an app's snapshot window and have
+        // its number stamped onto clicks meant for content. Being *addressable*
+        // is a different question, settled by the test below.
         let popup_menu = WindowInfo {
             layer: 101,
             ..base.clone()
         };
         assert!(
             !popup_menu.is_plausible_target(),
-            "pop-up menu windows are not targets"
+            "a pop-up menu is never the window a snapshot is of"
+        );
+        assert!(
+            popup_menu.is_addressable_target(),
+            "but a caller may aim at one on purpose"
         );
 
         let desktop = WindowInfo {
