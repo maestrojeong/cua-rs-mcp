@@ -197,6 +197,12 @@ fn main() -> anyhow::Result<()> {
                      CLICK DELIVERY:\n  \
                        AXPress/AXPick/AXConfirm first; custom-drawn controls use\n                         \
                        process-routed SkyLight events. Neither path moves the cursor.\n\n\
+                     SAFETY GATES:\n  \
+                       credential managers and security surfaces  refused (CUA_ALLOW_FORBIDDEN_TARGETS=1)\n  \
+                       destructive-looking targets                need confirm_destructive on the call\n  \
+                       locked screen or screen saver              refused\n  \
+                       human using the driven app                 off (CUA_YIELD_TO_HUMAN=1)\n  \
+                       HTTP mode                                  bearer token, printed at startup\n\n\
                      Requires Accessibility, and Screen Recording for screenshots.",
                     env!("CARGO_PKG_VERSION")
                 );
