@@ -1362,6 +1362,29 @@ action reports `ui_changed: no` while something certainly happened. That
 particular blind spot is what the `focus` field on pid-routed keyboard results
 covers — it compares the *element*, not a string built from it.
 
+**`is_transient_popup()` requiring `isOnScreen()` is right, and the doubt about
+it was a different window.** A menu of a buried app was once seen missing from the
+pop-up list while apparently open, which would make the predicate wrong. Measured
+on one app at one moment, with a terminal frontmost:
+
+| opened by | `isOnScreen` | reported |
+|---|:-:|:-:|
+| a right click, over its own window | `true` | yes |
+| an `AXPress` on its top-level menu bar item | `false` | no |
+
+Both are correct. A context menu belongs to the window it was opened over, so a
+background app can present one. A menu *bar* menu belongs to the **active** app's
+menu bar: pressing a background app's top-level item creates the window, and
+macOS never puts it on screen, because the menu bar on screen is somebody else's.
+A predicate answering "did this app put something on screen" has to say no to a
+window the window server says is not on screen — and `is_addressable_target()`
+has to refuse it too, since aiming a click at an unpresented window aims at
+nothing.
+
+Nothing is lost by that. `menu_bar` presses a row through accessibility and never
+opens a menu, so this window is not one cua-rs produces on purpose;
+`examples/popup_visibility.rs` is kept to re-take the reading.
+
 **The settle polls now, and a menu action still needs a re-read.** The 120 ms
 wait before `ui_changed` was a fixed sleep; it polls the fingerprint every 16 ms
 and returns the moment it moves, so a change that lands in one frame is reported

@@ -5,6 +5,27 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## Unreleased
+
+### `is_transient_popup()` requiring `isOnScreen()` was right
+
+A menu of a buried app had been seen missing from the pop-up list while
+apparently open, which would have made the predicate wrong. Measured on one app
+at one moment with a terminal frontmost, and the answer depends on how the menu
+was opened:
+
+| opened by | `isOnScreen` | reported |
+|---|:-:|:-:|
+| a right click, over its own window | `true` | yes |
+| an `AXPress` on its top-level menu bar item | `false` | no |
+
+Both correct. A context menu belongs to the window it was opened over, so a
+background app can present one. A menu *bar* menu belongs to the **active** app's
+menu bar: pressing a background app's top-level item creates the window and macOS
+never puts it on screen, because the menu bar on screen is somebody else's. No
+code changed; `examples/popup_visibility.rs` is new and keeps the reading
+re-takeable, and DESIGN §10 records it.
+
 ## 0.8.0
 
 The safety gate learned to read the question a dialog is asking, a shortcut-less
