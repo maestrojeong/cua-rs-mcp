@@ -629,7 +629,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press a background-safe semantic key on an element. `return`/`enter` and `escape` map to AXConfirm and AXCancel, and `up`/`down` map to AXIncrement/AXDecrement on steppers and sliders. Arbitrary keys and chords are refused because they require shared HID input and would steal keyboard focus. Successful results always report `delivery: ax`."
+        description = "Press any key or chord on an element — `return`, `escape`, `cmd+shift+p`, `ctrl+alt+delete`, a bare letter. The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first. The result reports `focus: verified | unverified | mismatched` so you can tell what actually happened; `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. Successful results report `delivery: pid (keyboard)`."
     )]
     async fn press_key(
         &self,
@@ -804,8 +804,49 @@ fn render_action(r: &cua_core::ActionResult) -> String {
     } else if r.ui_changed != cua_core::Observed::Changed {
         s.push_str("  (heuristic only — the tree diff below is the real answer)");
     }
+    if let Some(focus) = &r.focus {
+        s.push_str(&render_focus(focus));
+    }
     if let Some(state) = &r.state {
         s.push_str(&render_post_action_state(state));
+    }
+    s
+}
+
+/// Say where the input actually went, for the paths where that is a real
+/// question.
+///
+/// A pid-routed key event is addressed to a process and arrives at that
+/// process's first responder, so "it succeeded" and "it landed on the element
+/// you named" are two different claims. Printing only the first one is what
+/// let a keystroke into the wrong field of the same app read as an unqualified
+/// success — `ui_changed` cannot catch it either, since two text fields of one
+/// window usually share a role and have no title, leaving the fingerprint
+/// identical.
+fn render_focus(focus: &cua_core::FocusCheck) -> String {
+    let mut s = format!("\nfocus: {}", focus.state.as_str());
+    s.push_str(match focus.state {
+        cua_core::FocusState::Verified => {
+            "  (the app names the element you addressed as its focused one, so this is where the input went)"
+        }
+        cua_core::FocusState::Unverified => {
+            "  (this app published no focused element, so nothing here says where the input went — NOT evidence that it missed. Re-read the element to be sure)"
+        }
+        cua_core::FocusState::Mismatched => {
+            "  (the app names a DIFFERENT element of the same process as focused — the input most likely went there instead. It cannot have reached another app: the event was routed to this pid only. Click the element first, or set CUA_KEY_STRICT_FOCUS=1 to refuse rather than deliver)"
+        }
+    });
+    if let Some(other) = &focus.focused_instead {
+        s.push_str(&format!("\n  focused instead: {other}"));
+    }
+    if !focus.focus_write_accepted {
+        s.push_str(&format!(
+            "\n  AXFocused write refused: {} (not itself a failure — AXFocused is unsettable on many elements, including Terminal's text view)",
+            focus
+                .focus_write_error
+                .as_deref()
+                .unwrap_or("no reason given")
+        ));
     }
     s
 }

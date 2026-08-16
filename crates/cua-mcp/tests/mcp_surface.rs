@@ -248,6 +248,29 @@ fn cua_key_ax_only_restores_the_old_chord_refusal() {
 }
 
 #[test]
+fn press_key_promises_a_focus_verdict() {
+    // The whole point of the focus check is that a caller knows to look for
+    // it. If the tool description stops saying so, an agent has no reason to
+    // read the field and the honesty is wasted.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let press_key = tools
+        .iter()
+        .find(|t| t["name"] == "press_key")
+        .expect("press_key");
+    let description = press_key["description"].as_str().unwrap_or_default();
+    for word in ["verified", "unverified", "mismatched"] {
+        assert!(
+            description.contains(word),
+            "press_key must document the `{word}` focus verdict: {description}"
+        );
+    }
+}
+
+#[test]
 fn removed_allow_hid_option_is_rejected() {
     let output = Command::new(env!("CARGO_BIN_EXE_cua-rs"))
         .arg("--allow-hid")

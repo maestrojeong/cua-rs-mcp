@@ -258,6 +258,22 @@ pub fn require_trusted() -> Result<()> {
 #[derive(Clone)]
 pub struct Element(CFRetained<AXUIElement>);
 
+/// Two handles are equal when accessibility says they name the same object.
+///
+/// This is `CFEqual`, not pointer identity, and the difference is the whole
+/// point: an app hands out a *fresh* `AXUIElementRef` for each read, so the
+/// element that came back from `AXFocusedUIElement` is never the same pointer
+/// as the one a snapshot retained earlier even when it is the same text field.
+/// Comparing pointers would report "different" for every pair and make any
+/// focus check that used it uselessly pessimistic.
+impl PartialEq for Element {
+    fn eq(&self, other: &Self) -> bool {
+        *self.0 == *other.0
+    }
+}
+
+impl Eq for Element {}
+
 impl fmt::Debug for Element {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Element")
