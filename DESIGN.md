@@ -1074,8 +1074,9 @@ these are the wiring, which does
 | **wheel momentum and rubber-banding** | a trackpad fling is a phase-tagged stream of events, not a delta. Nothing has needed it |
 | AX notification streams (`AXObserver`) | would replace the fingerprint heuristic in §10 |
 | ~~menu invocation~~ | **the menu opens, and cua-rs now reports and photographs it — but a coordinate cannot pick a row. §10** |
-| reading a pop-up menu's items | it has no accessibility representation to read them from, and cua-rs does no OCR. The caller reads the screenshot |
-| parsing key equivalents out of a menu image | the shortcut is the way to activate an item, and recognising `⌥⌘⌫` from pixels well enough to *press* it is a different risk from describing it. The caller reads it |
+| reading a pop-up menu's items | it has no accessibility representation to read them from, and cua-rs does no OCR. The caller reads the screenshot — or reads the same rows off `menu_bar`, where most apps draw them a second time |
+| **choosing a shortcut-less row inside a pop-up** | **no, and four routes were measured before saying so — §10.** The arrow keys do reach the menu and do move the highlight, but nothing activates the highlighted row, on any event recipe. `menu_bar` reaches the row's twin where the app has one |
+| parsing key equivalents out of a menu image | the shortcut is the way to activate an item, and recognising `⌥⌘⌫` from pixels well enough to *press* it is a different risk from describing it. Unchanged — but `menu_bar` now reports key equivalents as *data*, which is not reading pixels and is the way to learn one |
 | Spaces handling | off-Space windows are observation-only, matching prior art |
 | per-app leases | needed once two agents share one machine |
 | ~~yield-to-human detection~~ | **built, opt-in, `CUA_YIELD_TO_HUMAN=1` — see below** |
@@ -1257,6 +1258,116 @@ equivalents, from the image. The shortcut is what activates an item, and a
 misread `⌥⌘⌫` presses "leave the chat room". Describing pixels and *acting* on a
 guess about pixels are different risks, and cua-rs does the first by handing over
 the screenshot and refuses the second.
+
+### A row with no shortcut: four candidates, three dead, one that ships
+
+Points 1-6 leave a specific hole. An item that draws a key equivalent can be
+activated; `톡게시판` and `채팅방 서랍` draw none, so nothing measured reached
+them. Four routes were tried against that hole, on TextEdit's text-view context
+menu (a level-101 window, 181x377, whose rows — Paste, Share, Font ▸, Spelling
+and Grammar ▸, Substitutions ▸, Speech ▸ — carry no key equivalents at all) and
+confirmed on KakaoTalk. `crates/cua-core/examples/menu_life.rs` grew the arms
+that took the measurements.
+
+7. **The arrow keys do reach the menu, and they do move the highlight.** This
+   was the surprise, and it corrects the natural reading of point 6 that only a
+   ⌘-chord gets in. A pid-routed `down` with the menu open is *not* delivered to
+   the window underneath — the control run proves the difference: with no menu
+   up, `press_key x` appends `x` to the text view; with the menu up, the same
+   `x` appends nothing and the menu stays open. And the highlight moves, which
+   is visible in the pixels: one `down` highlighted `붙여넣기`, five at 60 ms
+   apart highlighted `서체`, three rows further on.
+8. **Delivery into the tracking loop is lossy, and the loss is not a tuning
+   problem.** Five `down`s advanced three rows. At 250 ms spacing only the
+   *first* `down` registered and the rest changed nothing — photographed, with
+   the highlight still on row 1 after three more keys. The reading is that
+   `SLEventPostToPid` enqueues an event without waking the run loop the menu is
+   tracking in, so an event is only seen when a later one happens to wake it. A
+   deliberate trailing "flush" keystroke was tried and did not clear the
+   backlog.
+9. **Nothing activates the highlighted row.** `return`, `enter` and `space` were
+   each sent with a row visibly highlighted, on both event recipes below. The
+   clipboard was set to a sentinel and `붙여넣기` highlighted; the sentinel never
+   appeared. Sometimes the menu simply stayed up and the key vanished;
+   in one run the menu dismissed and the Return arrived in the text view instead,
+   inserting a newline — which is the same failure mode as point 5, one layer
+   further in. So the menu can be *navigated* and cannot be *chosen from*, and a
+   half-working navigation is worse than none: it would let a caller move a
+   highlight and then believe the item ran.
+10. **The window number is not the missing field.** Keyboard `CGEvent`s built
+    with `CGEventCreateKeyboardEvent` have no AppKit identity — window number 0,
+    `-[NSEvent window]` nil — which is a plausible reason a *window* running a
+    tracking loop would ignore them. So `cua_hid::press_chord_in_window_pid` was
+    built: the event comes from
+    `-[NSEvent keyEventWithType:…windowNumber:…characters:…]`, so it can name a
+    window, and `cua_hid::key_characters` reconstructs the `characters` string
+    AppKit will not derive for a synthesized event (arrow keys are
+    `U+F700..U+F703`, not empty). Measured with the number set to the pop-up's
+    own, to the parent window's, and to 0. None activated anything. The parent's
+    number dismissed the menu on the first key; 0 was the *most* reliable for
+    navigation, which is itself evidence that the window number is not what the
+    menu is routing on.
+11. **`AXShowMenu` is not implemented on either target.** TextEdit's `AXTextArea`
+    answers `this element supports []`, exactly as KakaoTalk's hamburger does. A
+    menu opened through accessibility cannot be compared with a click-opened one
+    because there is no way to open one through accessibility.
+12. **The menu bar is published in full, and pressing a row in it works from the
+    background.** This is the route that ships. `AXMenuBar` was already known to
+    be the application element's only child (point 2); what had not been checked
+    is what is *inside* it. Every menu, every submenu and every row is there,
+    each with `AXPress`, an `AXEnabled` that tracks the app's real first
+    responder, its key equivalent as data, and its checkmark. Measured on
+    TextEdit with another app frontmost throughout: `편집 > 변형 > 대문자로
+    만들기` — Make Upper Case, **no key equivalent**, and one of the rows the
+    text view's own context menu draws — turned a selected `bravo` into `BRAVO`,
+    and `소문자로 만들기` turned it back. `AXEnabled` on that row read `false`
+    with nothing selected and `true` with a selection, so the validation is the
+    app's live one. Nothing was drawn on screen, the pointer did not move, and
+    the app was not activated.
+
+So the answer to "can a shortcut-less row be activated" is **yes when the row
+has a menu-bar twin, and no otherwise**, and the second half is not a gap in
+cua-rs. KakaoTalk's menu bar was walked to check: it publishes `카카오톡`,
+`편집`, `창` and `도움말`, and none of them contains `톡게시판` or
+`채팅방 서랍`. Those rows exist only in a window with no accessibility, in a
+tracking loop that will not activate anything, and cua-rs cannot reach them
+without moving the real pointer, which §9 forbids permanently. That is the
+honest "no", and it is now a bounded one: it applies to rows an app draws
+*only* in a pop-up, not to menus in general.
+
+What ships from this:
+
+- **`menu_bar`**, one tool that reads a level and presses a row. `crates/cua-core/src/menubar.rs`
+  walks by title rather than by index, because a menu's indices move with its
+  separators while its titles are what the caller read. A row that owns a
+  submenu is refused with the names of its rows; a disabled row is refused
+  rather than pressed, because pressing one does nothing and reporting success
+  would be a lie; and the destructive-label gate runs on the row's own title,
+  which matters more here than anywhere else — a menu bar reaches Quit, Log Out
+  and `채팅방 나가기` in two steps, none of them behind a confirmation of the
+  app's own. `safety::Gate::labelled` exists for that: a menu path has no
+  snapshot index for the usual `Gate::at` to classify.
+- **Key equivalents as data.** `menu_shortcut()` turns `AXMenuItemCmdChar` and
+  `AXMenuItemCmdModifiers` into `press_key`'s own spelling — `cmd+i`,
+  `cmd+alt+shift+v`. The encoding is a trap worth naming: it is the Carbon menu
+  modifier byte, in which **Command is the default and bit 3 removes it**, so a
+  `0` means ⌘ rather than "no modifiers". This does not reopen the row §9 closed:
+  that row refuses to recognise a key equivalent from *pixels*, and this is
+  reading a string the app published. A caller can now learn `⌘I` for a pop-up
+  row from the menu bar's copy of it and press it on the pop-up, with no OCR
+  anywhere in the loop.
+- `cua_hid::press_chord_in_window_pid` and `key_characters` stay, unwired,
+  documented as the instrument that produced point 10 — the same standing
+  `post_click_to_pid` has.
+
+One incidental correction. `is_transient_popup()` requires `isOnScreen()`, and
+an app the human has buried under another window reports `false` on *every*
+window it owns, its open menus included. TextEdit's context menu was invisible
+to `get_app_state`'s pop-up list for exactly that reason while it was plainly
+open. Not fixed here — the predicate is shared with the capture path, where
+"on screen" means something else — but the probe now prints every above-content
+window of the pid alongside the predicate's verdict, so the disagreement is
+visible rather than reading as "no menu opened".
 
 The capture question resolved itself in passing, and not the way it looked.
 `screencapture -l<menu_id>` succeeds, but it does not return the menu: asking for
