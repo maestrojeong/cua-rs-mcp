@@ -166,11 +166,11 @@ one of them.
 | buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
 | **seeing a pop-up menu a click opened** | yes. It is a separate window with no accessibility representation, so it is never in the tree; `get_app_state` and every action's own result list it — id, level, frame, and whether it just appeared — and the window screenshot already contains it, because macOS photographs a window together with the pop-up attached to it |
 | **picking a row in that menu** | **only by its keyboard shortcut.** `press_key` with the item's own key equivalent (⌘I, ⌘T, ⌥⌘,) is measured to activate it. A `click_in_window` coordinate is delivered and *dismisses* the menu without selecting anything — a menu tracks the real pointer, and cua-rs does not move the real pointer. Reading the item labels and their shortcuts off the screenshot is yours; cua-rs does no OCR |
-| any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed |
-| right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed — **built, not yet verified on a real app** |
-| drag | yes: a real down, interpolated moves and an up, both ends in one window — **built, not yet verified on a real drag source** |
+| any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed. A bare character key carries the character as well as the keycode, so a non-Latin input source cannot substitute a different letter — `press_key x` under a Korean source delivered `ㅌ` before this |
+| right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed. **Measured:** a right-click opened a context menu on TextEdit's text view; a ⇧-click extended a selection an unmodified click leaves empty |
+| drag | yes: a real down, interpolated moves and an up, both ends in one window. **Measured:** dragging across TextEdit selected exactly the text spanned |
 | hover | a synthesized `mouseMoved` — **built, unproven**, and your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react at all |
-| scrolling something with no AX scroll verb (Electron list, canvas, web content) | yes, a wheel event at the element's point — **built, not yet verified** |
+| scrolling something with no AX scroll verb (Electron list, canvas, web content) | **no — expect this to fail.** The wheel event is delivered and scrolls nothing: measured against the window's pixels on a native `AXScrollArea` and on Chromium web content, in both pixel and line units. A pid-routed `pagedown` keystroke scrolls the same window in the same session, so use `press_key` instead. [DESIGN.md](DESIGN.md) §11 has the numbers |
 | canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
 | terminals | reading yes; typing yes with `type_text mechanism="keystrokes"`, which sends real per-pid key events. The default `AXValue` write is still ignored by terminals, and the keystroke path is measured on TextEdit, not yet on a terminal |
 

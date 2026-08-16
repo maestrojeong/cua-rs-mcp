@@ -955,9 +955,42 @@ Two smaller measurements from the same session, recorded because they will
 otherwise be rediscovered:
 
 - `type_text_background_pid` carries a Unicode string and arrives verbatim
-  under a non-Latin input source; `press_chord_background_pid` carries a
+  under a non-Latin input source; `press_chord_background_pid` carried a
   keycode, so with a Korean source active `press_key x` delivered `ㅌ`. Chords
-  go through the input method, literal text does not.
+  went through the input method, literal text did not. **Fixed — see below.**
+
+### A keycode is not a character
+
+`press_key x` delivering `ㅌ` was not a bug in the input method. Under a Korean
+2-set source, keycode 7 *is* `ㅌ`: that is the correct answer to "the user pressed
+this key", and the wrong answer to "the caller asked for the letter x". The event
+was under-specified, and macOS filled the gap the way it should for a person
+typing.
+
+The fix is to say both things. `Chord` now carries the literal character the
+caller named, and `press_chord_background_pid` attaches it with
+`CGEventKeyboardSetUnicodeString` **while keeping the real keycode** — so an app
+reading `keyCode` for a game control or a shortcut still sees the physical key it
+expects, and an app reading `characters` gets the letter that was asked for.
+
+Both candidate recipes were measured on this machine, with the Korean source
+active, through the shipping code path rather than a probe resembling it:
+
+| recipe | delivered |
+|---|:--|
+| keycode alone (before) | `ㅌ` |
+| real keycode + Unicode string | **`x`** |
+| keycode 0 + Unicode string | `x` |
+
+The last one is what `type_text_background_pid` does and it works, but it claims a
+key was pressed that was not — keycode 0 is `a`. The middle one was chosen because
+it is the only one that is true about both the key and the character.
+
+Deliberately not applied to a chord or a named key. `chord.literal` is `None` for
+`escape`, `f5`, and anything with a modifier: `cmd+x` means Cut rather than the
+letter x, and forcing a character onto it would change what the keystroke is. The
+keycode is unchanged in every case, so nothing that worked before behaves
+differently — only the character an input method would otherwise have substituted.
 - The staleness guard used to reject every click on TextEdit's document view,
   because the tree walk resolves a label from `AXTitle`, `AXDescription`,
   `AXPlaceholderValue`, `AXIdentifier` or a linked title element while the live
@@ -1553,6 +1586,98 @@ what was wanted. An action here that returned nothing would leave the caller
 with a blind retry loop over a gesture that may have already taken effect, which
 is the failure mode §10 says is worse than reporting a timeout.
 
+### What the widened model was measured to do, and the one thing it does not
+
+The experiments the next section asks for have now been run. Three of the five
+capabilities work, one is fixed, and **the wheel tier does not scroll anything**.
+Recorded here rather than in §8's checklist because two of the results changed
+the code and one changed what the tool descriptions may claim.
+
+| | measured | evidence |
+|---|:-:|:--|
+| `drag` | **works** | dragging 220 points along a line of TextEdit left `AXSelectedText = "The quick brown fox jumps over th"`. A string the app computed from where it believes the gesture went, so nothing but a tracked press-move-release produces it |
+| ⇧-click | **works** | a plain `click_in_window` planted the caret, then a `shift` click 200 points along left `AXSelectedText = "The quick brown fox jumps over"`. An unmodified click leaves the selection empty, so the selection *is* the modifier arriving |
+| right click | **works** | on TextEdit's text view: a new window of the same pid, level 101, 181x342, within 50 ms. Unambiguous because the element it was aimed at is not a menu and nothing else opens one |
+| `hover` | **unproven** | delivered, and no app has yet been found whose hover state enters the tree. The limitation in the next section stands |
+| wheel tier | **does not work** | see below |
+
+**The wheel tier delivers and scrolls nothing.** Measured against the window's
+own pixels, captured before and after:
+
+```console
+$ scroll_check wheel TextEdit 1     # AXScrollArea, 400-line document
+image 208189 bytes -> 208189 bytes        ==> NO
+$ scroll_check key   TextEdit 8     # control, same window, same session
+image 208189 bytes -> 206656 bytes        ==> YES
+```
+
+The control arm is what makes that mean something. A pid-routed `pagedown`
+*keystroke* scrolls the same window in the same run, so the failure is not pid
+routing, not the window number, not the aim point, and not the instrument — it is
+the scroll event itself. Also measured and also negative: Chromium web content,
+and both `ScrollUnit::Pixel` and `ScrollUnit::Line` on both apps. The most likely
+explanation is §6's finding applied to a different event family: a `CGEvent`
+synthesized from scratch has no AppKit identity, a click can be given one by
+building the `NSEvent` first, and `NSEvent` offers no scroll-wheel factory to
+build from.
+
+So the tier stays in the tree — the mechanism is right even where the result is
+not, and a future measurement on an app that reads the CG record directly may
+find it lands — but nothing in the docs or the tool descriptions may say it
+scrolls, and `scroll` on an element with no AX scroll verb should be treated as
+**expected to fail**. The working alternative is a keystroke: `press_key
+pagedown` / `up` / `down` reaches a scroller that publishes no scroll action,
+which is measured above.
+
+### Chromium's activation point is a lie, and it aimed every event at a corner
+
+Found while running the experiments above, and the more expensive of the two bugs
+they turned up.
+
+`element_point()` asked `AXActivationPoint` first and the frame centre second,
+which is right in principle: the activation point is the app's own answer, and for
+a wide list row or a control with a large transparent hit area it is a better
+point than the middle. Chromium answers `(0, 982)` — for every element in the
+window. Measured on Chrome, a button whose frame is `15,239 194x34` reports that
+corner as its activation point, and so does the web area containing it.
+
+Every pid-routed click, hover, drag and wheel event aimed at a Chrome element
+therefore went to one corner of the display. Nothing errored. `screen_point_inside`
+was satisfied because the corner *is* inside the browser window, the event was
+delivered, and the result said `delivery: pid` — the shape of failure this project
+is most exposed to, since `click` became pid-only in §1a and no longer has an
+`AXPress` to succeed behind the scenes.
+
+The rule that catches it needs no app-specific knowledge and no allow-list of
+misbehaving toolkits: **a point that activates an element has to be on that
+element**, so an activation point outside its own element's frame is
+self-contradictory and is discarded in favour of the frame centre. An element
+with no frame keeps the benefit of the doubt, because then there is nothing better
+to use. Verified: the same `hover` that reported `(0, 982)` now reports
+`(112, 256)`, which is the button.
+
+The general lesson is the one §2 and §6 keep teaching in different costumes. An
+app's own answer is better than a computed one *when it is an answer*, and a
+sanity check against geometry the app also published is cheap. Two coordinate
+bugs in this release were of exactly this shape — this one, and a capture whose
+`scale` was computed against a frame the image did not actually cover.
+
+### A scrollable element's frame is not its viewport
+
+The second aiming bug, in the wheel tier specifically. The aim came from the
+element's own point, and an `AXWebArea`'s frame is the whole document while a long
+list's frame covers every row — so the centre of either can sit far outside the
+window that shows it. On Chrome that put the aim at the bottom edge of the
+display.
+
+Two changes. The point is pulled back into the intersection of the element's frame
+and the window's, so a tall container is aimed at the part of it a person can see;
+and a caller who named a coordinate now has it honoured instead of discarded.
+`Target::Point` used to be resolved only to find out *which* element covers the
+point, after which the element's own point replaced it — meaning a caller who said
+exactly where to scroll was scrolled somewhere else. Neither change makes the
+wheel tier work, per the measurement above. Both were wrong independently of it.
+
 ### What the widened model has not been shown to do
 
 Everything above is reachable and none of it is measured on a real app. The
@@ -1563,15 +1688,17 @@ sizing, the coordinate generation guard, and every argument-validation refusal.
 That is a statement about the logic. It is not evidence that any app accepts the
 events, and it should not be read as one.
 
-Two of these deserve a stronger warning than the rest, because for them there is
-no corroboration available anywhere: **hover and the wheel tier**. The click and
-key paths were at least built against a recipe that had been observed to work
-elsewhere, and their §10 measurements exist. Nobody here has seen a synthesized
-per-pid `mouseMoved` or `scrollWheel` drive anything. The construction is
-reasoned — the same window stamping, the same pid route, the same fresh
-timestamp that make a click land — and reasoning is not a measurement. Treat
-both as *implemented and unproven*, in the strong sense: if they do not work at
-all on the first app tried, that is a plausible outcome and not a surprise.
+`hover` deserves a stronger warning than the rest, because for it there is no
+corroboration available anywhere. The click and key paths were at least built
+against a recipe that had been observed to work elsewhere, and their §10
+measurements exist. Nobody here has seen a synthesized per-pid `mouseMoved` drive
+anything. The construction is reasoned — the same window stamping, the same pid
+route, the same fresh timestamp that make a click land — and reasoning is not a
+measurement. Treat it as *implemented and unproven*, in the strong sense.
+
+The wheel tier used to carry the same warning. It has now been measured, and the
+answer was no; see the section above. That is the outcome this paragraph called a
+plausible one, and it is worth leaving the prediction next to the result.
 
 What would prove each, concretely:
 
