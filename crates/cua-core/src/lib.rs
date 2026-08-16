@@ -18,12 +18,14 @@
 //! error instead of a mis-click.
 
 pub mod apps;
+pub mod menubar;
 mod overlay;
 pub mod safety;
 pub mod session;
 pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
+pub use menubar::{menu_path_steps, menu_shortcut, MenuItem, MenuListing, MenuWalkError};
 pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,

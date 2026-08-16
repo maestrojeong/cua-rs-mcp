@@ -152,6 +152,7 @@ and `click`, `click_in_window`, `drag` and `hover` all honour it.
 | `click_in_window` | a bare point, no element, nothing verified — last resort on a canvas, and the only addressing a pop-up window has |
 | `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call. `type_text` takes `mechanism: "keystrokes"` for targets that ignore `AXValue` |
 | `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
+| `menu_bar` | read the app's menu bar a level at a time — title, enabled-right-now, ✓, submenu, key equivalent — and press a row. The only measured way to activate a menu item that has no shortcut |
 | `scroll` · `perform_secondary_action` | pages through AX, or a wheel event where there is no AX verb; any AX verb |
 | `list_apps` · `check_permissions` | running apps; grant status |
 
@@ -167,7 +168,9 @@ one of them.
 |---|:--|
 | buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
 | **seeing a pop-up menu a click opened** | yes. It is a separate window with no accessibility representation, so it is never in the tree; `get_app_state` and every action's own result list it — id, level, frame, and whether it just appeared — and the window screenshot already contains it, because macOS photographs a window together with the pop-up attached to it |
-| **picking a row in that menu** | **only by its keyboard shortcut.** `press_key` with the item's own key equivalent (⌘I, ⌘T, ⌥⌘,) is measured to activate it. A `click_in_window` coordinate is delivered and *dismisses* the menu without selecting anything — a menu tracks the real pointer, and cua-rs does not move the real pointer. Reading the item labels and their shortcuts off the screenshot is yours; cua-rs does no OCR |
+| **picking a row in that menu** | **by its keyboard shortcut, or through the menu bar.** `press_key` with the item's own key equivalent (⌘I, ⌘T, ⌥⌘,) activates it. A `click_in_window` coordinate is delivered and *dismisses* the menu without selecting anything — a menu tracks the real pointer, and cua-rs does not move the real pointer |
+| **a row in that menu with no shortcut at all** | **not inside the pop-up — use `menu_bar`.** Four routes were measured (DESIGN §10): the arrow keys really do reach the menu and move the highlight, but `return`, `enter` and `space` are consumed and activate nothing, whether the key event carries the pop-up's window number, the parent's, or none; and `AXShowMenu` is unimplemented on the controls that own these menus. What does work is that most apps draw the same rows in their **menu bar**, which accessibility publishes in full. **Measured:** `Edit ▸ Transformations ▸ Make Upper Case` — no shortcut, and a row of TextEdit's context menu — upper-cased the selection with another app frontmost. Where an app draws a row *only* in the pop-up (KakaoTalk's `톡게시판`), it is genuinely unreachable |
+| **reading a menu item's shortcut** | `menu_bar` reports it as data, already spelled the way `press_key` takes it (`cmd+i`, `cmd+alt+shift+v`), along with the ✓ on a toggle and whether the row is enabled right now. So learning a pop-up row's shortcut means reading the menu bar's copy of it, not recognising a ⌘ glyph in a screenshot — cua-rs still does no OCR |
 | any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed. A bare character key carries the character as well as the keycode, so a non-Latin input source cannot substitute a different letter — `press_key x` under a Korean source delivered `ㅌ` before this |
 | right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed. **Measured:** a right-click opened a context menu on TextEdit's text view; a ⇧-click extended a selection an unmodified click leaves empty |
 | drag | yes: a real down, interpolated moves and an up, both ends in one window. **Measured:** dragging across TextEdit selected exactly the text spanned |
@@ -225,7 +228,7 @@ window, and nothing when you are not.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 205 tests, no permissions needed
+cargo test --workspace          # 221 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 
 # read-back tests for the keyboard path: needs an Accessibility grant,

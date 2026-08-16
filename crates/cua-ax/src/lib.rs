@@ -180,6 +180,16 @@ pub mod attr {
     pub const SELECTED_TEXT_RANGE: &str = "AXSelectedTextRange";
     pub const NUMBER_OF_CHARACTERS: &str = "AXNumberOfCharacters";
     pub const MENU_BAR: &str = "AXMenuBar";
+    /// A menu item's key equivalent, as the character it is drawn with: `"i"`
+    /// for ⌘I. Absent on an item with no shortcut, which is the case this whole
+    /// area exists for.
+    pub const MENU_ITEM_CMD_CHAR: &str = "AXMenuItemCmdChar";
+    /// The modifier mask that goes with [`MENU_ITEM_CMD_CHAR`]. See
+    /// `cua_core::menu_shortcut` for the encoding, which is not the obvious one.
+    pub const MENU_ITEM_CMD_MODIFIERS: &str = "AXMenuItemCmdModifiers";
+    /// The mark drawn to the left of a menu item: `"✓"` for a checked toggle,
+    /// `"-"` for a mixed one, absent for an unmarked row.
+    pub const MENU_ITEM_MARK_CHAR: &str = "AXMenuItemMarkChar";
     pub const TITLE_UI_ELEMENT: &str = "AXTitleUIElement";
     pub const LINKED_UI_ELEMENTS: &str = "AXLinkedUIElements";
 
