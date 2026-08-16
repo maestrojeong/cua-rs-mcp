@@ -233,7 +233,7 @@ cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1
 cua-ax        safe AXUIElement wrapper + budgeted tree walker
 cua-capture   window discovery + crash-isolated per-window PNG
 cua-core      app resolution, one native worker thread, snapshots, safety gates
-cua-hid       process-routed input — the only crate that synthesizes events
+cua-hid       process-routed input — the only crate that links the event APIs
 cua-mcp       the server, binary `cua-rs`
 cua-overlay   the drawn cursor
 ```

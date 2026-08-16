@@ -115,6 +115,7 @@ use objc2_core_graphics::{
     CGEventType, CGMouseButton, CGScrollEventUnit,
 };
 
+pub mod humanwatch;
 mod nsevent;
 mod skylight;
 

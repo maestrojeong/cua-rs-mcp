@@ -717,6 +717,29 @@ Reads are untouched, including screenshots. The scope answers what may be
 secrecy argument here, since the human chose the machine's contents, not the
 scope's silence.
 
+### The yield tap lives in `cua-hid`, and that placement is load-bearing
+
+`§4` and the README both claim that `cua-hid` is the only crate in the workspace
+that touches the event APIs. That claim is how a reader verifies the product's
+central promise without taking anybody's word for it: they open five
+`Cargo.toml` files and see which one links `CGEvent`.
+
+The listen-only tap was first written inside `safety.rs`, which meant `cua-core`
+linked `CGEvent` too. Nothing was wrong with the code — it constructs no event
+and posts none — but the invariant had quietly degraded from something checkable
+in a manifest to something checkable only by grepping for `CGEventCreate` and
+believing the result. That is a worse property even when the behaviour is
+identical, because the next person to need "just a read" from the event surface
+has a precedent instead of a wall.
+
+So the mechanism moved to `cua-hid::humanwatch` and the policy stayed here.
+`cua-core` now links `objc2-core-graphics` for `CGSession` alone — a state read
+about whether the screen is locked, which is not an event API by any reading.
+`safety::HumanWatch` decides *whether* to watch and what a refusal says;
+`humanwatch::InputWatch` owns the tap, the callback, the run loop and the
+teardown. Holding the `InputWatch` is what keeps the tap alive, so the lifetime
+is the type rather than a convention.
+
 ### Reading is allowed; acting is not; photographing is not either
 
 The blocklist refuses actions and permits `get_app_state`, `find`, `wait_for`

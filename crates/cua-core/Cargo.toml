@@ -36,16 +36,16 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
     "CFRunLoop",
     "CFString",
 ] }
-# Read-only. `cua-core` links CGEvent for exactly two things: the session
-# dictionary that reports a locked screen, and a listen-only input tap that
-# returns every event unchanged. It constructs no event and posts none —
-# `cua-hid` is still the only crate in this workspace that synthesizes input,
-# and `grep -r CGEventCreate crates/cua-core` is how a reader checks that.
+# `CGSession` only, and deliberately nothing else: the session dictionary that
+# reports a locked screen is a state read, not an event API. `cua-hid` is the one
+# crate in this workspace that links the event surface at all, which is what makes
+# "only cua-hid can touch input" checkable from these files rather than a promise
+# about code somebody has to go and read. The listen-only input tap behind
+# CUA_YIELD_TO_HUMAN used to live here and was moved to `cua-hid::humanwatch` to
+# keep that true; `safety.rs` holds the policy and calls into it.
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
     "objc2",
-    "CGEvent",
-    "CGEventTypes",
     "CGSession",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
