@@ -5,29 +5,93 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
-## Unreleased
+## 0.8.0
 
-### The shell capture that refused a pop-up id was a dead window id
+The safety gate learned to read the question a dialog is asking, a shortcut-less
+menu row became reachable, and the function that could steal your keyboard is
+gone. Four measurements settled questions 0.7.0 shipped as open — one of them by
+proving the fix I had reasoned my way to was worthless.
 
-An unexplained observation from the pop-up work: a shell
-`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
-create image from window` while every in-process `capture_window` around it
-succeeded. Chased with `cargo run -p cua-core --example popup_capture_probe`,
-which opens a pop-up and alternates both paths against its window id while
-reading the window's liveness between every step.
+### A terse button under a destructive question is now refused
 
-129 live rounds across four runs: both paths succeeded every time. Asked for the
-same id *after* the pop-up closed, the shell command fails with exactly that
-message, 3 out of 3. The in-process path normally reports `window <id> not found
-(it may have closed)` instead, because it enumerates first — which is the whole of
-the apparent disagreement. One round caught the raw refusal in-process too, when
-the window died inside the gap between that enumeration and the capture.
+`OK` in a sheet asking *Delete 4 items?* used to sail through, because the
+classifier read the button and the verb was in the alert. It now reads the
+**nearest decision context** — an `AXSheet`, an `AXDialog`, or a window whose
+subrole marks it an alert — and judges the button against the question that
+context is asking. Four rules, each pinned by a test that fails if the rule is
+removed:
 
-So a pop-up id is not a durable handle, and §10's answer — ask for the parent
-window, which macOS photographs with the pop-up attached — remains the way to get
-a pop-up's pixels. `capture_failure_warning` is unchanged and undiminished: it
-describes a *live* window of an app with a menu open, which is a different case
-and still an unestablished correlation.
+- Only a decision context counts. An ordinary window, group or scroll area is
+  layout, and its text is content **at any depth** — so a mail thread about
+  deleting still clicks normally.
+- The nearest one, and no further. Bounded by construction, and it gets nested
+  sheets right for free.
+- The question only, never the other answers. A Cancel sitting beside a Delete
+  is not evidence about Cancel.
+- Content is excluded everywhere: no descent into tables, rows, web areas or text
+  areas, and a writable value is never the question. A text field inside a delete
+  sheet stays writable.
+
+**Cancel, No, Keep, Save, 취소, 저장 are never refused.** An answer that names its
+own harmlessness is judged by itself: refusing the way *out* of a destructive
+dialog would leave an agent holding a sheet it could only escape by confirming,
+which is the exact habit that makes the gate worthless when it matters. Whole
+label only, so `Don't Save` is not excused by `Save`, nor `Close Account` by
+`Close`. This one is evidence-driven — a live run caught the gate refusing 저장 on
+Apple's own save-or-delete sheet, which is one of the most-used sheets on the
+system.
+
+Live-verified on this Korean machine, both directions: `OK` under *Delete 4
+items?* refused and then pressed with `confirm_destructive: true`; `확인` under
+*4개 항목을 삭제할까요?* refused; `Cancel` and `취소` on the same dialogs allowed
+unconfirmed; `OK` under *Save these settings?* allowed. The refusal quotes the
+question it read.
+
+### Return is judged by the button it will actually press
+
+The same gate had a hole underneath it. Every other check judges the element the
+caller named, which is right for a click — but inside an alert, Return activates
+the **default** button whatever was addressed. So `press_key return` aimed at a
+dialog's Cancel was judged against Cancel, found exempt, and pressed **Delete**.
+Measured before the fix on a real dialog: allowed, and `osascript` reported
+`button returned:Delete`.
+
+For an unmodified Return the gate now resolves `AXDefaultButton` on the nearest
+window-like ancestor — bottom-up, so a sheet's own default wins over its parent
+window's — and judges that control instead. The aimed element's value,
+settability and caption are dropped in the swap, so a text field cannot excuse the
+button Return presses. Escape is untouched (it activates *cancel*, safe by
+construction), space presses the focused control, and a modified Return is an app
+shortcut rather than "confirm this dialog".
+
+### A shortcut-less menu row is reachable — through the menu bar
+
+0.7.0 established that a pop-up menu opens fine, has no accessibility inside it,
+and only yields to an item's own keyboard shortcut. That left rows with no
+shortcut with no route at all. There is one, and it was never in the pop-up:
+`AXMenuBar` is published **in full** — every menu, submenu and row, each with
+`AXPress`, a live `AXEnabled`, its checkmark, and its key equivalent as data.
+
+New **`menu_bar`** tool: read a level, press a row. It refuses a submenu (naming
+its rows), refuses a disabled row (pressing one does nothing and reporting success
+would be a lie), and runs the destructive gate on the row's own title, because a
+menu bar reaches Quit and Leave Chat in two steps.
+
+Measured: `Edit > Transformations > Make Upper Case` — no key equivalent —
+changed `alpha bravo charlie` to `alpha BRAVO charlie` with another app frontmost
+throughout, and the inverse row put it back byte-identically. Nothing was drawn
+on screen and the frontmost app never changed.
+
+Also new: **`menu_shortcut`** reports key equivalents already spelled the way
+`press_key` takes them (`cmd+z`, `cmd+alt+shift+v`), so no agent has to recognise
+⌘ glyphs in a screenshot. The encoding is a trap worth naming —
+`AXMenuItemCmdModifiers` is the Carbon byte where Command is the *default* and
+bit 3 removes it, so `0` means ⌘.
+
+And a bound on the no: KakaoTalk's menu bar publishes `카카오톡`, `편집`, `창`,
+`도움말`, and none of them contains 톡게시판 or 채팅방 서랍. A row an app draws
+*only* in a pop-up is genuinely unreachable without moving the real pointer. The
+refusal is now specific rather than general.
 
 ### An `AXMenuItem` does act on the first `AXPress`
 
@@ -95,6 +159,78 @@ longer describe a fallback that exists.
 `parse_chord` is untouched: it is shared with the pid keyboard path. Nothing
 tested `post_chord` — there was no way to assert on a write to the shared stream
 — so the workspace test count is unchanged at 212.
+
+### The shell capture that refused a pop-up id was a dead window id
+
+An unexplained observation from the pop-up work: a shell
+`/usr/sbin/screencapture -x -o -l<menu_window_id>` exited 1 with `could not
+create image from window` while every in-process `capture_window` around it
+succeeded. Chased with `cargo run -p cua-core --example popup_capture_probe`,
+which opens a pop-up and alternates both paths against its window id while
+reading the window's liveness between every step.
+
+129 live rounds across four runs: both paths succeeded every time. Asked for the
+same id *after* the pop-up closed, the shell command fails with exactly that
+message, 3 out of 3. The in-process path normally reports `window <id> not found
+(it may have closed)` instead, because it enumerates first — which is the whole of
+the apparent disagreement. One round caught the raw refusal in-process too, when
+the window died inside the gap between that enumeration and the capture.
+
+So a pop-up id is not a durable handle, and §10's answer — ask for the parent
+window, which macOS photographs with the pop-up attached — remains the way to get
+a pop-up's pixels. `capture_failure_warning` is unchanged and undiminished: it
+describes a *live* window of an app with a menu open, which is a different case
+and still an unestablished correlation.
+
+### Measurements that closed open questions
+
+- **`hover` drives web content, and nothing else tried.** A local fixture page
+  publishes a button CSS hides until its row is hovered, and rewrites a paragraph
+  with the coordinate a `mousemove` handed it — a coordinate the app *computed*
+  cannot be produced by anything but the event arriving with it. Confirmed in two
+  engines. A Finder list row, with a click as the control, showed nothing.
+- **The wheel tier's explanation was wrong.** §6 says a click only lands once the
+  `NSEvent` is built first, and `NSEvent` has no scroll-wheel factory, so "that is
+  why scrolling fails" was the convenient guess. Six constructions — as shipped,
+  round-tripped through `+[NSEvent eventWithCGEvent:]`, phased, and phased with
+  momentum — across both the private and public post routes: all delivered, all
+  moving zero pixels (`260063 bytes -> 260063 bytes`) while the keystroke control
+  scrolled the same document before and after. Not the header, not the phases, not
+  the route. Recorded as unexplained rather than guessed at twice.
+- **The `AXMenuItem` first-press rumour is refuted.** 180 presses across six arms,
+  two apps and three toggles: 180 acted on the first press. What lags is the
+  *read* — 50 ms to 1.7 s before the change is visible.
+- **A pop-up window id is not a durable handle.** The one unexplained
+  `screencapture` failure from 0.7.0 reproduces exactly when the id has closed,
+  3 of 3, and `capture_window`'s preflight enumeration is the whole apparent
+  asymmetry between the two paths.
+
+### The settle polls, and stays short on purpose
+
+`ui_changed`'s 120 ms wait was a fixed sleep; it now polls every 16 ms and returns
+the moment the fingerprint moves, so a change that lands in one frame is reported
+after one frame. Only "nothing changed" spends the deadline, which it must.
+
+The 1.7 s menu-read figure above invited a longer deadline, and measurement
+refused it: a 2 s deadline reported `Unchanged` after waiting the full 2 198 ms on
+a press that had plainly worked, because the fingerprint reads the focused
+window's title and the focused element — and a tab bar appearing changes neither.
+The limit is *what* is compared, not *when*. The patient variant was deleted
+rather than shipped as a tax that buys nothing; for a menu action, read the row
+back through `menu_bar`, whose title and checkmark say the state outright.
+
+### Also
+
+- A browser is outside this server's one property, measured: **Chrome and Safari
+  accept no synthesized pointer input while backgrounded** — a click and a
+  `mouseMoved` at the same pixel both ignored, both honoured once active, while a
+  background click on TextEdit worked in the same session. Not a gap to close;
+  it is a second reason the README already sends the web to browser-rs over CDP.
+- CI derives the crate list from `cargo metadata` and asserts it matches
+  `ls crates` both ways, which is how an empty `crates/cua-sky/` went unnoticed.
+- **212 → 249 tests**, all still passing with no permissions granted.
+- New probes: `hover_check`, `menu_item_press`, `popup_capture_probe`, and
+  `scroll_check` gained an `idle` instrument arm and `CUA_WHEEL_RECIPE`.
 
 ## 0.7.0
 
