@@ -229,6 +229,31 @@ pub struct StateOptions {
 /// about the app: "12 structural elements omitted" is identical before and
 /// after, so it would either be diffed away as noise or, worse, flip when the
 /// count changes and read as a real UI change.
+/// Name the cause of a capture failure when this snapshot can see it.
+///
+/// Measured on KakaoTalk: while an NSMenu is up, the window server refuses to
+/// produce an image for that app's windows, and the *same* window id captures
+/// fine seconds later once the menu closes. Worth saying out loud, because the
+/// bare OS text — "could not create image from window" — reads like a
+/// permission or window-identity problem and invites retrying the one thing
+/// that cannot work until the menu goes away.
+///
+/// Deliberately no fallback. Capturing the window's screen *region* instead does
+/// succeed; measured, it returned an entirely unrelated app's window, because a
+/// region capture photographs whatever is actually in front. That is a wrong
+/// answer wearing a right answer's clothes, and it discloses a window the caller
+/// never asked about. A named failure is worth more than either.
+fn capture_failure_warning(err: &str, nodes: &[AxNode]) -> String {
+    if nodes.iter().any(|n| n.role == "AXMenu") {
+        return format!(
+            "{err}. This app has a menu open, and macOS does not render window images while one \
+             is up — the same window captures fine once it closes. The tree above is current; to \
+             get pixels, dismiss the menu first (press_key `escape` on the AXMenu)"
+        );
+    }
+    err.to_string()
+}
+
 /// Whether a stored snapshot can be the `before` side of a post-action diff.
 ///
 /// Both refusals were measured on KakaoTalk, and they fail the same way: the
@@ -1059,7 +1084,7 @@ impl Inner {
                     scale: shot.scale,
                 }),
                 Err(e) => {
-                    warnings.push(e.to_string());
+                    warnings.push(capture_failure_warning(&e.to_string(), &nodes));
                     None
                 }
             },
@@ -2059,6 +2084,25 @@ mod tests {
         let mut n = tnode(index, role, None, None, act);
         n.frame = Some(f);
         n
+    }
+
+    #[test]
+    fn a_capture_failure_blames_an_open_menu_only_when_one_is_open() {
+        let bare = "screencapture exited with status 1: could not create image from window";
+        let no_menu = vec![tnode(0, "AXWindow", Some("Chat"), None, false)];
+        assert_eq!(
+            capture_failure_warning(bare, &no_menu),
+            bare,
+            "with no menu open the cause is unknown, and guessing would mislead"
+        );
+
+        let with_menu = vec![
+            tnode(0, "AXWindow", Some("Chat"), None, false),
+            tnode(1, "AXMenu", None, None, true),
+        ];
+        let explained = capture_failure_warning(bare, &with_menu);
+        assert!(explained.starts_with(bare), "the OS text has to survive");
+        assert!(explained.contains("menu open"), "got {explained}");
     }
 
     #[test]

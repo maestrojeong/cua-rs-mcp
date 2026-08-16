@@ -130,6 +130,26 @@ Two secondary reasons:
   window, only that disposable process fails and the MCP server returns a
   screenshot warning while preserving the AX tree and connection.
 
+### An open menu blocks window capture, and there is no safe fallback
+
+Measured on KakaoTalk: while an `NSMenu` is up, `screencapture -l<id>` fails with
+`could not create image from window` for that app's windows, and the *same*
+window id captures fine seconds later once the menu closes. `on_screen` is not
+the discriminator — every window of the app reported `on_screen=false` in both
+the failing and the succeeding case.
+
+The obvious fallback is to capture the window's screen *region* instead, and it
+does succeed while the menu is open. It was rejected after measuring what comes
+back: a region capture of a covered KakaoTalk window returned an unrelated app's
+window, because a region capture photographs whatever is actually in front. That
+is a wrong answer presented as a right one, and it discloses a window the caller
+never asked about — the exact thing per-window capture exists to prevent.
+
+So the failure is named instead. When the tree that was just walked contains an
+`AXMenu`, the capture warning says the menu is why and how to clear it. The bare
+OS text reads like a permission or window-identity problem and invites retrying
+what cannot work until the menu goes away.
+
 Captures are requested at backing-store resolution, then clamped with macOS
 `sips` (`max_image_dim`, default 1400). Asking for point dimensions instead
 yields a soft half-resolution image on Retina where small UI text becomes unreadable.
