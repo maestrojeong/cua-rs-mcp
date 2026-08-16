@@ -292,6 +292,32 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// A textual delta between two rendered trees — **not** a verification that the
+/// UI did or did not change.
+///
+/// This is a multiset difference over outline lines, with indentation and the
+/// `[N]` handle removed from what makes two lines equal (see [`diff_key`]). That
+/// buys the thing it was built for: an app that regroups its own subtrees on
+/// every click no longer reports hundreds of lines as change. It costs identity,
+/// and the cost is real:
+///
+/// - **Equal-text nodes are fungible.** Two rows both reading `AXRow "Room"`,
+///   one of them `(selected)`, and the selection moves from one to the other:
+///   before and after each hold one selected and one unselected line, so the
+///   delta is empty. The selection did move.
+/// - **Position is not part of identity.** An unchanged line moving from one
+///   container to another — `Inbox` to `Archive` — is indistinguishable from the
+///   re-parenting this deliberately ignores.
+///
+/// So an empty delta means "no line-level text difference", which is weaker than
+/// "nothing happened", and a caller that needs to know a *specific* element's
+/// state must read that element rather than infer it from here. What the delta is
+/// good at is structure appearing and disappearing — a menu opening, a dialog
+/// replacing a pane, a row being added — which is the common case and the one
+/// that used to be invisible.
+///
+/// ---
+///
 /// What changed between two rendered trees.
 ///
 /// Line-level and deliberately not positional. A structural diff over `AxNode`

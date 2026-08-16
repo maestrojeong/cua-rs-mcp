@@ -114,6 +114,11 @@ pub enum CoreError {
         found: String,
     },
 
+    /// A coordinate was resolved against a snapshot that an action has already
+    /// invalidated.
+    #[error("an action has run on `{app}` since its last read, so the coordinates in this call would be resolved against stale geometry. Call get_app_state again, or address the element by element_index, which survives an action because it names the element rather than the place")]
+    StalePointGeometry { app: String },
+
     /// A coordinate landed on nothing in the app's current snapshot.
     #[error("no element of `{app}` covers ({x}, {y}) in its current snapshot. Coordinates are resolved against the snapshot's geometry, so the point has to be inside the window get_app_state read; call it again and click the element_index you want")]
     NoElementAtPoint { app: String, x: f32, y: f32 },
@@ -163,6 +168,16 @@ pub struct Snapshot {
     /// 40-element read followed by a click reported 278 appeared lines, all of
     /// them nodes the first walk had simply not reached.
     limits: Limits,
+    /// Whether the walk that produced `nodes` finished, rather than stopping at a
+    /// cap or the time budget.
+    ///
+    /// Same role as `limits`, for the case equal caps cannot catch: two walks can
+    /// run under identical caps and still describe different amounts of the same
+    /// window, because the time budget depends on how fast the app answers. A
+    /// pre-action walk that timed out at 300 nodes against a post-action walk that
+    /// reached 500 reports 200 nodes as having appeared, all of them nodes the
+    /// first walk simply never asked about.
+    complete: bool,
     /// An action has run since this walk, and nothing has re-read the window.
     ///
     /// Only set when the action declined `return_state`, since a re-read
@@ -229,26 +244,34 @@ pub struct StateOptions {
 /// about the app: "12 structural elements omitted" is identical before and
 /// after, so it would either be diffed away as noise or, worse, flip when the
 /// count changes and read as a real UI change.
-/// Name the cause of a capture failure when this snapshot can see it.
+/// Offer an open menu as a *possible* cause of a capture failure.
 ///
-/// Measured on KakaoTalk: while an NSMenu is up, the window server refuses to
-/// produce an image for that app's windows, and the *same* window id captures
-/// fine seconds later once the menu closes. Worth saying out loud, because the
-/// bare OS text — "could not create image from window" — reads like a
-/// permission or window-identity problem and invites retrying the one thing
-/// that cannot work until the menu goes away.
+/// Observed on KakaoTalk: while an NSMenu was up, `screencapture -l<id>` failed
+/// for that app's windows and the same window id captured fine once the menu
+/// closed. Worth mentioning, because the bare OS text — "could not create image
+/// from window" — reads like a permission or window-identity problem.
 ///
-/// Deliberately no fallback. Capturing the window's screen *region* instead does
+/// Deliberately hedged, and deliberately narrow. The correlation is not
+/// established: the same measurements were taken while ScreenCaptureKit on that
+/// machine was in a degraded state, which makes capture fail broadly and would
+/// produce the same pairing by coincidence (see DESIGN §2). And a capture can
+/// fail for reasons a menu has nothing to do with — a worker timeout, an encode
+/// error, a window mid-rebuild — so the note is attached only to the exact
+/// window-server refusal it was observed with, never to every error that happens
+/// to coincide with an `AXMenu` in the tree.
+///
+/// No fallback either way. Capturing the window's screen *region* instead does
 /// succeed; measured, it returned an entirely unrelated app's window, because a
 /// region capture photographs whatever is actually in front. That is a wrong
 /// answer wearing a right answer's clothes, and it discloses a window the caller
 /// never asked about. A named failure is worth more than either.
 fn capture_failure_warning(err: &str, nodes: &[AxNode]) -> String {
-    if nodes.iter().any(|n| n.role == "AXMenu") {
+    const WINDOW_SERVER_REFUSAL: &str = "could not create image from window";
+    if err.contains(WINDOW_SERVER_REFUSAL) && nodes.iter().any(|n| n.role == "AXMenu") {
         return format!(
-            "{err}. This app has a menu open, and macOS does not render window images while one \
-             is up — the same window captures fine once it closes. The tree above is current; to \
-             get pixels, dismiss the menu first (press_key `escape` on the AXMenu)"
+            "{err}. This app has a menu open, which may be why: the same window has been seen \
+             to capture once its menu closed. The tree above is current either way; if you need \
+             pixels, dismiss the menu (press_key `escape` on the AXMenu) and read again"
         );
     }
     err.to_string()
@@ -256,22 +279,34 @@ fn capture_failure_warning(err: &str, nodes: &[AxNode]) -> String {
 
 /// Whether a stored snapshot can be the `before` side of a post-action diff.
 ///
-/// Both refusals were measured on KakaoTalk, and they fail the same way: the
-/// stored tree is not a complete description of the window the re-read will
-/// walk, so subtracting them reports as "appeared" a pile of nodes that were
-/// there all along, and the few lines that are the actual answer fall past the
-/// output cutoff. A stated reason is worth more than a wrong diff.
-fn diff_basis(scoped: bool, limits: Limits) -> std::result::Result<(), &'static str> {
-    if scoped {
+/// Every refusal fails the same way: the stored tree is not a complete
+/// description of the window the re-read will walk, or it does not describe the
+/// same moment, so subtracting them reports as "appeared" a pile of nodes that
+/// were there all along and the few lines that are the actual answer fall past
+/// the output cutoff. A stated reason is worth more than a wrong diff.
+fn diff_basis(snap: &Snapshot) -> std::result::Result<(), &'static str> {
+    if snap.scoped {
         return Err(
             "the previous snapshot was scoped to one subtree, which a whole-window \
                     re-read cannot be subtracted from",
         );
     }
-    if limits != post_action_limits() {
+    if snap.limits != post_action_limits() {
         return Err(
             "the previous snapshot was walked under different caps, so it never described \
                     the whole window and the difference would be mostly nodes it did not reach",
+        );
+    }
+    if !snap.complete {
+        return Err(
+            "the previous snapshot's walk did not finish, so nodes it never reached would \
+                    read as newly appeared",
+        );
+    }
+    if snap.acted_on {
+        return Err(
+            "an action has already run against this snapshot without re-reading, so a diff \
+                    would attribute that action's changes to this one",
         );
     }
     Ok(())
@@ -371,7 +406,12 @@ pub struct ActionResult {
 pub struct PostActionState {
     /// Id of the snapshot taken after the action. Element indices in `diff` or
     /// `tree` belong to *this* snapshot, and it is the one to quote back.
-    pub snapshot_id: u64,
+    ///
+    /// `None` when the re-read itself failed, which is a different finding from
+    /// "nothing changed" and from "nobody looked": the action already happened
+    /// and its effect is simply unobserved. A click that closes the only window
+    /// gets here — the action succeeded and there is no longer a window to read.
+    pub snapshot_id: Option<u64>,
     /// Lines that appeared or vanished versus the pre-action tree. `None` when
     /// there was nothing fair to compare against; `note` then says why.
     pub diff: Option<crate::snapshot::TreeDiff>,
@@ -419,26 +459,49 @@ impl ActionResult {
 /// merely telling the application it is active. That means synthesizing a real
 /// click at a point the app chose, so it is gated on two checks:
 ///
-/// 1. the window publishes an activation point at all — a guessed title-bar point
+/// 1. the activation point comes from the AX window that corresponds to `live` —
+///    the very window whose number the click will carry — and not from whichever
+///    window accessibility happens to consider focused;
+/// 2. the point lies inside `live`'s own frame, so the window-local coordinate
+///    the event carries cannot be negative or off the end of the window;
+/// 3. the window publishes an activation point at all — a guessed title-bar point
 ///    would be exactly the kind of coordinate that lands on a close button;
-/// 2. a live system-wide hit test at that point resolves to *this* pid and to a
+/// 4. a live system-wide hit test at that point resolves to *this* pid and to a
 ///    window rather than a control. Measured on KakaoTalk, the published point
 ///    sits about six pixels from the close button, so "the app said so" is not on
 ///    its own enough of a reason to click there.
 ///
-/// `None` means skip the assist and send the bare notice, which is strictly what
-/// cua-rs did before and therefore cannot regress anything.
-fn window_focus_assist(
-    pid: libc::pid_t,
-    window_origin: &objc2_core_foundation::CGPoint,
-) -> Option<cua_hid::ActivationAssist> {
+/// Check 1 exists because it was missing: the window was chosen by
+/// `AXFocusedWindow` independently of the window being clicked, so in a
+/// multi-window app — a chat app with a list window and several conversation
+/// windows, which is the measured case — the assist could take window A's
+/// activation point, localize it against window B's origin, and stamp B's window
+/// number onto a real click aimed at a point inside A.
+///
+/// `None` means skip the assist and send the bare notice. That is what cua-rs did
+/// before the assist existed, so it is the safe direction to fail in — but it is
+/// not free: a control that only arms itself when its window is key will keep
+/// refusing the click that follows.
+fn window_focus_assist(pid: libc::pid_t, live: &WindowInfo) -> Option<cua_hid::ActivationAssist> {
+    // Correspondence by frame, the same public-API route `best_window_match` uses
+    // in the other direction. `_AXUIElementGetWindow` would answer directly and is
+    // private; see §6.
     let app_el = Element::for_pid(pid);
     let window_el = app_el
-        .element(cua_ax::attr::FOCUSED_WINDOW)
-        .or_else(|| app_el.element(cua_ax::attr::MAIN_WINDOW))
-        .or_else(|| app_el.elements(cua_ax::attr::WINDOWS).into_iter().next())?;
+        .elements(cua_ax::attr::WINDOWS)
+        .into_iter()
+        .filter_map(|w| {
+            let frame = w.frame()?;
+            let distance = frame_distance(&frame, &live.frame);
+            (distance <= AX_WINDOW_MATCH_TOLERANCE).then_some((distance, w))
+        })
+        .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, w)| w)?;
 
     let point = window_el.activation_point()?;
+    if !frame_contains(&live.frame, point.x, point.y) {
+        return None;
+    }
 
     // Ask the window server who owns that pixel right now, not who owned it when
     // the snapshot was taken.
@@ -453,9 +516,27 @@ fn window_focus_assist(
     }
 
     Some(cua_hid::ActivationAssist {
-        window_origin: (window_origin.x, window_origin.y),
+        window_origin: (live.frame.origin.x, live.frame.origin.y),
         activation_point: (point.x, point.y),
     })
+}
+
+/// How far an AX window frame may sit from a window-server frame and still be
+/// considered the same window.
+///
+/// Not zero: the two are reported by different subsystems and a point of
+/// disagreement is normal. Small enough that two genuinely different windows
+/// cannot both match, unless an app stacks windows within two points of each
+/// other — in which case the assist declines rather than guessing.
+const AX_WINDOW_MATCH_TOLERANCE: f64 = 2.0;
+
+/// Whether a screen point falls inside a frame, half-open on the far edges so
+/// adjacent frames cannot both claim it.
+fn frame_contains(frame: &CGRect, x: f64, y: f64) -> bool {
+    x >= frame.origin.x
+        && y >= frame.origin.y
+        && x < frame.origin.x + frame.size.width
+        && y < frame.origin.y + frame.size.height
 }
 
 /// An element's best on-screen point for a drawn cursor: its own
@@ -1114,6 +1195,7 @@ impl Inner {
                 process_key: key,
                 scoped: opts.scope.is_some(),
                 limits: opts.limits,
+                complete,
                 acted_on: false,
             },
         );
@@ -1184,9 +1266,10 @@ impl Inner {
                 Ok((info, node.element.clone(), describe_node(node)))
             }
             // Resolved against the snapshot's own geometry, not with
-            // `AXUIElementCopyElementAtPosition`. That API was measured to
-            // answer `AXMenuBar` for every point in a *background* app — which
-            // is every app cua-rs drives — so it silently retargeted every
+            // `AXUIElementCopyElementAtPosition`. On the app element of a
+            // *background* app that API answered `AXMenuBar` for every point
+            // tried — measured on one app, but every app cua-rs drives is
+            // backgrounded by design — so it silently retargeted those
             // coordinate click at the menu bar, and the failure surfaced as an
             // unrelated "the AX element and window snapshot drifted apart".
             // The snapshot already carries each element's frame, so the
@@ -1201,6 +1284,19 @@ impl Inner {
 
                 if snap.process_key != ProcessKey::for_pid(info.pid) {
                     return Err(CoreError::ProcessReplaced {
+                        app: info.name.clone(),
+                    });
+                }
+
+                // A coordinate is only meaningful against current geometry. An
+                // index keeps working after an action because it names an element
+                // and the element is re-read; a point names a *place*, and the
+                // element that occupied it may have moved. Opening a disclosure
+                // with `return_state: false` and then clicking the same point
+                // would otherwise resolve to whatever used to be there and act on
+                // that element wherever it is now.
+                if snap.acted_on {
+                    return Err(CoreError::StalePointGeometry {
                         app: info.name.clone(),
                     });
                 }
@@ -1276,7 +1372,7 @@ impl Inner {
             .snapshots
             .get(&info.pid)
             .ok_or("this app had no previous snapshot to diff against")?;
-        diff_basis(snap.scoped, snap.limits)?;
+        diff_basis(snap)?;
         Ok((
             crate::snapshot::render_tree(&snap.nodes, post_action_render()),
             snap.window.as_ref().map(|w| w.id),
@@ -1295,7 +1391,22 @@ impl Inner {
             limits: post_action_limits(),
             ..StateOptions::default()
         };
-        let state = self.get_app_state(query, opts).ok()?;
+        // A failed re-read is reported, not swallowed. Returning `None` here made
+        // it indistinguishable from `return_state: false`, so a caller could not
+        // tell "the window is gone" from "you did not ask".
+        let state = match self.get_app_state(query, opts) {
+            Ok(state) => state,
+            Err(e) => {
+                return Some(PostActionState {
+                    snapshot_id: None,
+                    diff: None,
+                    note: Some(format!(
+                        "the action ran, but the window could not be read afterwards, so its                          effect is unobserved: {e}"
+                    )),
+                    node_count: 0,
+                });
+            }
+        };
 
         // Only subtract trees that describe the same window. An action that
         // opens or switches windows — a chat row that opens a conversation —
@@ -1305,19 +1416,28 @@ impl Inner {
             .ok()
             .and_then(|info| self.snapshots.get(&info.pid))
             .and_then(|s| s.window.as_ref().map(|w| w.id));
-        let comparable = before.and_then(|(tree, before_window)| {
-            if before_window == after_window {
-                Ok(tree)
-            } else {
-                Err(
-                    "the window this app is showing is not the one the previous snapshot \
+        // Two unknown ids are not a match. Without Screen Recording no window can
+        // be identified at all, and treating `None == None` as "same window" made
+        // the diff subtract two entirely different windows and call the result a
+        // change set.
+        let comparable =
+            before.and_then(
+                |(tree, before_window)| match (before_window, after_window) {
+                    (Some(before_id), Some(after_id)) if before_id == after_id => Ok(tree),
+                    (Some(_), Some(_)) => Err(
+                        "the window this app is showing is not the one the previous snapshot \
                      described, so there is nothing to diff against",
-                )
-            }
-        });
+                    ),
+                    _ => Err(
+                        "this app's window could not be identified, so there is no evidence the \
+                     re-read describes the same window as the previous snapshot (a missing \
+                     Screen Recording grant is the usual reason)",
+                    ),
+                },
+            );
 
         Some(PostActionState {
-            snapshot_id: state.snapshot_id,
+            snapshot_id: Some(state.snapshot_id),
             diff: comparable
                 .as_ref()
                 .ok()
@@ -1457,7 +1577,7 @@ impl Inner {
             let app_el = Element::for_pid(info.pid);
             move || app_el.bool("AXFrontmost").unwrap_or(false)
         };
-        let assist = window_focus_assist(info.pid, &live_window.frame.origin);
+        let assist = window_focus_assist(info.pid, &live_window);
         cua_hid::click_background_pid(
             cua_hid::PidClick {
                 pid: info.pid,
@@ -1922,6 +2042,12 @@ fn best_window_match(
             candidates.first().map(|w| (*w).clone())
         }
         None => {
+            // No AX frame means no evidence tying any window to what
+            // accessibility is showing, and "largest wins" is a guess. Restrict
+            // the guess to level 0: level 3 is shared by ordinary floating
+            // windows and torn-off menus, and a menu picked here would have its
+            // window number stamped onto clicks meant for content.
+            candidates.retain(|w| w.layer == 0);
             candidates.sort_by(|a, b| {
                 let area = |w: &WindowInfo| w.frame.size.width * w.frame.size.height;
                 (area(b), b.on_screen)
@@ -2009,6 +2135,13 @@ fn hit_test(nodes: &[AxNode], x: f32, y: f32) -> Option<&AxNode> {
             b.is_actionable()
                 .cmp(&a.is_actionable())
                 .then(area(a).total_cmp(&area(b)))
+                // Equal frames are the common case, not an edge one: a table row
+                // and its single cell usually occupy exactly the same rectangle.
+                // Area cannot separate them, and without this the winner is
+                // whichever the breadth-first walk reached first — always the
+                // ancestor, so a point inside a cell selected its row. The deeper
+                // element is the more specific answer.
+                .then(b.depth.cmp(&a.depth))
         })
 }
 
@@ -2110,15 +2243,30 @@ mod tests {
         assert!(explained.contains("menu open"), "got {explained}");
     }
 
+    /// A snapshot with nothing in it but the properties `diff_basis` judges.
+    fn basis(scoped: bool, limits: Limits, complete: bool, acted_on: bool) -> Snapshot {
+        Snapshot {
+            id: 1,
+            nodes: Vec::new(),
+            window: None,
+            taken_at: Instant::now(),
+            process_key: ProcessKey::for_pid(std::process::id() as libc::pid_t),
+            scoped,
+            limits,
+            complete,
+            acted_on,
+        }
+    }
+
     #[test]
     fn a_default_whole_window_snapshot_is_a_fair_diff_basis() {
-        assert!(diff_basis(false, post_action_limits()).is_ok());
+        assert!(diff_basis(&basis(false, post_action_limits(), true, false)).is_ok());
     }
 
     #[test]
     fn a_scoped_or_capped_snapshot_is_refused_as_a_diff_basis() {
         assert!(
-            diff_basis(true, post_action_limits()).is_err(),
+            diff_basis(&basis(true, post_action_limits(), true, false)).is_err(),
             "a subtree cannot be subtracted from a whole window"
         );
         let capped = Limits {
@@ -2126,9 +2274,73 @@ mod tests {
             ..post_action_limits()
         };
         assert!(
-            diff_basis(false, capped).is_err(),
+            diff_basis(&basis(false, capped, true, false)).is_err(),
             "a 40-node walk of a 300-node window would report 260 nodes as new"
         );
+    }
+
+    #[test]
+    fn an_unfinished_walk_is_refused_as_a_diff_basis() {
+        // Equal caps are not enough: the time budget depends on how fast the app
+        // answers, so one walk can stop at 300 nodes and the next reach 500.
+        assert!(
+            diff_basis(&basis(false, post_action_limits(), false, false)).is_err(),
+            "nodes the first walk never reached would read as newly appeared"
+        );
+    }
+
+    #[test]
+    fn an_already_acted_on_snapshot_is_refused_as_a_diff_basis() {
+        assert!(
+            diff_basis(&basis(false, post_action_limits(), true, true)).is_err(),
+            "a diff would blame this action for the previous action's changes too"
+        );
+    }
+
+    #[test]
+    fn hit_test_breaks_an_equal_frame_tie_toward_the_deeper_element() {
+        // A row and its only cell normally occupy the same rectangle, so area
+        // cannot separate them. Without a depth tie-break the breadth-first walk
+        // order decides, which always favours the ancestor.
+        let mut row = placed(0, "AXRow", true, rect(0.0, 0.0, 500.0, 40.0));
+        row.depth = 3;
+        let mut cell = placed(1, "AXCell", true, rect(0.0, 0.0, 500.0, 40.0));
+        cell.depth = 4;
+        let nodes = vec![row, cell];
+        assert_eq!(
+            hit_test(&nodes, 10.0, 10.0).map(|n| n.index),
+            Some(1),
+            "the deeper element is the more specific answer"
+        );
+    }
+
+    #[test]
+    fn frame_contains_is_half_open_on_the_far_edges() {
+        let f = rect(10.0, 20.0, 100.0, 50.0);
+        assert!(frame_contains(&f, 10.0, 20.0), "the near corner is inside");
+        assert!(
+            !frame_contains(&f, 110.0, 40.0),
+            "the far x edge is outside"
+        );
+        assert!(!frame_contains(&f, 50.0, 70.0), "the far y edge is outside");
+        assert!(!frame_contains(&f, 9.0, 40.0));
+    }
+
+    #[test]
+    fn a_capture_failure_is_only_blamed_on_a_menu_for_the_window_server_refusal() {
+        let with_menu = vec![
+            tnode(0, "AXWindow", Some("Chat"), None, false),
+            tnode(1, "AXMenu", None, None, true),
+        ];
+        let unrelated = "screencapture worker timed out after 5s";
+        assert_eq!(
+            capture_failure_warning(unrelated, &with_menu),
+            unrelated,
+            "a timeout is not evidence about menus, even with a menu on screen"
+        );
+
+        let refusal = "screencapture exited with status 1: could not create image from window";
+        assert!(capture_failure_warning(refusal, &with_menu).contains("may be why"));
     }
 
     #[test]

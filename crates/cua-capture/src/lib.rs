@@ -161,11 +161,19 @@ pub struct WindowInfo {
 
 /// Highest window level still treated as ordinary content.
 ///
-/// `NSNormalWindowLevel` is 0 and `NSFloatingWindowLevel` is 3, and the gap
-/// between them holds nothing an app uses for chrome. Everything an agent must
-/// not drive — `NSSubmenuWindowLevel`/`NSTornOffMenuWindowLevel` (3 is *not*
-/// one of them), `NSStatusWindowLevel` (25), `NSPopUpMenuWindowLevel` (101),
-/// screen-saver and overlay levels — sits far above.
+/// `kCGNormalWindowLevel` is 0 and `kCGFloatingWindowLevel` is 3. Read from the
+/// installed SDK rather than assumed: `kCGMainMenuWindowLevel` is 24,
+/// `kCGStatusWindowLevel` is 25 and `kCGPopUpMenuWindowLevel` is 101, all far
+/// above this ceiling — **but `kCGTornOffMenuWindowLevel` is also 3**, sharing
+/// its level with ordinary floating panels. Level alone therefore cannot
+/// separate a floating content window from a torn-off menu, and this constant
+/// must not be read as "menus are excluded".
+///
+/// What keeps that from mattering is the caller. A target is chosen by matching
+/// the AX window's frame, so a menu window has to coincide with the frame of the
+/// window accessibility is showing to be picked at all. The one place that
+/// evidence is absent — the no-AX-frame fallback, which just takes the largest
+/// window — is restricted to level 0 for exactly this reason.
 ///
 /// This ceiling was raised from 0 after a measured failure: KakaoTalk publishes
 /// its chat-room windows at level 3, so a layer-0 rule dropped them from the

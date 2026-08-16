@@ -618,20 +618,17 @@ fn post_window_focus_click(
         assist.activation_point.1 - assist.window_origin.1,
     );
     let wid = window_number as u32;
+    // One event number for the pair, as in the main click path: AppKit pairs an
+    // up with its own down by this field, so allocating per half hands a view a
+    // mouse-up that belongs to no down it saw.
+    let event_number = nsevent::next_event_number();
 
     for (kind, pressure) in [
         (NSEventType::LeftMouseDown, 1.0_f32),
         (NSEventType::LeftMouseUp, 0.0_f32),
     ] {
-        let event = nsevent::mouse_event(
-            kind,
-            point,
-            window_number,
-            nsevent::next_event_number(),
-            1,
-            pressure,
-        )
-        .ok_or(HidError::NoSource)?;
+        let event = nsevent::mouse_event(kind, point, window_number, event_number, 1, pressure)
+            .ok_or(HidError::NoSource)?;
         post_mouse_event(pid, &event, point, window_local, wid, click_group_id)?;
         std::thread::sleep(std::time::Duration::from_millis(12));
     }

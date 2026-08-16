@@ -126,6 +126,14 @@ struct ActionArgs {
     /// will look at — filling three fields before submitting, say. That is the
     /// one case where the re-read is pure cost, and on an app with a slow
     /// accessibility tree the walk is seconds, not milliseconds.
+    ///
+    /// Read the diff as a *textual* delta, not as proof. Lines are compared
+    /// without their index or indentation, so two elements with identical text
+    /// are interchangeable: if a selection moves between two rows that read the
+    /// same, the diff is empty even though something changed. It is reliable for
+    /// structure arriving or leaving — a menu opening, a dialog replacing a pane
+    /// — and an empty diff means "no line-level difference", not "nothing
+    /// happened". To know one specific element's state, read that element.
     #[serde(default)]
     return_state: Option<bool>,
 }
@@ -746,9 +754,21 @@ fn render_post_action_state(state: &cua_core::PostActionState) -> String {
     // better handled by re-reading the tree deliberately.
     const MAX_LINES: usize = 40;
 
+    let Some(snapshot_id) = state.snapshot_id else {
+        // No snapshot means the re-read failed rather than finding nothing. Say
+        // so, because the action itself did happen.
+        return format!(
+            "\n\nstate after: unavailable\n  {}",
+            state
+                .note
+                .as_deref()
+                .unwrap_or("the window could not be re-read")
+        );
+    };
+
     let mut s = format!(
         "\n\nstate after (snapshot_id={}, {} elements):",
-        state.snapshot_id, state.node_count
+        snapshot_id, state.node_count
     );
 
     let Some(diff) = &state.diff else {

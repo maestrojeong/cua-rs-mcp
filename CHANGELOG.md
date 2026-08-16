@@ -5,6 +5,74 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.4.1
+
+Fixes from an external review of 0.4.0. Nothing here is a new feature; the first
+three are ways an action could act on the wrong thing.
+
+### The activation assist could click a window it never validated
+
+`window_focus_assist` chose its window with `AXFocusedWindow`, independently of
+the window being clicked. In a multi-window app — a chat app with a list window
+and several conversation windows, which is the case it was built for — it could
+take window A's activation point, localize it against window B's origin, and stamp
+B's window number onto a **real** synthesized click aimed at a point inside A. The
+live gate proved only "some window of this pid", which A satisfied.
+
+It now selects the AX window that corresponds to the window being clicked, by
+frame, and additionally requires the activation point to lie inside that window's
+own frame so the window-local coordinate cannot be negative or past the end.
+
+Its two synthesized events also shared no event number — down got N and up got
+N+1 — while the main click path hoists one number per pair precisely because
+AppKit pairs an up with its own down by that field.
+
+### Coordinates are refused against stale geometry
+
+`acted_on` was honored by `find` but not by coordinate resolution, so an action
+with `return_state: false` followed by an x/y click hit-tested pre-action frames.
+Opening a disclosure and clicking the same point would resolve to whatever used
+to be there. An index survives an action because it names an element; a point
+names a place, so it now errors instead.
+
+### The post-action diff refuses three more incomparable bases
+
+- A walk that did not finish. Equal caps do not imply equal coverage, because the
+  time budget depends on how fast the app answers: 300 nodes before against 500
+  after reported 200 nodes as newly appeared.
+- A snapshot an action already ran against, which attributed two actions' changes
+  to the second one.
+- Two windows that could not be identified. `None == None` was treated as "same
+  window", so without Screen Recording it diffed two entirely different windows.
+
+### The diff is documented as what it is
+
+A textual multiset delta, not verification. Because lines are compared without
+index or indentation, two elements with identical text are interchangeable: if a
+selection moves between two rows that read the same, the delta is empty. That is
+now stated in the tool description and in the code, rather than left for a caller
+to discover. The behaviour is unchanged — the noise reduction it buys is worth
+more than the identity it gives up, but only if callers know which they have.
+
+### Also
+
+- Window level 3 admits ordinary floating windows **and** `kCGTornOffMenuWindowLevel`,
+  which share that level. A comment claiming menu levels were all above the cutoff
+  was simply false, checked against the installed SDK. Frame matching is what
+  keeps a menu from being chosen, so the one path with no frame evidence — the
+  largest-window fallback — is now restricted to level 0.
+- Equal-frame overlaps break toward the deeper element. A row and its only cell
+  usually share a rectangle exactly, and the walk order always favoured the row.
+- A failed capture no longer asserts an open menu is the cause. It hedges, and
+  only for the specific window-server refusal it was observed with, not for
+  timeouts and encode errors that happen to coincide with a menu.
+- A failed post-action re-read is reported instead of looking identical to
+  `return_state: false`. A click that closes the only window lands here.
+- Corrected documentation: §6 claimed the activation notice is balanced per click
+  when it has not been since 0.4.0, and §10 now records the belief left standing
+  as a residual contract risk; §6's window-matching rule said level 0; §1
+  overstated that accessibility covers the whole capability.
+
 ## 0.4.0
 
 Behaviour a caller can see changed in three places, which is what makes this a

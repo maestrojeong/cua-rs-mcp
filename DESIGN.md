@@ -30,11 +30,12 @@ message and acts on it.
 
 ### This was verified, not assumed
 
-A computer-use tool can be built entirely out of accessibility actions: the
-whole capability is reachable through `AXUIElementPerformAction`,
-`AXUIElementSetAttributeValue` and `AXUIElementCopyAttributeValue`, and every AX
-symbol that requires is available in the public `objc2-application-services`
-crate. "Does not steal focus" is then not a feature flag but the absence of
+Most of a computer-use tool can be built out of accessibility actions alone —
+`AXUIElementPerformAction`, `AXUIElementSetAttributeValue` and
+`AXUIElementCopyAttributeValue`, all available in the public
+`objc2-application-services` crate. Not all of it: controls that advertise no AX
+action at all still need a synthesized event, which is why `cua-hid` exists and
+why the ceiling below is stated plainly rather than implied. "Does not steal focus" is then not a feature flag but the absence of
 event-posting code, which is a property a reader can check rather than trust.
 
 cua-rs keeps a public-API event path as its reliable click tier, and additionally
@@ -394,9 +395,13 @@ Actions come from AX (which knows `AXWindow` elements). Pixels come from SCK
 (which knows `CGWindowID`). Bridging them is normally done with
 `_AXUIElementGetWindow` — a private symbol.
 
-cua-rs matches on public API instead: same pid, plausible target (layer 0, ≥40pt
-each side), then the smallest frame distance to the AX frame. With no AX frame,
-the largest on-screen window wins.
+cua-rs matches on public API instead: same pid, plausible target (window level
+0-3, ≥40pt each side), then the smallest frame distance to the AX frame. With no
+AX frame there is no evidence tying any window to what accessibility is showing,
+so that fallback is narrower: the largest on-screen window *at level 0*. Level 3
+is shared by ordinary floating windows and `kCGTornOffMenuWindowLevel`, so
+admitting it without frame evidence could stamp a menu's window number onto a
+click meant for content.
 
 Trade-off, accepted deliberately: slightly fuzzier than the SPI, but it cannot
 break on a macOS update. Tolerant comparison is required because AX reports
@@ -429,11 +434,20 @@ The tradeoff is explicit and bounded:
   is still never called: it can divert a physical keystroke even without a window
   raise, and if the target's windows live on another Space macOS switches Spaces
   under the user. What *is* sent is an `NSEventTypeAppKitDefined` event with
-  subtype `ApplicationActivated`, posted into the target's own event queue and
-  balanced by `ApplicationDeactivated` after the click. The window server's key
-  focus never changes, so the user's typing keeps going where it was going; only
-  the target's private idea of "am I active" moves, for the duration of the
-  click. This reverses an earlier "no focus assist at all" stance, which was
+  subtype `ApplicationActivated`, posted into the target's own event queue. The
+  window server's key focus never changes, so the user's typing keeps going where
+  it was going; only the target's private idea of "am I active" moves.
+
+  That belief is **not** revoked per click. Sending a matching
+  `ApplicationDeactivated` after every click was measured to destroy the
+  key-window state the *next* click depended on, so it is off by default
+  (`CUA_DEACTIVATE_AFTER_CLICK=1` restores it for comparison). The belief is
+  therefore left standing, and the earlier claim that real AppKit events correct
+  it as soon as the user touches anything is **unverified** — macOS has no reason
+  to deactivate an app it never considered active. A target that keeps behaving as
+  though it were active is a residual contract risk; see §10.
+
+  This reverses an earlier "no focus assist at all" stance, which was
   measured to be the reason clicks on views that gate on `NSApp.isActive` — a
   chat app's conversation rows being the case that forced the issue — silently
   did nothing. The residual risk is second-order and app-specific: an app whose
@@ -595,6 +609,16 @@ the obvious next safety feature.
 
 **Point coordinates are AX-global.** Multi-display setups with negative origins
 are untested.
+
+**A target is left believing it is active.** The `ApplicationActivated` notice is
+not revoked after the click (§6), because revoking it broke the following click.
+Nothing verifies that the belief ever clears: macOS will not deactivate an app it
+never considered active, so it may persist until the app is genuinely activated.
+The observable consequences are app-specific — a view that only draws its
+selection highlight while active, a toolbar that stays enabled — and the sharp
+edge is an app whose own activation handler calls `activateIgnoringOtherApps:`,
+which would turn the notice into a real raise. Releasing the belief on a session
+boundary rather than per click is the shape of the fix, and it is not built.
 
 **Menu-opening controls: solved, and the fix was two bugs rather than a
 mechanism.** KakaoTalk's chat-room hamburger was the standing case — no AX
