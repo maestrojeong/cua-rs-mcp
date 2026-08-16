@@ -932,10 +932,11 @@ impl rmcp::ServerHandler for CuaServer {
              you can drive a background window while the user keeps working in another one. \
              Indices are only valid until \
              the next get_app_state for that app; pass snapshot_id to make staleness an error \
-             instead of a mis-click. Actions pass through three safety gates: apps that hold \
+             instead of a mis-click. Actions pass through four safety gates: apps that hold \
              credentials or system security state are never driven (reading them is still \
              allowed, minus screenshots), a target whose label reads as destructive needs \
-             confirm_destructive=true, and nothing is delivered while the session is locked. \
+             confirm_destructive=true, nothing is delivered while the session is locked, and — \
+             if the operator enabled it — cua-rs stands down on an app the human is using. \
              Every refusal names what to pass or change."
                 .to_string(),
         );

@@ -7,17 +7,21 @@
 //! agrees with it. Mixing them makes both harder to review, and `session.rs` is
 //! already the largest file here.
 //!
-//! # The three gates
+//! # The four gates
 //!
 //! | gate | default | flag | scope |
 //! |---|:--|:--|:--|
 //! | forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` disables | actions + screenshots |
 //! | destructive label | **on** | none — per-call `confirm_destructive` | activation-shaped actions |
 //! | screen lock | **on** | none | actions |
+//! | yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` enables | actions |
 //!
-//! All three are on by default because the cost of a false refusal is one round
-//! trip and an error message that says exactly how to proceed, while the cost
-//! of a false permit is a click that cannot be taken back.
+//! Three of the four are on by default because the cost of a false refusal is
+//! one round trip and an error message that says exactly how to proceed, while
+//! the cost of a false permit is a click that cannot be taken back. The fourth
+//! is off because turning it on installs an event tap, which is a reversal of a
+//! documented policy (DESIGN.md §9) and should be a choice rather than a
+//! surprise.
 //!
 //! # Why reads are not gated the same way as actions
 //!
@@ -48,7 +52,8 @@
 //! false negative costs a deleted conversation. Where the two could be traded
 //! off, this module takes the false positive.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::apps::AppInfo;
 use crate::session::Target;
@@ -112,6 +117,27 @@ pub enum Refused {
         target: String,
         matched: String,
     },
+
+    #[error(
+        "refusing to {verb} in `{app}`: the human took over. Real input arrived {ago_ms}ms ago \
+         while `{app}` was the frontmost app, and CUA_YIELD_TO_HUMAN=1 tells cua-rs to stand down \
+         rather than compete for the window somebody is using. Retry once they have left it alone \
+         for {idle_ms}ms, drive a different app, or unset CUA_YIELD_TO_HUMAN"
+    )]
+    HumanTookOver {
+        verb: &'static str,
+        app: String,
+        ago_ms: u64,
+        idle_ms: u64,
+    },
+
+    #[error(
+        "refusing to {verb}: CUA_YIELD_TO_HUMAN=1 asks cua-rs to stop when the human starts using \
+         the app it is driving, but the listen-only input tap that would notice could not be \
+         created ({reason}), so it cannot tell. This fails closed on purpose. Grant Accessibility \
+         to the process that launched cua-rs, or unset CUA_YIELD_TO_HUMAN"
+    )]
+    YieldWatchUnavailable { verb: &'static str, reason: String },
 }
 
 // ── environment flags ────────────────────────────────────────────────────────
@@ -144,6 +170,30 @@ pub fn forbidden_targets_allowed() -> bool {
             );
         }
         allowed
+    })
+}
+
+/// Whether cua-rs should stop acting on an app the human has started using.
+pub fn yield_to_human_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| flag("CUA_YIELD_TO_HUMAN"))
+}
+
+/// How long the human has to be idle before cua-rs picks the app back up.
+///
+/// Long enough that a pause between two keystrokes does not read as "they are
+/// done", short enough that an agent is not stalled for a whole turn.
+/// `CUA_YIELD_IDLE_MS` overrides it; values outside 250..=60000 are clamped
+/// rather than rejected, because a typo in an environment variable should not
+/// take the safety gate out of service in either direction.
+pub fn yield_idle_ms() -> u64 {
+    static IDLE: OnceLock<u64> = OnceLock::new();
+    *IDLE.get_or_init(|| {
+        std::env::var("CUA_YIELD_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(250, 60_000))
+            .unwrap_or(3_000)
     })
 }
 
@@ -636,6 +686,279 @@ fn screen_saver_running() -> bool {
     })
 }
 
+// ── yield to human ───────────────────────────────────────────────────────────
+
+/// Monotonic nanoseconds of the last real human input event, or `0`.
+///
+/// A process-global atomic rather than something the watcher owns, because the
+/// event-tap callback is a bare `extern "C"` function pointer with no captured
+/// state and this is the smallest thing it can safely touch.
+static LAST_HUMAN_INPUT: AtomicU64 = AtomicU64::new(0);
+
+/// Set by the callback when macOS disables the tap; cleared by the watcher
+/// thread after re-enabling it.
+static TAP_NEEDS_REENABLE: AtomicBool = AtomicBool::new(false);
+
+fn now_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, correctly typed timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// What the listen-only tap turned out to be.
+enum Watch {
+    /// `CUA_YIELD_TO_HUMAN` is not set. The gate never fires.
+    Off,
+    /// The tap is up and reporting.
+    On { stop: Arc<AtomicBool> },
+    /// The flag is set but the tap could not be created. Every action is
+    /// refused, because a yield gate that cannot see is worse than no gate: it
+    /// would silently promise a property it is not providing.
+    Broken { reason: String },
+}
+
+/// The listen-only input tap, and its thread.
+///
+/// # Why this exists at all, and why it does not break the promise
+///
+/// DESIGN.md §9 listed yield-to-human as deliberately not built, on the grounds
+/// that watching real input needs an event tap. The tap here is
+/// `kCGEventTapOptionListenOnly`, and its callback returns every event
+/// unchanged. A listen-only tap is not in the delivery path: it cannot swallow,
+/// delay, rewrite or reorder what the human typed. The property cua-rs promises
+/// — that it never takes the human's cursor, focus or keystrokes — is about
+/// *writing* to the shared input stream, and this only reads it. That is why
+/// the reversal is a flag rather than a default: it is a real change in what
+/// the process does, even though it is not a change in what the human
+/// experiences.
+///
+/// # What it records
+///
+/// A timestamp, and nothing else. Not the key, not the position, not the app.
+/// The gate's actual question — "is the human working in the app I am about to
+/// drive" — is answered at the action boundary by combining that timestamp with
+/// `NSWorkspace.frontmostApplication`, which is state cua-rs can read cheaply
+/// on the thread that is already asking. Keeping the callback down to one
+/// atomic store means it allocates nothing, takes no lock, and calls into no
+/// framework while sitting on the session's input path.
+pub struct HumanWatch {
+    watch: Watch,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Default for HumanWatch {
+    fn default() -> Self {
+        Self {
+            watch: Watch::Off,
+            thread: None,
+        }
+    }
+}
+
+impl HumanWatch {
+    /// Start watching, if the flag asks for it.
+    pub fn start() -> Self {
+        if !yield_to_human_enabled() {
+            return Self::default();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let thread_stop = stop.clone();
+
+        let thread = std::thread::Builder::new()
+            .name("cua-human-watch".into())
+            .spawn(move || run_watch_loop(&thread_stop, &ready_tx))
+            .map_err(|e| e.to_string());
+
+        let thread = match thread {
+            Ok(t) => t,
+            Err(reason) => {
+                return Self {
+                    watch: Watch::Broken { reason },
+                    thread: None,
+                }
+            }
+        };
+
+        // The tap either exists or it does not, and the answer arrives in
+        // microseconds. Waiting for it here means the first action already
+        // knows, instead of racing the thread and reading a stale "fine".
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    "CUA_YIELD_TO_HUMAN=1: watching real input through a listen-only tap; \
+                     actions on an app the human is using will be refused"
+                );
+                Self {
+                    watch: Watch::On { stop },
+                    thread: Some(thread),
+                }
+            }
+            Ok(Err(reason)) => {
+                tracing::error!("yield-to-human tap unavailable: {reason}");
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Self {
+                    watch: Watch::Broken { reason },
+                    thread: None,
+                }
+            }
+            Err(_) => Self {
+                watch: Watch::Broken {
+                    reason: "the watcher thread exited before reporting".to_string(),
+                },
+                thread: None,
+            },
+        }
+    }
+
+    /// Milliseconds since the last human input event, when the watch is up.
+    fn since_human_input_ms(&self) -> Option<u64> {
+        match self.watch {
+            Watch::On { .. } => {
+                let last = LAST_HUMAN_INPUT.load(Ordering::Relaxed);
+                if last == 0 {
+                    return None;
+                }
+                Some(now_nanos().saturating_sub(last) / 1_000_000)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Drop for HumanWatch {
+    /// Tear the tap down.
+    ///
+    /// The thread polls its run loop in short slices rather than blocking in
+    /// `CFRunLoopRun`, so stopping it is a flag plus a join and needs no
+    /// cross-thread `CFRunLoopStop` against a `!Send` run-loop handle. The
+    /// join matters: the `CFMachPort` must be invalidated on the thread that
+    /// created it, before the process tears down around it.
+    fn drop(&mut self) {
+        if let Watch::On { stop } = &self.watch {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The tap callback. Returns its event untouched, always.
+///
+/// # Safety
+///
+/// Matches `CGEventTapCallBack`. Touches nothing but two atomics, so it is safe
+/// to run on the session's input path.
+unsafe extern "C-unwind" fn tap_callback(
+    _proxy: objc2_core_graphics::CGEventTapProxy,
+    event_type: objc2_core_graphics::CGEventType,
+    event: std::ptr::NonNull<objc2_core_graphics::CGEvent>,
+    _user_info: *mut std::ffi::c_void,
+) -> *mut objc2_core_graphics::CGEvent {
+    // macOS disables a tap that has been unresponsive, and tells it so through
+    // these two pseudo-events. A listen-only tap should never see the timeout
+    // one, but a tap that has been silently switched off is a yield gate that
+    // has silently stopped working, so it is handled rather than assumed away.
+    const DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const DISABLED_BY_USER: u32 = 0xFFFF_FFFF;
+    if event_type.0 == DISABLED_BY_TIMEOUT || event_type.0 == DISABLED_BY_USER {
+        TAP_NEEDS_REENABLE.store(true, Ordering::Relaxed);
+    } else {
+        LAST_HUMAN_INPUT.store(now_nanos(), Ordering::Relaxed);
+    }
+    // Unchanged, and not consumed. This is the whole reason a listen-only tap
+    // is compatible with the project's promise.
+    event.as_ptr()
+}
+
+/// Own the tap and pump its run loop until asked to stop.
+fn run_watch_loop(
+    stop: &AtomicBool,
+    ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) {
+    use objc2_core_foundation::{kCFRunLoopDefaultMode, CFMachPort, CFRunLoop};
+    use objc2_core_graphics::{
+        CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    };
+
+    /// Only the events that mean a person is present. Mouse *movement* is
+    /// excluded deliberately: a cursor nudged by a trackpad brush is not
+    /// somebody taking over a window, and including it would make the gate fire
+    /// on almost any desk.
+    fn mask_for(types: &[u32]) -> u64 {
+        types.iter().fold(0u64, |m, t| m | (1u64 << t))
+    }
+    // kCGEventLeftMouseDown/Up, RightMouseDown/Up, KeyDown/Up, FlagsChanged,
+    // ScrollWheel, OtherMouseDown.
+    let mask = mask_for(&[1, 2, 3, 4, 10, 11, 12, 22, 25]);
+
+    // SAFETY: `tap_callback` has the required signature and touches no user
+    // info, so a null `user_info` is correct.
+    let port = unsafe {
+        CGEvent::tap_create(
+            CGEventTapLocation::AnnotatedSessionEventTap,
+            CGEventTapPlacement::TailAppendEventTap,
+            CGEventTapOptions::ListenOnly,
+            mask,
+            Some(tap_callback),
+            std::ptr::null_mut(),
+        )
+    };
+
+    let Some(port) = port else {
+        let _ = ready.send(Err(
+            "CGEventTapCreate returned nothing, which on macOS means the process that launched \
+             cua-rs holds neither Accessibility nor Input Monitoring"
+                .to_string(),
+        ));
+        return;
+    };
+
+    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&port), 0) else {
+        let _ = ready.send(Err(
+            "the input tap could not be attached to a run loop".to_string()
+        ));
+        port.invalidate();
+        return;
+    };
+
+    let Some(run_loop) = CFRunLoop::current() else {
+        let _ = ready.send(Err("this thread has no run loop".to_string()));
+        port.invalidate();
+        return;
+    };
+    // SAFETY: reading the framework's own mode constant.
+    let mode = unsafe { kCFRunLoopDefaultMode };
+    run_loop.add_source(Some(&source), mode);
+    CGEvent::tap_enable(&port, true);
+
+    let _ = ready.send(Ok(()));
+
+    // Short slices rather than one blocking `CFRunLoopRun`, so teardown is a
+    // flag rather than a cross-thread stop against a `!Send` handle. 250 ms is
+    // the whole cost of shutting the server down.
+    while !stop.load(Ordering::Relaxed) {
+        CFRunLoop::run_in_mode(mode, 0.25, false);
+        if TAP_NEEDS_REENABLE.swap(false, Ordering::Relaxed) {
+            tracing::warn!("the yield-to-human input tap was disabled by macOS; re-enabling");
+            CGEvent::tap_enable(&port, true);
+        }
+    }
+
+    run_loop.remove_source(Some(&source), mode);
+    CGEvent::tap_enable(&port, false);
+    port.invalidate();
+}
+
 // ── the gate ─────────────────────────────────────────────────────────────────
 
 /// One action's worth of safety context, assembled by the caller in `session`.
@@ -704,6 +1027,7 @@ impl Gate {
 /// down the wrong path.
 pub(crate) fn guard(
     app: &AppInfo,
+    watch: &HumanWatch,
     gate: &Gate,
     candidate: Option<&Candidate>,
 ) -> std::result::Result<(), Refused> {
@@ -722,6 +1046,36 @@ pub(crate) fn guard(
                     bundle_id: bundle_id.to_string(),
                     why,
                 });
+            }
+        }
+    }
+
+    match &watch.watch {
+        Watch::Off => {}
+        Watch::Broken { reason } => {
+            return Err(Refused::YieldWatchUnavailable {
+                verb,
+                reason: reason.clone(),
+            })
+        }
+        Watch::On { .. } => {
+            let idle_ms = yield_idle_ms();
+            if let Some(ago_ms) = watch.since_human_input_ms() {
+                // The pid test is what keeps this from firing on the whole
+                // point of the project. cua-rs never activates an app, so an
+                // app it is driving is frontmost only because the human put it
+                // there; input arriving while that is true is the human's, and
+                // input arriving while some other app is frontmost is the human
+                // working somewhere else, which is exactly the case cua-rs
+                // exists to run alongside.
+                if ago_ms < idle_ms && crate::apps::frontmost_pid() == Some(app.pid) {
+                    return Err(Refused::HumanTookOver {
+                        verb,
+                        app: app.name.clone(),
+                        ago_ms,
+                        idle_ms,
+                    });
+                }
             }
         }
     }
@@ -1112,6 +1466,26 @@ mod tests {
     }
 
     #[test]
+    fn a_yield_error_says_how_to_resume() {
+        let text = Refused::HumanTookOver {
+            verb: "click",
+            app: "KakaoTalk".to_string(),
+            ago_ms: 120,
+            idle_ms: 3_000,
+        }
+        .to_string();
+        assert!(text.contains("3000ms"));
+        assert!(text.contains("CUA_YIELD_TO_HUMAN"));
+    }
+
+    #[test]
+    fn a_watch_that_was_never_started_never_refuses() {
+        let watch = HumanWatch::default();
+        assert!(watch.since_human_input_ms().is_none());
+        assert!(matches!(watch.watch, Watch::Off));
+    }
+
+    #[test]
     fn the_screenshot_refusal_explains_itself_when_it_fires() {
         // Calls the classifier directly rather than `screenshot_refusal`, which
         // consults a process-wide env flag another test could have set.
@@ -1119,5 +1493,22 @@ mod tests {
         assert!(forbidden_bundle(a.bundle_id.as_deref().unwrap()).is_some());
         let a = app("TextEdit", "com.apple.TextEdit");
         assert!(forbidden_bundle(a.bundle_id.as_deref().unwrap()).is_none());
+    }
+
+    #[test]
+    fn the_idle_window_is_clamped_into_something_usable() {
+        // The parse-and-clamp rule, exercised without mutating the process
+        // environment (`yield_idle_ms` caches its answer for the process).
+        let parse = |v: &str| {
+            v.trim()
+                .parse::<u64>()
+                .ok()
+                .map(|n| n.clamp(250, 60_000))
+                .unwrap_or(3_000)
+        };
+        assert_eq!(parse("5000"), 5_000);
+        assert_eq!(parse("1"), 250);
+        assert_eq!(parse("999999"), 60_000);
+        assert_eq!(parse("nonsense"), 3_000);
     }
 }

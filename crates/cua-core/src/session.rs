@@ -847,6 +847,10 @@ struct Inner {
     /// empty" and "the app refused to build one" have to be told apart in the
     /// response rather than guessed at by the caller.
     enablement: HashMap<ProcessKey, cua_ax::Enablement>,
+    /// The listen-only input tap behind `CUA_YIELD_TO_HUMAN`, shared with
+    /// [`Cua`] so the tap is torn down when the last handle goes away rather
+    /// than leaking for the life of the process. Inert unless the flag is set.
+    human: std::sync::Arc<crate::safety::HumanWatch>,
 }
 
 /// Identifies a process incarnation, not just a pid slot.
@@ -909,18 +913,29 @@ pub struct Cua {
     /// single-threaded AX worker — there is no reason to serialize a stdin
     /// write behind tree walks and clicks.
     overlay: std::sync::Arc<Overlay>,
+    /// Held only to keep the yield-to-human tap alive for as long as any handle
+    /// to this server is. Dropping the last one stops the tap's thread.
+    _human: std::sync::Arc<crate::safety::HumanWatch>,
 }
 
 impl Cua {
     /// Spawn the worker thread.
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        // Started before the worker so the first action already knows whether
+        // the tap is up, rather than racing it. A no-op unless
+        // `CUA_YIELD_TO_HUMAN=1`.
+        let human = std::sync::Arc::new(crate::safety::HumanWatch::start());
+        let worker_human = human.clone();
         std::thread::Builder::new()
             .name("cua-native".into())
             // AX tree walks recurse and some apps are pathologically deep.
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                let mut inner = Inner::default();
+                let mut inner = Inner {
+                    human: worker_human,
+                    ..Inner::default()
+                };
                 while let Ok(job) = rx.recv() {
                     // One malformed tree must not take down the worker and with
                     // it every future tool call, so each job is isolated.
@@ -936,6 +951,7 @@ impl Cua {
         Self {
             tx,
             overlay: std::sync::Arc::new(Overlay::new()),
+            _human: human,
         }
     }
 
@@ -1581,7 +1597,7 @@ impl Inner {
         // resolve is left to the action, which reports that better.
         if let Ok(info) = apps::resolve_app(query) {
             let candidate = gate.target().and_then(|t| self.safety_candidate(query, t));
-            crate::safety::guard(&info, &gate, candidate.as_ref())?;
+            crate::safety::guard(&info, &self.human, &gate, candidate.as_ref())?;
         }
 
         let before = if return_state {
