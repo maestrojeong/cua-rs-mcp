@@ -386,9 +386,12 @@ pub struct ActionResult {
     /// missing value never surfaces as an error, and it never has to be kept
     /// stable for callers outside this crate.
     point: Option<(f64, f64)>,
-    /// CGWindowID used only to pin the drawn cursor immediately above the
-    /// target window instead of above unrelated foreground windows.
-    overlay_window_id: Option<u32>,
+    /// CGWindowID and owning pid, used only to pin the drawn cursor
+    /// immediately above the target window and to let the overlay hide
+    /// itself the moment a *different* app becomes frontmost, rather than
+    /// trusting window ordering alone to keep it from showing above
+    /// whatever the human just switched to.
+    overlay_target: Option<(u32, libc::pid_t)>,
     /// What the window looked like after the action, when the caller asked.
     pub state: Option<PostActionState>,
 }
@@ -440,13 +443,13 @@ impl ActionResult {
             ui_changed,
             delivery: Delivery::Ax,
             point,
-            overlay_window_id: None,
+            overlay_target: None,
             state: None,
         }
     }
 
-    fn with_overlay_window(mut self, window_id: Option<u32>) -> Self {
-        self.overlay_window_id = window_id;
+    fn with_overlay_target(mut self, target: Option<(u32, libc::pid_t)>) -> Self {
+        self.overlay_target = target;
         self
     }
 }
@@ -824,7 +827,7 @@ impl Cua {
         let result = self.exec(f)?;
         if let Ok(r) = &result {
             if let Some((x, y)) = r.point {
-                self.overlay.mark(x, y, clicking, r.overlay_window_id);
+                self.overlay.mark(x, y, clicking, r.overlay_target);
             }
         }
         result
@@ -1481,7 +1484,7 @@ impl Inner {
                 Ok(verb) => {
                     let changed = self.changed_since(info.pid, before);
                     return Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
-                        .with_overlay_window(self.overlay_window_id(info.pid)));
+                        .with_overlay_target(self.overlay_target(info.pid)));
                 }
                 Err(e) => e,
             }
@@ -1600,7 +1603,7 @@ impl Inner {
             ui_changed: changed,
             delivery: Delivery::Pid,
             point: Some((x, y)),
-            overlay_window_id: Some(wid),
+            overlay_target: Some((wid, info.pid)),
             state: None,
         })
     }
@@ -1613,7 +1616,7 @@ impl Inner {
         let changed = self.changed_since(info.pid, before);
         Ok(
             ActionResult::ax_at("AXValue=", desc, changed, element_point(&el))
-                .with_overlay_window(self.overlay_window_id(info.pid)),
+                .with_overlay_target(self.overlay_target(info.pid)),
         )
     }
 
@@ -1631,7 +1634,7 @@ impl Inner {
             changed,
             element_point(&el),
         )
-        .with_overlay_window(self.overlay_window_id(info.pid)))
+        .with_overlay_target(self.overlay_target(info.pid)))
     }
 
     fn select_text(
@@ -1659,7 +1662,7 @@ impl Inner {
             Observed::Unknown,
             element_point(&el),
         )
-        .with_overlay_window(self.overlay_window_id(info.pid)))
+        .with_overlay_target(self.overlay_target(info.pid)))
     }
 
     fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {
@@ -1692,7 +1695,7 @@ impl Inner {
             changed,
             element_point(&el),
         )
-        .with_overlay_window(self.overlay_window_id(info.pid)))
+        .with_overlay_target(self.overlay_target(info.pid)))
     }
 
     fn perform_action(
@@ -1717,7 +1720,7 @@ impl Inner {
         let changed = self.changed_since(info.pid, before);
         Ok(
             ActionResult::ax_at(action, desc, changed, element_point(&el))
-                .with_overlay_window(self.overlay_window_id(info.pid)),
+                .with_overlay_target(self.overlay_target(info.pid)),
         )
     }
 
@@ -1815,14 +1818,14 @@ impl Inner {
         }
         let changed = self.changed_since(info.pid, before);
         Ok(ActionResult::ax_at(verb, desc, changed, element_point(&el))
-            .with_overlay_window(self.overlay_window_id(info.pid)))
+            .with_overlay_target(self.overlay_target(info.pid)))
     }
 
-    fn overlay_window_id(&self, pid: libc::pid_t) -> Option<u32> {
+    fn overlay_target(&self, pid: libc::pid_t) -> Option<(u32, libc::pid_t)> {
         self.snapshots
             .get(&pid)
             .and_then(|snapshot| snapshot.window.as_ref())
-            .map(|window| window.id)
+            .map(|window| (window.id, pid))
     }
 
     /// A cheap proxy for "did the UI move".

@@ -5,6 +5,29 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.4.2
+
+### The drawn cursor no longer floats over another app
+
+`cua-overlay` positioned itself with `setLevel(0)` plus
+`orderWindow(Above, target_window_id)`, which only means anything while the
+target window is alive and on the current Space. The overlay itself joins all
+Spaces, so switching Space or going full-screen leaves it ordered relative to a
+window that is not there — and the arrow could stay visible above whatever the
+human switched to.
+
+Ordering is no longer trusted on its own. The overlay polls
+`NSWorkspace.frontmostApplication()` each frame and hides the arrow whenever the
+pid it is pinned to is not the frontmost app, without asking why. That covers
+every way ordering can fail at once — Space switch, full-screen, timing — and it
+fails in the safe direction: a false positive costs one hidden arrow that returns
+on the next command, a false negative is an arrow drawn over someone else's work.
+The `move`/`click` protocol therefore carries a `pid` alongside the window id.
+
+Notably **not** included: the focus-stealing machinery a shipped implementation
+uses for this (a preventer process tap, re-activating the target). That takes
+focus away from other apps, which §9 rules out, and it was not the cause here.
+
 ## 0.4.1
 
 Fixes from an external review of 0.4.0. Nothing here is a new feature; the first

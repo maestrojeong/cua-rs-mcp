@@ -12,6 +12,7 @@ name = "cua-overlay"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -25,6 +26,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "objc2-core-foundation",
     "NSApplication",
     "NSRunningApplication",
+    "NSWorkspace",
     "NSWindow",
     "NSView",
     "NSResponder",

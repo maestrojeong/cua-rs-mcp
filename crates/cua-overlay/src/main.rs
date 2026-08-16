@@ -16,6 +16,15 @@
 //! implementation uses: a long-lived process that draws, a thin caller that
 //! tells it where.
 //!
+//! # Motion
+//!
+//! The arrow never teleports between commands. Each `move`/`click` sets a
+//! *target*; a critically-ish-damped spring chases it every frame, with the
+//! constants tuned here by eye. Left alone at rest for a moment it also
+//! breathes — a slow, faint vertical bob plus a barely-there halo — which says
+//! "the agent is still here, just not moving" so a stationary arrow does not
+//! read as a stuck or dead process.
+//!
 //! # Protocol
 //!
 //! Line-oriented on stdin, so a caller needs no library and a human can drive
@@ -33,17 +42,43 @@
 //! centre straight through without converting.
 
 use std::cell::Cell;
+use std::f64::consts::PI;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DeclaredClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
     NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowOrderingMode,
-    NSWindowStyleMask,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-/// What the arrow is doing, in screen points with a top-left origin.
+/// Spring stiffness (`k`, in px/s² per px of displacement) and damping (`c`,
+/// in 1/s) driving the chase toward the target. Slightly under critical
+/// damping (critical for these values is `2*sqrt(k)` ≈ 32) on purpose: a
+/// small, quick overshoot reads as physical motion rather than a slide, the
+/// same reason the shipping overlay this is calibrated against bothers with
+/// spring parameters at all instead of a linear tween.
+const SPRING_STIFFNESS: f64 = 260.0;
+const SPRING_DAMPING: f64 = 27.0;
+/// Below this distance *and* speed, snap exactly onto the target and stop
+/// integrating — otherwise floating point noise keeps the spring "settling"
+/// forever, which would keep the idle-breathing clock from ever starting.
+const SETTLE_DISTANCE: f64 = 0.4;
+const SETTLE_SPEED: f64 = 4.0;
+/// How long the arrow must sit still before it starts breathing.
+const IDLE_DELAY: f64 = 0.5;
+/// Seconds per breath cycle, and how far it bobs.
+const BREATH_PERIOD: f64 = 2.4;
+const BREATH_AMPLITUDE: f64 = 1.6;
+/// How long the click ring takes to fade out after a click command.
+const CLICK_FADE: f64 = 0.22;
+
+/// What the arrow is doing, in screen points with a top-left origin. This is
+/// the *target* state a command sets; `CursorViewState` tracks where the
+/// arrow actually is separately, since those two are no longer the same
+/// point once motion is animated.
 #[derive(Clone, Copy, Default)]
 struct Marker {
     x: f64,
@@ -58,10 +93,25 @@ struct Marker {
 struct OverlayCommand {
     marker: Marker,
     window_id: Option<u32>,
+    /// The pid the marker is currently pointing at. Kept alongside
+    /// `window_id` (rather than looked up from it) so the frontmost-mismatch
+    /// check in the main loop costs no extra window-list query.
+    pid: Option<libc::pid_t>,
 }
 
 struct CursorViewState {
-    marker: Cell<Marker>,
+    /// Where the next command wants the arrow.
+    target: Cell<Marker>,
+    /// Where it actually is right now, mid-spring.
+    pos: Cell<(f64, f64)>,
+    vel: Cell<(f64, f64)>,
+    /// When the arrow last started a click flash; `None` once it has fully
+    /// faded, so a stale click can't relight itself.
+    click_started: Cell<Option<Instant>>,
+    /// When the arrow came to rest, for the breathing clock. `None` while
+    /// still moving.
+    idle_since: Cell<Option<Instant>>,
+    last_tick: Cell<Instant>,
 }
 
 define_class!(
@@ -73,29 +123,58 @@ define_class!(
     impl CursorView {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let m = self.ivars().marker.get();
-            if !m.visible {
+            let ivars = self.ivars();
+            let target = ivars.target.get();
+            if !target.visible {
                 return;
             }
             // The view is flipped so callers can speak screen coordinates.
-            let (x, y) = (m.x, m.y);
+            let (x, mut y) = ivars.pos.get();
 
-            if m.clicking {
-                // A small, quiet ring at the click point: a faint glow plus a
-                // crisp thin outline, not a big flat disc — the old radius-18
-                // filled circle read as an alert, not a cursor. Drawn first so
-                // the arrow sits on top of it rather than being swallowed by
-                // it.
-                let r = 8.0;
-                let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                    NSPoint::new(x - r, y - r),
-                    NSSize::new(r * 2.0, r * 2.0),
-                ));
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.18).setFill();
-                ring.fill();
-                ring.setLineWidth(1.2);
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.75).setStroke();
-                ring.stroke();
+            // A slow, faint bob once the arrow has been at rest a moment —
+            // "the agent is still here" rather than "the agent just did
+            // something", which the spring alone can't say since it goes
+            // silent the instant it settles.
+            if let Some(since) = ivars.idle_since.get() {
+                let idle_for = since.elapsed().as_secs_f64();
+                if idle_for > IDLE_DELAY {
+                    let phase = (idle_for - IDLE_DELAY) * (2.0 * PI / BREATH_PERIOD);
+                    y += phase.sin() * BREATH_AMPLITUDE;
+
+                    let r = 11.0;
+                    let glow_alpha = 0.05 + 0.05 * (0.5 + 0.5 * phase.sin());
+                    let halo = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                        NSPoint::new(x - r, y - r),
+                        NSSize::new(r * 2.0, r * 2.0),
+                    ));
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, glow_alpha)
+                        .setFill();
+                    halo.fill();
+                }
+            }
+
+            if let Some(started) = ivars.click_started.get() {
+                let elapsed = started.elapsed().as_secs_f64();
+                let alpha = (1.0 - elapsed / CLICK_FADE).max(0.0);
+                if alpha > 0.0 {
+                    // A small, quiet ring at the click point that expands
+                    // slightly as it fades — a quick ripple rather than a
+                    // static disc, so a repeated click at the same point
+                    // still reads as a new event. Drawn first so the arrow
+                    // sits on top of it rather than being swallowed by it.
+                    let r = 8.0 + (1.0 - alpha) * 5.0;
+                    let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                        NSPoint::new(x - r, y - r),
+                        NSSize::new(r * 2.0, r * 2.0),
+                    ));
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.18 * alpha)
+                        .setFill();
+                    ring.fill();
+                    ring.setLineWidth(1.2);
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.95, 0.75 * alpha)
+                        .setStroke();
+                    ring.stroke();
+                }
             }
 
             // The "presence cursor" silhouette used by Figma, Notion and
@@ -147,15 +226,87 @@ define_class!(
 
 impl CursorView {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let now = Instant::now();
         let this = Self::alloc(mtm).set_ivars(CursorViewState {
-            marker: Cell::new(Marker::default()),
+            target: Cell::new(Marker::default()),
+            pos: Cell::new((0.0, 0.0)),
+            vel: Cell::new((0.0, 0.0)),
+            click_started: Cell::new(None),
+            idle_since: Cell::new(None),
+            last_tick: Cell::new(now),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
-    fn set_marker(&self, m: Marker) {
-        self.ivars().marker.set(m);
-        self.setNeedsDisplay(true);
+    /// Record a new command. Motion toward it happens later, in `advance`;
+    /// this only decides what changed *as of this command* — a fresh click
+    /// flash, or an instant (non-animated) appearance the first time the
+    /// arrow becomes visible.
+    fn set_target(&self, m: Marker) {
+        let ivars = self.ivars();
+        let prev = ivars.target.get();
+
+        if m.visible && !prev.visible {
+            // Reappearing after being hidden: snap straight there rather than
+            // sliding in from wherever it last was (or the origin, for the
+            // very first command), which would read as the arrow crossing
+            // the screen for no reason.
+            ivars.pos.set((m.x, m.y));
+            ivars.vel.set((0.0, 0.0));
+            ivars.idle_since.set(Some(Instant::now()));
+        }
+        if m.clicking {
+            // Every click command restarts the flash, even a repeated one at
+            // the same point — a double-click should ripple twice.
+            ivars.click_started.set(Some(Instant::now()));
+        }
+        ivars.target.set(m);
+    }
+
+    /// Step the spring and the idle clock by however much time actually
+    /// passed. Returns whether the view has anything left to animate, so the
+    /// caller only pays for a redraw while something is visible.
+    fn advance(&self) -> bool {
+        let ivars = self.ivars();
+        let now = Instant::now();
+        // Clamped so a paused/backgrounded process resuming doesn't feed the
+        // spring a huge `dt` and fling the arrow across the screen.
+        let dt = (now - ivars.last_tick.get()).as_secs_f64().min(0.05);
+        ivars.last_tick.set(now);
+
+        let target = ivars.target.get();
+        if !target.visible {
+            return false;
+        }
+
+        let (mut px, mut py) = ivars.pos.get();
+        let (mut vx, mut vy) = ivars.vel.get();
+        let dx = target.x - px;
+        let dy = target.y - py;
+        let ax = SPRING_STIFFNESS * dx - SPRING_DAMPING * vx;
+        let ay = SPRING_STIFFNESS * dy - SPRING_DAMPING * vy;
+        vx += ax * dt;
+        vy += ay * dt;
+        px += vx * dt;
+        py += vy * dt;
+
+        let settled = (dx * dx + dy * dy).sqrt() < SETTLE_DISTANCE
+            && (vx * vx + vy * vy).sqrt() < SETTLE_SPEED;
+        if settled {
+            px = target.x;
+            py = target.y;
+            vx = 0.0;
+            vy = 0.0;
+            if ivars.idle_since.get().is_none() {
+                ivars.idle_since.set(Some(now));
+            }
+        } else {
+            ivars.idle_since.set(None);
+        }
+
+        ivars.pos.set((px, py));
+        ivars.vel.set((vx, vy));
+        true
     }
 }
 
@@ -222,6 +373,7 @@ fn main() {
                     let x: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     let y: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     let window_id = it.next().and_then(|v| v.parse().ok());
+                    let pid = it.next().and_then(|v| v.parse().ok());
                     OverlayCommand {
                         marker: Marker {
                             x,
@@ -230,6 +382,7 @@ fn main() {
                             clicking,
                         },
                         window_id,
+                        pid,
                     }
                 }
                 Some("hide") => OverlayCommand::default(),
@@ -242,15 +395,43 @@ fn main() {
         }
     });
 
-    // Pump the run loop in short slices and apply whatever the reader queued.
-    // Simpler than a custom run-loop source, and 20 ms is far below the
-    // threshold where a moving arrow looks stepped.
+    // The pid the marker currently claims to point at, so the frontmost check
+    // below has something to compare against. `None` whenever nothing is
+    // showing, so a hidden marker can't be "hidden again" every tick.
+    let mut pinned_pid: Option<libc::pid_t> = None;
+
+    // Pump the run loop in short slices, apply whatever the reader queued,
+    // then step the spring/idle animation and repaint if it changed
+    // anything. 20 ms is far below the threshold where either the chase or
+    // the breathing motion would look stepped.
     loop {
         while let Ok(command) = rx.try_recv() {
             if let Some(window_id) = command.window_id {
                 window.orderWindow_relativeTo(NSWindowOrderingMode::Above, window_id as isize);
             }
-            view.set_marker(command.marker);
+            pinned_pid = command.pid;
+            view.set_target(command.marker);
+        }
+
+        // Window ordering alone is what is supposed to keep the arrow from
+        // showing above whatever the human just switched to — `orderWindow:
+        // relativeTo:` puts it just above the target's current stacking
+        // position, so a real foreground app should already bury it. This is
+        // the belt to that suspenders: if the pinned pid is no longer the
+        // frontmost app at all (a Space switch, a full-screen app, or any
+        // other case ordering alone doesn't cover), hide outright rather than
+        // trust that ordering caught it. A false positive here costs one
+        // hidden arrow that reappears on the next command; a false negative
+        // is an arrow floating over someone else's work.
+        if let Some(pid) = pinned_pid {
+            if frontmost_pid() != Some(pid) {
+                pinned_pid = None;
+                view.set_target(Marker::default());
+            }
+        }
+
+        if view.advance() {
+            view.setNeedsDisplay(true);
         }
         unsafe {
             objc2_core_foundation::CFRunLoop::run_in_mode(
@@ -260,4 +441,17 @@ fn main() {
             );
         }
     }
+}
+
+/// The pid of whatever app is frontmost right now, per `NSWorkspace` — the
+/// same source of truth a click's activation notice targets, and distinct
+/// from what an individual app's own `AXFrontmost` believes (see
+/// `window_focus_assist` in `cua-core` for why that distinction matters
+/// there too).
+fn frontmost_pid() -> Option<libc::pid_t> {
+    Some(
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()?
+            .processIdentifier(),
+    )
 }
