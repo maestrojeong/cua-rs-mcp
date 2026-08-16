@@ -267,6 +267,13 @@ spots.
 
 Chromium content degrades under any AX-only tool; hand the web to
 [browser-rs](https://github.com/maestrojeong/browser-rs-mcp) over CDP instead.
+Measured, and a second reason for the same advice: **Chrome and Safari accept no
+synthesized pointer input at all while their app is not frontmost** — a click and
+a `mouseMoved` at the same pixel of the same window were both ignored in the
+background and both honoured the moment the app was active, while a background
+click on TextEdit worked in the same session. So a browser is outside the one
+property this server exists to provide, and CDP is the right tool rather than the
+consolation prize.
 
 ## License
 
