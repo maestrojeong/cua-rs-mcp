@@ -250,6 +250,77 @@ fn cua_key_ax_only_restores_the_old_chord_refusal() {
 }
 
 #[test]
+fn type_text_advertises_the_mechanism_choice() {
+    // The keystroke path is only reachable if the argument that selects it is
+    // in the advertised schema. A caller cannot guess a parameter the tool
+    // list does not mention, so losing this field would quietly restore the
+    // "terminals cannot be typed into" limit while every unit test still
+    // passed.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let type_text = tools
+        .iter()
+        .find(|t| t["name"] == "type_text")
+        .expect("type_text");
+    assert!(
+        !type_text["inputSchema"]["properties"]["mechanism"].is_null(),
+        "type_text must advertise `mechanism`; schema was {:#?}",
+        type_text["inputSchema"]["properties"]
+    );
+    let description = type_text["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("keystrokes") && description.contains("ax"),
+        "the description must name both mechanisms so a caller knows the choice exists: {description}"
+    );
+}
+
+#[test]
+fn a_misspelled_mechanism_is_refused_rather_than_defaulted() {
+    // Grant-free: the mechanism is parsed in the server layer before any
+    // native call. Falling back to the default here would write `AXValue`
+    // into a target the caller had just said ignores it, and report success.
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"type_text","arguments":{"app":"Finder","element_index":"0","text":"hi","mechanism":"keystroke"}}}"#,
+        ],
+    );
+
+    assert_eq!(response(&responses, 3)["result"]["isError"], true);
+    let text = call_text(&responses, 3);
+    assert!(
+        text.contains("keystrokes") && text.contains("ax"),
+        "the refusal must name the two valid values: {text}"
+    );
+}
+
+#[test]
+fn press_key_promises_a_focus_verdict() {
+    // The whole point of the focus check is that a caller knows to look for
+    // it. If the tool description stops saying so, an agent has no reason to
+    // read the field and the honesty is wasted.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let press_key = tools
+        .iter()
+        .find(|t| t["name"] == "press_key")
+        .expect("press_key");
+    let description = press_key["description"].as_str().unwrap_or_default();
+    for word in ["verified", "unverified", "mismatched"] {
+        assert!(
+            description.contains(word),
+            "press_key must document the `{word}` focus verdict: {description}"
+        );
+    }
+}
+
+#[test]
 fn removed_allow_hid_option_is_rejected() {
     let output = Command::new(env!("CARGO_BIN_EXE_cua-rs"))
         .arg("--allow-hid")

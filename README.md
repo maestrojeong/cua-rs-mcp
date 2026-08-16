@@ -110,7 +110,7 @@ and `click`, `click_in_window`, `drag` and `hover` all honour it.
 | `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
 | — | every action returns what it did — verb, target, `delivery`, and a tree diff by default. Nothing is fire-and-forget |
 | `click_in_window` | last resort: a bare point, no element, nothing verified |
-| `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call |
+| `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call. `type_text` takes `mechanism: "keystrokes"` for targets that ignore `AXValue` |
 | `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
 | `scroll` · `perform_secondary_action` | pages through AX, or a wheel event where there is no AX verb; any AX verb |
 | `list_apps` · `check_permissions` | running apps; grant status |
@@ -126,13 +126,13 @@ one of them.
 | | |
 |---|:--|
 | buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
-| any key or chord | yes, pid-routed |
+| any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed |
 | right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed — **built, not yet verified on a real app** |
 | drag | yes: a real down, interpolated moves and an up, both ends in one window — **built, not yet verified on a real drag source** |
 | hover | a synthesized `mouseMoved` — **built, unproven**, and your cursor does not move, so an app that polls the *real* pointer position instead of reading the event will not react at all |
 | scrolling something with no AX scroll verb (Electron list, canvas, web content) | yes, a wheel event at the element's point — **built, not yet verified** |
 | canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
-| terminals | reading yes; typing no — `set_value`/`type_text` write `AXValue`, which terminals ignore; `press_key` reaches them but one key or chord at a time |
+| terminals | reading yes; typing yes with `type_text mechanism="keystrokes"`, which sends real per-pid key events. The default `AXValue` write is still ignored by terminals, and the keystroke path is measured on TextEdit, not yet on a terminal |
 
 "Built, not yet verified" means the events are constructed and delivered on the
 same pid route `click` uses, the logic behind them is unit-tested without any
@@ -142,10 +142,23 @@ click path. [DESIGN.md](DESIGN.md) §11 lists what is owed and names the
 experiment that would settle each one.
 
 `set_value` replaces and `type_text` appends via one atomic `AXValue` write; an
-app that only reacts to real key events ignores both. `click` and `press_key`
-never attempt an AX action at all — every event is routed to the target process
-by pid, reported as `delivery: pid`, and fails rather than touching your pointer
-if that tier is unavailable.
+app that only reacts to real key events ignores both, which is what
+`mechanism: "keystrokes"` is for — explicit rather than automatic, because a
+write cua-rs cannot tell was ignored is not a signal to start typing. `click`
+and `press_key` never attempt an AX action at all — every event is routed to the
+target process by pid, reported as `delivery: pid`, and fails rather than
+touching your pointer if that tier is unavailable.
+
+Anything that sends real keys is addressed to the *process*, so it arrives at
+whatever that process's first responder is. Those results carry
+`focus: verified | unverified | mismatched`, compared against the app's own
+focused element: `mismatched` means the keys most likely reached a sibling of
+the element you named (never another app — the event never leaves the target
+process), and `unverified` means the app published nothing to check against.
+Delivery happens anyway in both cases; `CUA_KEY_STRICT_FOCUS=1` refuses on
+`mismatched` instead. Clicking a target before typing into it is the reliable
+way to get `verified` — a window that has never been clicked can be frontmost
+and still have no key window at all.
 
 ## The drawn cursor
 
@@ -161,8 +174,12 @@ the workspace to get both.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 132 tests, no permissions needed
+cargo test --workspace          # no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
+
+# read-back tests for the keyboard path: needs an Accessibility grant,
+# a GUI session and TextEdit, so they are #[ignore]d by default
+cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1
 ```
 
 ```text

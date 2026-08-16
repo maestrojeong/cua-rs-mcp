@@ -491,6 +491,17 @@ struct TypeTextArgs {
     target: ActionArgs,
     /// Text to append after the element's current contents.
     text: String,
+    /// How to deliver it. `"ax"` (default) writes the string through the
+    /// accessibility API in one atomic, element-addressed call — no focus
+    /// needed, cannot land anywhere else, and the right choice for ordinary
+    /// text fields. `"keystrokes"` synthesizes real per-character key events
+    /// and routes them to the target process: use it ONLY when you know the
+    /// target ignores AXValue (terminals, canvas editors), because the events
+    /// go to whatever that process's own first responder is rather than to the
+    /// element you named. The result reports `focus:` so you can tell whether
+    /// the addressed element was the one holding focus.
+    #[serde(default)]
+    mechanism: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -887,7 +898,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Append text to a text element. Unlike set_value this preserves what is already there: it collapses the caret at the end and writes through AXSelectedText, falling back to a whole-value rewrite when the element exposes no settable selection (the result says which happened). Delivered through the accessibility API, so it needs no focus and does not move the cursor — but for the same reason apps that only react to real key events (terminals, canvas editors) will ignore it."
+        description = "Append text to a text element. Unlike set_value this preserves what is already there: it collapses the caret at the end and writes through AXSelectedText, falling back to a whole-value rewrite when the element exposes no settable selection (the result says which happened). By default (mechanism=\"ax\") it is delivered through the accessibility API, so it needs no focus and does not move the cursor — but for the same reason apps that only react to real key events (terminals, canvas editors) will ignore it. Pass mechanism=\"keystrokes\" for those targets and only those: it sends real key events routed to the target process, which reaches a terminal but lands on whatever that process's first responder is rather than on the element you named. Whichever mechanism runs, your pointer, keyboard focus and Space are untouched."
     )]
     async fn type_text(
         &self,
@@ -897,11 +908,16 @@ impl CuaServer {
             Ok(t) => t,
             Err(e) => return Ok(fail(e)),
         };
+        let mechanism = match a.mechanism.as_deref().map(cua_core::Mechanism::parse) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => return Ok(fail(e)),
+            None => cua_core::Mechanism::default(),
+        };
         let app = a.target.app.clone();
         let want_state = a.target.return_state();
         let text = a.text.clone();
         match self
-            .native(move |c| c.type_text(&app, target, &text, want_state))
+            .native(move |c| c.type_text(&app, target, &text, mechanism, want_state))
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
@@ -933,7 +949,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The keys are real key events routed to the target process by pid and reported as `delivery: pid (keyboard)` — the shared keyboard tap is never used, so the user's own typing keeps going where it was going. They land wherever that process's own first responder currently is; cua-rs best-effort-focuses the element you name first (AXFocused, where the app makes it settable) but cannot guarantee it, so re-read the element afterwards when it matters which field received the keys."
+        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set."
     )]
     async fn press_key(
         &self,
@@ -1108,8 +1124,49 @@ fn render_action(r: &cua_core::ActionResult) -> String {
     } else if r.ui_changed != cua_core::Observed::Changed {
         s.push_str("  (heuristic only — the tree diff below is the real answer)");
     }
+    if let Some(focus) = &r.focus {
+        s.push_str(&render_focus(focus));
+    }
     if let Some(state) = &r.state {
         s.push_str(&render_post_action_state(state));
+    }
+    s
+}
+
+/// Say where the input actually went, for the paths where that is a real
+/// question.
+///
+/// A pid-routed key event is addressed to a process and arrives at that
+/// process's first responder, so "it succeeded" and "it landed on the element
+/// you named" are two different claims. Printing only the first one is what
+/// let a keystroke into the wrong field of the same app read as an unqualified
+/// success — `ui_changed` cannot catch it either, since two text fields of one
+/// window usually share a role and have no title, leaving the fingerprint
+/// identical.
+fn render_focus(focus: &cua_core::FocusCheck) -> String {
+    let mut s = format!("\nfocus: {}", focus.state.as_str());
+    s.push_str(match focus.state {
+        cua_core::FocusState::Verified => {
+            "  (the app names the element you addressed as its focused one, so this is where the input went)"
+        }
+        cua_core::FocusState::Unverified => {
+            "  (this app published no focused element, so nothing here says where the input went — NOT evidence that it missed. Re-read the element to be sure)"
+        }
+        cua_core::FocusState::Mismatched => {
+            "  (the app names a DIFFERENT element of the same process as focused — the input most likely went there instead. It cannot have reached another app: the event was routed to this pid only. Click the element first, or set CUA_KEY_STRICT_FOCUS=1 to refuse rather than deliver)"
+        }
+    });
+    if let Some(other) = &focus.focused_instead {
+        s.push_str(&format!("\n  focused instead: {other}"));
+    }
+    if !focus.focus_write_accepted {
+        s.push_str(&format!(
+            "\n  AXFocused write refused: {} (not itself a failure — AXFocused is unsettable on many elements, including Terminal's text view)",
+            focus
+                .focus_write_error
+                .as_deref()
+                .unwrap_or("no reason given")
+        ));
     }
     s
 }

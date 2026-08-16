@@ -57,7 +57,7 @@ AX cannot express everything:
 | Return, Escape | `AXConfirm`, `AXCancel` | works |
 | context menu | `AXShowMenu` | works |
 | page a scroll area | `AXScroll*ByPage` | works |
-| set text | `AXValue` write | works — still the *only* mechanism `set_value`/`type_text` use, see below |
+| set text | `AXValue` write | works — and stays the default for `set_value`/`type_text`, see §1a. `type_text` can be asked for real keystrokes instead, for the targets that ignore the write |
 | **arbitrary chord** (`⌘⇧P`) | — | no verb exists, but reachable since the pid-only change below via the pid tier (not a fallback — the only tier) |
 | **drag** | — | no verb exists; delivered as a real down/drag/up gesture by the pid tier (§11). Not yet verified against a real drag source |
 | **right click where the element advertises nothing** | `AXShowMenu` | works *where the element advertises it*; where it does not, a real `rightMouseDown`/`rightMouseUp` pair by the pid tier |
@@ -151,11 +151,22 @@ for Return and `AXCancel` for Escape. Anything a caller might mean by "press
 
 Setting text is not an event. `AXValue` writes replace a whole string in one
 call, atomically, addressed at the element — which is precisely what a caller
-asking to set a field wants. Delivering the same thing as keystrokes would mean
-a stream of events landing wherever the target process's first responder
-happens to be, character by character, with no element addressing and no way to
-confirm the focus went where it was aimed. That is strictly worse for the one
-operation AX does exactly right, so `set_value` and `type_text` keep it.
+asking to set a field wants. Delivering the same thing as keystrokes means a
+stream of events landing wherever the target process's first responder happens
+to be, character by character, with no element addressing. That is strictly
+worse for the one operation AX does exactly right, so `set_value` and
+`type_text` default to it.
+
+The exception proves rather than dents the rule. A terminal or a canvas editor
+ignores an `AXValue` write outright, and there the better mechanism does
+nothing at all — so `type_text` takes `mechanism: "ax" | "keystrokes"` and
+sends real per-pid key events on request. It is a separate, explicit choice
+rather than a fallback from a failed write: cua-rs cannot tell "the app
+accepted the write" from "the app took the write and ignored it", so an
+automatic retry would be guessing, and guessing with a keystroke stream is the
+expensive direction to guess in. A caller reaches for `keystrokes` when they
+know what they are aiming at, and gets the same `focus` verdict `press_key`
+reports (§10) because a long string multiplies a misdelivery by its own length.
 
 That also reframes what "no AX fallback" costs on the click path. Retrying a
 failed pid click through `AXPress` sounds free and is not: it reintroduces the
@@ -185,15 +196,19 @@ is tried around it, not the tier's own mechanics.
 restores 0.4.x's `click` order (AXPress first, pid only when no AX verb
 exists, with a retry through AX if pid then fails). `CUA_KEY_AX_ONLY=1`
 restores 0.4.x's `press_key` (`return`/`escape`/`up`/`down` only, chords
-refused, no synthesized input at all). Neither is a supported "best of both"
-mode — mixing tiers per call is the exact pattern the paragraph above argues
-against — they exist to bisect a specific app or macOS version where the pid
-tier turns out to be the less reliable choice.
+refused, no synthesized input at all). `CUA_KEY_STRICT_FOCUS=1` keeps the pid
+keyboard tier but refuses to deliver when the app names a different element as
+focused (§10) — the one switch here that tightens rather than reverts. None is
+a supported "best of both" mode — mixing tiers per call is the exact pattern
+the paragraph above argues against — they exist to bisect a specific app or
+macOS version where the pid tier turns out to be the less reliable choice.
 
 **The manual-test checklist (§8) predates this change** and still describes
 0.4.x's tier order in places; it has not yet been re-walked end to end against
-this change's pid-only click/key path. Treat rows there that assume an AX-first
-click as aspirational until they are re-verified.
+this change's pid-only click path. Treat rows there that assume an AX-first
+click as aspirational until they are re-verified. The keyboard rows are the
+exception: they are gone, replaced by the automated read-back tests §8 now
+describes.
 
 ---
 
@@ -676,6 +691,55 @@ permission-free logic: rendering, resolution tiers, window matching, clamping.
       `click_in_window`, `drag` and `hover` alike
 - [ ] cursor is byte-identical before and after each of the above
 
+**Keyboard delivery — automated, and no longer a checklist item**
+
+The rows that used to sit here ("a chord reaches the target", "typing lands in
+the right field") were the ones a human could not check reliably, because the
+failure they were looking for is a keystroke arriving somewhere nobody was
+looking. They are now three read-back tests against TextEdit — address a text
+element, send keys, read that element's `AXValue` back — plus a negative test
+that addresses element A and asserts element B, its sibling in the same window,
+did not receive the text. Run them on a machine with an Accessibility grant and
+a GUI session:
+
+```console
+$ cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1
+running 3 tests
+test does_not_type_into_the_other_text_element ... ok
+test sends_keys_into_the_addressed_element ... ok
+test the_focus_verdict_predicts_where_the_text_lands ... ok
+```
+
+They open and close their own scratch documents. `--test-threads=1` is not
+optional: they drive one app.
+
+Three things they established, none of which was known before:
+
+- **Keys addressed at a text element arrive in it.** The `focus: verified`
+  case is now a measurement rather than a hope, on macOS 26.5 / TextEdit.
+- **They do not reach the sibling field.** With the find bar open, text
+  addressed at the document turns up in the document exactly once and nowhere
+  else in the window.
+- **A window that has never been clicked swallows them silently.** TextEdit
+  can be frontmost with no key window, publishing no `AXFocusedUIElement` at
+  all; pid-routed keys then land nowhere and no error is raised anywhere. That
+  is exactly what `focus: unverified` reports, and it is the reason a caller
+  should click a target before typing into it. Sending a click first is what
+  the tests do.
+
+Two smaller measurements from the same session, recorded because they will
+otherwise be rediscovered:
+
+- `type_text_background_pid` carries a Unicode string and arrives verbatim
+  under a non-Latin input source; `press_chord_background_pid` carries a
+  keycode, so with a Korean source active `press_key x` delivered `ㅌ`. Chords
+  go through the input method, literal text does not.
+- The staleness guard used to reject every click on TextEdit's document view,
+  because the tree walk resolves a label from `AXTitle`, `AXDescription`,
+  `AXPlaceholderValue`, `AXIdentifier` or a linked title element while the live
+  re-read compared only `AXTitle` and `AXValue`. Both sides now call
+  `Element::label`.
+
 **Tree**
 - [x] native app: Finder 4 elements, Chrome 413 — labeled, actionable elements present
 - [x] Electron: Slack 367 elements including an `AXWebArea`, **but not on the
@@ -724,6 +788,14 @@ changes it cannot see. It is reported honestly rather than optimistically,
 because an agent that believes every action landed is worse than one that knows
 it should re-read. The right fix is `AXObserver` notifications.
 
+One failure of it is specific enough to name: the fingerprint is *focused
+window title | focused element role | focused element title*, and two text
+fields of one window usually share a role and have no title. Text landing in
+the wrong one of them therefore leaves the fingerprint byte-identical, so the
+action reports `ui_changed: no` while something certainly happened. That
+particular blind spot is what the `focus` field on pid-routed keyboard results
+covers — it compares the *element*, not a string built from it.
+
 **One snapshot per app.** Driving two windows of the same app alternately
 invalidates indices each time. Correct, but awkward; keying snapshots by window
 would fix it.
@@ -769,36 +841,52 @@ dialog, observed once. `return_state` makes that visible — the diff reported
 exactly one changed line, `(selected)` — so it is measurable now, but it has not
 been characterized.
 
-**`press_chord_background_pid` is wired in; `type_text_background_pid` still
-is not.** Both exist in `cua-hid`, built the same way —
-`CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
+**Both per-pid keyboard functions are wired in now.**
+`press_chord_background_pid` and `type_text_background_pid` are built the same
+way — `CGEventCreateKeyboardEvent` against a `HIDSystemState` source,
 `CGEventKeyboardSetUnicodeString` for characters with no keycode, posted
 per-pid — which invalidates this crate's founding assumption that keyboard
-input must go through the global tap and steal focus. `press_key` now
-calls the former as its only tier (§1a), because accessibility cannot express a
-chord at all: there is `AXConfirm` and `AXCancel` and then nothing, so a real
-event is the only thing `cmd+shift+p` could ever become.
+input must go through the global tap and steal focus. `press_key` calls the
+former as its only tier (§1a), because accessibility cannot express a chord at
+all: there is `AXConfirm` and `AXCancel` and then nothing. `type_text` calls
+the latter only when a caller asks for `mechanism: "keystrokes"`, which stays
+opt-in for the reason §1a gives: a bulk text write is the one operation
+accessibility expresses *better*, one atomic element-addressed `AXValue` write
+against a long stream of events landing one character at a time. The events
+path exists because on a terminal or a canvas editor the better mechanism does
+nothing at all.
 
-**The control-and-measure treatment this paragraph used to demand is still
-owed.** Being the only possible mechanism is an argument for the design, not
-evidence that it lands correctly, and the risk originally named here has not
-moved: a keystroke goes to wherever the target process's own first responder is,
-`cua-core` can only best-effort-focus the addressed element first (`AXFocused`),
-and no query confirms the focus actually moved before the keystrokes did. A miss
-therefore types into whatever the human was editing — the asymmetry that kept
-this gated for several releases. Until that is measured on a target whose text
-can be read back, treat `press_key` on an app you have not tried as unproven,
-and use `CUA_KEY_AX_ONLY=1` to get the old AX-verb-only path back.
+**The measurement this paragraph used to demand has been taken.** §8 has the
+command and the results: keys addressed at a text element arrive in it, they do
+not arrive in its sibling, and a window that has never been clicked swallows
+them silently while reporting `focus: unverified`. What remains unproven is
+breadth, not the mechanism — TextEdit on macOS 26.5 is one target, and an app
+you have not tried is still an app you have not tried. `CUA_KEY_AX_ONLY=1`
+gets the old AX-verb-only path back.
 
-`type_text_background_pid` stays unwired, for the reason §1a gives: a bulk text
-write is the one operation accessibility expresses better than events can. One
-`AXValue` write replaces the whole string atomically and is addressed at the
-element, where the same text typed as events becomes a long stream landing on
-whatever holds focus, one character at a time, multiplying the focus risk above
-by the length of the string. So `set_value`/`type_text` keep the AX-only
-mechanism they always had, and `post_chord` remains the honest, focus-stealing
-fallback for a caller that specifically needs real keystrokes typed into a
-terminal or canvas that ignores `AXValue`.
+**A keystroke can still be misdelivered, and the bound on that is worth stating
+precisely.** It goes to whatever the target process's own first responder is;
+cua-rs best-effort-focuses the addressed element first (`AXFocused`, which is
+not settable on every element) and now reads the app's own
+`AXFocusedUIElement` back to say whether that worked — `focus: verified |
+unverified | mismatched` on every pid-routed keyboard result. Because the post
+is addressed to a pid, a miss can only land on another element **of the same
+process**; it cannot reach the human's foreground app when that is a different
+process, which is precisely what the shared HID tap this crate refuses to use
+would do. An earlier version of this section said a miss "types into whatever
+the human was editing", which was too strong. The risk is real and bounded to
+"the human and the agent are in the same app at the same time" — a condition a
+caller can test, and one `CUA_KEY_STRICT_FOCUS=1` refuses to deliver into.
+
+What is still not solved is the `unverified` case: an app that publishes no
+focused element gives cua-rs nothing to check against, and the honest report is
+that nothing is known. `AXObserver` notifications would be the real fix here as
+they would be for `ui_changed`.
+
+`post_chord` remains the unreachable, focus-stealing shared-input path. Its
+last stated reason to exist — being the only way to type real keystrokes into a
+terminal — is gone with `mechanism: "keystrokes"`, and §11 says it should be
+deleted.
 
 ---
 
@@ -1126,21 +1214,36 @@ What would prove each, concretely:
 
 None of these has been run. §8's checklist carries them so that stays visible.
 
-### Chords
+### Chords and literal text — both wired, both verified
 
-`press_chord_background_pid` and `type_text_background_pid` exist and nothing
-calls them (§10). Turning them on is a verification problem, not an
-implementation one, and the asymmetry is why they are still off: a click that
-misses does nothing, while a keystroke that misses types into whatever the human
-is editing. Gate on the same activation evidence the click path already collects
-— the synthesized notice plus the `AXFrontmost` poll — and require a target whose
-text can be read back, so a miss is provable rather than assumed.
+This section used to say `press_chord_background_pid` and
+`type_text_background_pid` existed and nothing called them, and that turning
+them on was a verification problem rather than an implementation one. That was
+right, and the verification has now been done the way this paragraph asked for
+it: against a target whose text can be read back, so a miss is provable rather
+than assumed. §8 has the command and the results, §10 the residual risk.
+
+`press_key` routes every chord through the pid tier (§1a). `type_text` reaches
+the same tier on request, through `mechanism: "keystrokes"`, and defaults to
+the `AXValue` write. Every pid-routed keyboard result carries
+`focus: verified | unverified | mismatched`, compared against the app's own
+`AXFocusedUIElement` rather than the fingerprint string, and
+`CUA_KEY_STRICT_FOCUS=1` refuses to deliver on `mismatched`.
+
+The asymmetry that kept these gated — a click that misses does nothing, a
+keystroke that misses types somewhere — is still the reason the keyboard path
+is the one that reports a focus verdict while the click path does not. What
+changed is that "somewhere" turned out to be bounded: the event is addressed to
+a pid, so a miss stays inside the target process.
 
 ### What stays closed
 
 `post_chord` remains unreachable from the server. It exists so the shared-input
-keyboard path is visible in one file and can be reasoned about, and it should be
-deleted once chords land in the pid tier.
+keyboard path is visible in one file and can be reasoned about. Its last
+argument for existing — being the only way to type real keystrokes into a
+terminal — is gone now that `type_text` can do it per-pid, so it should be
+deleted; it is left in this change only because deleting it is a separate edit
+from the one that made it redundant.
 
 Its mouse counterpart is already gone. `click_by_moving_pointer` warped the real
 pointer, clicked through the shared HID stream, and warped back; every control it

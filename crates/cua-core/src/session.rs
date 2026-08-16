@@ -104,6 +104,18 @@ pub enum CoreError {
     #[error("could not deliver key `{key}` via the pid-routed route: {reason}. cua-rs's default keyboard path does not fall back to accessibility (see CUA_KEY_AX_ONLY to opt into the old AX-verb-only path)")]
     PidKeyUnavailable { key: String, reason: String },
 
+    /// Strict focus mode (`CUA_KEY_STRICT_FOCUS=1`) refused to deliver because
+    /// the app names a *different* element as its focused one. Nothing was
+    /// sent. Off by default, because a keystroke that has to be dropped
+    /// whenever `AXFocused` is unsettable would make `press_key` useless on
+    /// Terminal, whose text view is a measured case of exactly that.
+    #[error("refused to send `{what}`: this app reports {focused} as its focused element, not {addressed}, and a pid-routed keystroke goes to whatever the process's own first responder is — so it would have landed there instead. Unset CUA_KEY_STRICT_FOCUS to send it anyway, or click the element first")]
+    FocusMismatch {
+        what: String,
+        addressed: String,
+        focused: String,
+    },
+
     #[error("{original}. This element advertises no AXPress/AXPick/AXConfirm, and the quiet SkyLight pid-routed click is unavailable: {reason}. cua-rs will not fall back to moving the real pointer. perform_secondary_action with AXShowMenu may reach the same control another way")]
     PidClickUnavailable {
         original: cua_ax::AxError,
@@ -442,11 +454,23 @@ fn post_action_render() -> crate::snapshot::RenderOptions {
 /// both" mode, since mixing the two tiers is the thing this default avoids.
 fn ax_first() -> bool {
     static AX_FIRST: OnceLock<bool> = OnceLock::new();
-    *AX_FIRST.get_or_init(|| {
-        std::env::var("CUA_AX_FIRST")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *AX_FIRST.get_or_init(|| env_flag("CUA_AX_FIRST"))
+}
+
+/// Read one of this crate's opt-in switches.
+///
+/// `1` and `true` (in any case) turn a switch on; an unset variable, an empty
+/// one, and anything else leave it off. Shared so the switches cannot drift
+/// apart in what they accept, and so the parsing is testable without a
+/// process-wide `set_var` — which `cargo test` would race across threads.
+fn env_flag(name: &str) -> bool {
+    flag_is_on(std::env::var(name).ok().as_deref())
+}
+
+fn flag_is_on(value: Option<&str>) -> bool {
+    value
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Whether `press_key` routes through the pid tier
@@ -467,11 +491,29 @@ fn ax_first() -> bool {
 /// machine or app.
 fn pid_keyboard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CUA_KEY_AX_ONLY")
-            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
-            .unwrap_or(true)
-    })
+    *ENABLED.get_or_init(|| !env_flag("CUA_KEY_AX_ONLY"))
+}
+
+/// Whether a pid-routed keyboard action refuses to deliver when the app names
+/// a *different* element as focused ([`FocusState::Mismatched`]).
+///
+/// Off by default, and the default is the considered one rather than the
+/// timid one. `AXFocused` is not settable on every element — Terminal's text
+/// view is a measured case — so an app can route keys perfectly well while
+/// reporting a focused element that is not the one addressed, and refusing
+/// there would break the exact targets §10 wants reached. The fix for the
+/// silence was to *report* the mismatch, not to start dropping keystrokes.
+///
+/// `CUA_KEY_STRICT_FOCUS=1` is for the caller who would rather lose a
+/// keystroke than land one in the wrong field of an app the human is also in —
+/// the one situation where a pid-routed miss can be seen by a human at all,
+/// since the event never leaves the target process. It refuses only on
+/// `Mismatched`; `Unverified` still delivers, because "the app said nothing"
+/// is not evidence of a miss and treating it as one would refuse almost
+/// everything.
+fn strict_focus() -> bool {
+    static STRICT: OnceLock<bool> = OnceLock::new();
+    *STRICT.get_or_init(|| env_flag("CUA_KEY_STRICT_FOCUS"))
 }
 
 impl Default for StateOptions {
@@ -683,6 +725,15 @@ pub struct ActionResult {
     overlay_target: Option<(u32, libc::pid_t)>,
     /// What the window looked like after the action, when the caller asked.
     pub state: Option<PostActionState>,
+    /// Whether the addressed element actually held keyboard focus when the
+    /// input was sent.
+    ///
+    /// `Some` only on the paths where the question means something — the
+    /// pid-routed keyboard ones, where the event is addressed to a process and
+    /// lands on that process's first responder. An `AXValue` write is
+    /// addressed at the element itself and cannot miss, so it reports `None`
+    /// rather than a reassuring `verified` it did not earn.
+    pub focus: Option<FocusCheck>,
 }
 
 /// The target's state immediately after an action, when `return_state` was set.
@@ -734,6 +785,7 @@ impl ActionResult {
             point,
             overlay_target: None,
             state: None,
+            focus: None,
         }
     }
 
@@ -847,6 +899,34 @@ fn element_point(el: &Element) -> Option<(f64, f64)> {
     })
 }
 
+/// One reading of an app's focus state: the focused element itself, plus the
+/// cheap string [`Inner::window_fingerprint`] compares. See
+/// [`Inner::focus_probe`].
+struct FocusProbe {
+    focused: Option<Element>,
+    fingerprint: Option<String>,
+}
+
+/// A short human-readable name for a live element, for error text and for
+/// naming the element that holds focus instead of the addressed one.
+fn describe_element(el: &Element) -> String {
+    let role = el.role().unwrap_or_else(|| "element".into());
+    match el
+        .string(cua_ax::attr::TITLE)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            el.string(cua_ax::attr::DESCRIPTION)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            el.string(cua_ax::attr::PLACEHOLDER)
+                .filter(|s| !s.is_empty())
+        }) {
+        Some(label) => format!("{role} {label:?}"),
+        None => role,
+    }
+}
+
 /// What was observed after an action, in three values rather than two.
 ///
 /// `Unknown` is the point of this type. The evidence for "something happened"
@@ -922,6 +1002,136 @@ impl Delivery {
     }
 }
 
+/// How `type_text` should get a string into an element.
+///
+/// Two mechanisms, and the caller picks — because neither is right for every
+/// target and picking silently would hide which one ran.
+///
+/// [`Mechanism::Ax`] is the default and stays the default: one `AXValue` /
+/// `AXSelectedText` write replaces or inserts the whole string atomically and
+/// is addressed at the element, so it cannot land anywhere else and needs no
+/// focus at all. That is the one operation accessibility expresses *better*
+/// than events do, so making events the default would be a downgrade for every
+/// ordinary text field.
+///
+/// [`Mechanism::Keystrokes`] is for the targets that ignore `AXValue`
+/// entirely — terminals, canvas editors — where a real key event is the only
+/// thing that works. It is opt-in rather than a fallback because its
+/// weaknesses are the mirror image: a long stream of per-character events
+/// addressed at a *process*, landing on whatever that process's first
+/// responder is, multiplying the focus risk by the length of the string. The
+/// result carries a [`FocusCheck`] for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mechanism {
+    /// A single accessibility write. Default.
+    #[default]
+    Ax,
+    /// Real per-character key events, routed to the target pid.
+    Keystrokes,
+}
+
+impl Mechanism {
+    /// Parse the wire spelling. Unknown values are an error rather than a
+    /// silent fall back to the default: a caller who typed `keystroke` meant
+    /// keystrokes, and quietly writing `AXValue` into a terminal that ignores
+    /// it would look like the tool succeeded and did nothing.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ax" => Ok(Mechanism::Ax),
+            "keystrokes" => Ok(Mechanism::Keystrokes),
+            other => Err(format!(
+                "mechanism must be \"ax\" (one atomic AXValue write, the default) or \"keystrokes\" (real key events routed to the pid, for terminals and canvases that ignore AXValue), got {other:?}"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mechanism::Ax => "ax",
+            Mechanism::Keystrokes => "keystrokes",
+        }
+    }
+}
+
+/// Where a pid-routed keystroke was going to land, as far as accessibility can
+/// say.
+///
+/// A pid-routed key event is addressed to a *process*, not to an element: it
+/// arrives at whatever that process's own first responder is. cua-rs
+/// best-effort-moves accessibility focus onto the addressed element first, but
+/// the write is not always accepted and even an accepted one is not proof the
+/// AppKit first responder followed. This is the honest answer to "did it?".
+///
+/// The blast radius, stated precisely: because the post is per-pid, a
+/// misdelivered keystroke can only reach another element **of the same
+/// process**. It cannot reach the human's foreground app when that is a
+/// different process, which the shared HID tap this crate refuses to use
+/// would. The risk is real and bounded to "the human and the agent are in the
+/// same app at the same time".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusState {
+    /// The app names the addressed element as its `AXFocusedUIElement`. The
+    /// keystrokes went where they were aimed, as far as accessibility can see.
+    Verified,
+    /// The app published no focused element to compare against, so there is no
+    /// evidence either way. Not a failure: plenty of apps answer nothing here
+    /// and still route the keys correctly.
+    Unverified,
+    /// The app names a *different* element of the same process as focused. The
+    /// keystrokes most likely landed there instead. Delivered anyway by
+    /// default; `CUA_KEY_STRICT_FOCUS=1` refuses instead.
+    Mismatched,
+}
+
+impl FocusState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FocusState::Verified => "verified",
+            FocusState::Unverified => "unverified",
+            FocusState::Mismatched => "mismatched",
+        }
+    }
+}
+
+/// [`FocusState`] plus the two inputs it was derived from, so a caller can see
+/// *why* it says what it says rather than having to trust the verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusCheck {
+    pub state: FocusState,
+    /// Whether the `AXFocused = true` write on the addressed element was
+    /// accepted. `false` is not on its own a reason to withhold the keys:
+    /// `AXFocused` is not settable on every element (Terminal's text view is a
+    /// measured case) and the element may already hold focus. Until this
+    /// change the result was discarded entirely, which is the defect: a failed
+    /// focus move was invisible to the caller.
+    pub focus_write_accepted: bool,
+    /// Why the write was refused, when it was.
+    pub focus_write_error: Option<String>,
+    /// Role and title of whatever the app *does* report as focused, when that
+    /// is not the addressed element. This is the element the keys probably
+    /// reached.
+    pub focused_instead: Option<String>,
+}
+
+/// Classify a focus check from its two independent inputs.
+///
+/// `addressed_is_focused` is `None` when the app published no
+/// `AXFocusedUIElement` at all — a different answer from "it published a
+/// different one", and deliberately not collapsed into it.
+///
+/// The `AXFocused` write outcome deliberately does *not* enter the verdict.
+/// A refused write on an element that already holds focus is still verified
+/// delivery, and an accepted write is not evidence the AppKit first responder
+/// moved — only the read-back is. The write is reported alongside, as
+/// context, not as the answer.
+fn classify_focus(addressed_is_focused: Option<bool>) -> FocusState {
+    match addressed_is_focused {
+        Some(true) => FocusState::Verified,
+        Some(false) => FocusState::Mismatched,
+        None => FocusState::Unverified,
+    }
+}
+
 /// The outcome of attempting the pid tier of a click, split so the caller can
 /// tell "try accessibility instead" apart from "stop — do not press anything
 /// else". See [`Inner::pid_click_result`].
@@ -951,6 +1161,15 @@ fn live_tokens(el: &Element) -> HashSet<String> {
     let mut out = HashSet::new();
     push_token(el.string(cua_ax::attr::TITLE), &mut out);
     push_token(el.string(cua_ax::attr::VALUE), &mut out);
+    // Whatever the snapshot would have called this element, resolved the same
+    // way the walk resolves it. Without this the guard compares two different
+    // questions and refuses a target that has not changed at all: measured on
+    // TextEdit, whose document view publishes an empty `AXTitle` and is
+    // labelled "First Text View" further down the chain, so the snapshot held
+    // a token the live read could never produce and every click on it was
+    // rejected as stale. The child walk below already read `AXDescription`;
+    // the element itself read only title and value.
+    push_token(el.label(), &mut out);
     walk(el, 3, &mut out);
     out
 }
@@ -1301,17 +1520,29 @@ impl Cua {
     }
 
     /// Append text to an element, preferring insertion over replacement.
+    ///
+    /// `mechanism` picks how: [`Mechanism::Ax`] (the default) writes the
+    /// string through accessibility in one call, [`Mechanism::Keystrokes`]
+    /// sends real per-character key events to the target pid for the targets
+    /// that ignore `AXValue`. See [`Mechanism`] for why the choice is the
+    /// caller's rather than automatic.
     pub fn type_text(
         &self,
         app: &str,
         target: Target,
         text: &str,
+        mechanism: Mechanism,
         return_state: bool,
     ) -> Result<ActionResult> {
         let app = app.to_string();
         let text = text.to_string();
+        // `false` is the drawn cursor's "no click ring", the same as
+        // `press_key`: keystrokes are not a click whichever mechanism carries
+        // them.
         self.exec_action(false, move |inner| {
-            inner.acting(&app, return_state, |i| i.type_text(&app, target, &text))
+            inner.acting(&app, return_state, |i| {
+                i.type_text(&app, target, &text, mechanism)
+            })
         })
     }
 
@@ -2144,6 +2375,7 @@ impl Inner {
             point: Some((x, y)),
             overlay_target: Some((wid, info.pid)),
             state: None,
+            focus: None,
         })
     }
 
@@ -2302,6 +2534,7 @@ impl Inner {
             point: Some((sx, sy)),
             overlay_target: Some((wid, info.pid)),
             state: None,
+            focus: None,
         })
     }
 
@@ -2326,7 +2559,16 @@ impl Inner {
         )
     }
 
-    fn type_text(&mut self, query: &str, target: Target, text: &str) -> Result<ActionResult> {
+    fn type_text(
+        &mut self,
+        query: &str,
+        target: Target,
+        text: &str,
+        mechanism: Mechanism,
+    ) -> Result<ActionResult> {
+        if mechanism == Mechanism::Keystrokes {
+            return self.type_text_as_keystrokes(query, target, text);
+        }
         cua_ax::require_trusted()?;
         let (info, el, desc) = self.resolve(query, &target)?;
         let before = self.window_fingerprint(info.pid);
@@ -2345,6 +2587,85 @@ impl Inner {
         .with_overlay_target(self.overlay_target(info.pid)))
     }
 
+    /// `type_text` with `mechanism: "keystrokes"` — real per-character key
+    /// events routed to the target pid, for the targets that ignore `AXValue`.
+    ///
+    /// Everything `set_value`'s comment says against this mechanism is still
+    /// true: it appends wherever the process's first responder is, one
+    /// character at a time, with no element addressing. It exists because on a
+    /// terminal or a canvas editor the atomic, element-addressed write it
+    /// loses to simply does nothing at all. So it is a separate, explicit
+    /// choice rather than a fallback, and it reports its [`FocusCheck`] —
+    /// which matters more here than for a single chord, since a miss is
+    /// repeated once per character.
+    fn type_text_as_keystrokes(
+        &mut self,
+        query: &str,
+        target: Target,
+        text: &str,
+    ) -> Result<ActionResult> {
+        if text.is_empty() {
+            return Err(CoreError::PidKeyUnavailable {
+                key: "<empty string>".into(),
+                reason: "there is nothing to type".into(),
+            });
+        }
+        cua_ax::require_trusted()?;
+        let (info, el, desc) = self.resolve(query, &target)?;
+        let before = self.window_fingerprint(info.pid);
+
+        if !cua_hid::skylight_available() {
+            return Err(CoreError::PidKeyUnavailable {
+                key: text.to_string(),
+                reason: "SLEventPostToPid is not available on this macOS version".into(),
+            });
+        }
+
+        let focus = self.prime_for_pid_keyboard(&info, &el);
+        self.enforce_strict_focus(
+            &focus,
+            &format!("{} characters", text.chars().count()),
+            &desc,
+        )?;
+
+        cua_hid::type_text_background_pid(info.pid, text).map_err(|e| {
+            CoreError::PidKeyUnavailable {
+                key: text.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        let changed = self.changed_since(info.pid, before);
+        Ok(ActionResult {
+            verb: format!(
+                "pid-routed keystrokes ({} characters)",
+                text.chars().count()
+            ),
+            target: desc,
+            ui_changed: changed,
+            delivery: Delivery::PidKey,
+            point: element_point(&el),
+            overlay_target: self.overlay_target(info.pid),
+            state: None,
+            focus: Some(focus),
+        })
+    }
+
+    /// Refuse the send when strict focus mode is on and the app names a
+    /// different element as focused. Nothing has been posted at this point.
+    fn enforce_strict_focus(&self, focus: &FocusCheck, what: &str, addressed: &str) -> Result<()> {
+        if strict_focus() && focus.state == FocusState::Mismatched {
+            return Err(CoreError::FocusMismatch {
+                what: what.to_string(),
+                addressed: addressed.to_string(),
+                focused: focus
+                    .focused_instead
+                    .clone()
+                    .unwrap_or_else(|| "another element".into()),
+            });
+        }
+        Ok(())
+    }
+
     /// Best-effort preparation before any pid-routed keyboard event: try to
     /// move accessibility focus onto the addressed element, then send the same
     /// activation notices [`Inner::pid_click_result`] sends, in case the
@@ -2352,13 +2673,21 @@ impl Inner {
     /// believing it is frontmost the same way its willingness to accept a
     /// synthesized click does.
     ///
-    /// Neither step is checked for success. `AXFocused` is not settable on
-    /// every element — Terminal's own text view is a measured case — and a
-    /// failure here is not a reason to refuse the keystrokes that follow: the
-    /// element may already have focus, or the app may accept real key events
+    /// Neither step *gates* the send. `AXFocused` is not settable on every
+    /// element — Terminal's own text view is a measured case — and a failure
+    /// here is not a reason to refuse the keystrokes that follow: the element
+    /// may already have focus, or the app may accept real key events
     /// regardless of what accessibility reports.
-    fn prime_for_pid_keyboard(&mut self, info: &AppInfo, el: &Element) {
-        let _ = el.set_bool(cua_ax::attr::FOCUSED, true);
+    ///
+    /// What changed is that the outcome is no longer discarded. The returned
+    /// [`FocusCheck`] carries the `AXFocused` write result *and* a read-back
+    /// of the app's own `AXFocusedUIElement`, so a caller is told whether the
+    /// element it addressed is the one the keys will reach instead of being
+    /// handed an unqualified `Ok`. The read-back is the load-bearing half: a
+    /// successful write does not prove the AppKit first responder moved, and
+    /// only the app can say where it actually is.
+    fn prime_for_pid_keyboard(&mut self, info: &AppInfo, el: &Element) -> FocusCheck {
+        let write = el.set_bool(cua_ax::attr::FOCUSED, true);
         let window_number = self
             .snapshots
             .get(&info.pid)
@@ -2369,6 +2698,11 @@ impl Inner {
             move || app_el.bool("AXFrontmost").unwrap_or(false)
         };
         cua_hid::prime_keyboard_target(info.pid, window_number, &believes_frontmost);
+        // Read focus *after* the activation notices, not before: making the
+        // target believe it is active is part of what can move its first
+        // responder, so a reading taken earlier would describe a state the
+        // keystrokes were never delivered into.
+        self.check_focus(info.pid, el, write)
     }
 
     fn select_text(
@@ -2433,7 +2767,11 @@ impl Inner {
                     reason: "SLEventPostToPid is not available on this macOS version".into(),
                 });
             }
-            self.prime_for_pid_keyboard(&info, &el);
+            let focus = self.prime_for_pid_keyboard(&info, &el);
+            // Refuse *before* posting, when asked to. `unverified` still
+            // delivers: the app publishing no focused element is silence, not
+            // evidence of a miss.
+            self.enforce_strict_focus(&focus, &format!("key `{key}`"), &desc)?;
             cua_hid::press_chord_background_pid(info.pid, &chord).map_err(|e| {
                 CoreError::PidKeyUnavailable {
                     key: key.to_string(),
@@ -2449,6 +2787,7 @@ impl Inner {
                 point: element_point(&el),
                 overlay_target: self.overlay_target(info.pid),
                 state: None,
+                focus: Some(focus),
             });
         }
 
@@ -2713,6 +3052,10 @@ impl Inner {
             delivery: Delivery::Pid,
             point: Some((x, y)),
             overlay_target: Some((live.id, info.pid)),
+            // A wheel event is addressed at a point, not at a first responder:
+            // nothing here moves keyboard focus, so there is no focus verdict to
+            // report. `None` says "not applicable", not "unverified".
+            focus: None,
             state: None,
         })
     }
@@ -2823,6 +3166,9 @@ impl Inner {
             },
             point: Some(destination.point),
             overlay_target: Some((live.id, info.pid)),
+            // A drag is addressed at two points; it moves no keyboard focus, so
+            // there is no focus verdict to report.
+            focus: None,
             state: None,
         })
     }
@@ -2899,6 +3245,9 @@ impl Inner {
             },
             point: Some(aim.point),
             overlay_target: Some((live.id, info.pid)),
+            // Hover presses nothing and focuses nothing, so there is no focus
+            // verdict to report.
+            focus: None,
             state: None,
         })
     }
@@ -3032,6 +3381,21 @@ impl Inner {
     /// moved, a tab switched — and honestly reports `false` otherwise rather
     /// than claiming success it cannot see.
     fn window_fingerprint(&self, pid: libc::pid_t) -> Option<String> {
+        self.focus_probe(pid).fingerprint
+    }
+
+    /// One read of the app's focus state, serving both the `ui_changed`
+    /// fingerprint and the focus check.
+    ///
+    /// The fingerprint already had to read `AXFocusedUIElement`; it just threw
+    /// the element away and kept a string built from its role and title. That
+    /// string is why a keystroke landing in a *different field of the same
+    /// app* leaves the fingerprint identical — two text fields of one window
+    /// usually share a role and have no title, so the comparison cannot see
+    /// the difference and the action reports `ui_changed: false` while
+    /// something really did change. Keeping the element itself costs nothing
+    /// extra and answers the question the fingerprint cannot.
+    fn focus_probe(&self, pid: libc::pid_t) -> FocusProbe {
         let app = Element::for_pid(pid);
         let focused = app.element(cua_ax::attr::FOCUSED_UI_ELEMENT);
         let title = app
@@ -3049,10 +3413,37 @@ impl Inner {
         // Every field empty means the app told us nothing — not that it is in
         // a particular state. Returning `Some("||")` here would make two such
         // reads compare equal and manufacture an `Unchanged` out of silence.
-        if fingerprint == "||" {
-            return None;
+        let fingerprint = (fingerprint != "||").then_some(fingerprint);
+        FocusProbe {
+            focused,
+            fingerprint,
         }
-        Some(fingerprint)
+    }
+
+    /// Try to move accessibility focus to `el`, then say where focus actually
+    /// is — the two halves of [`FocusCheck`].
+    ///
+    /// Called after the `AXFocused` write and before any event is posted, so
+    /// what it reports is the state the keystrokes were about to be delivered
+    /// into rather than a reconstruction afterwards.
+    fn check_focus(
+        &self,
+        pid: libc::pid_t,
+        el: &Element,
+        write: std::result::Result<(), cua_ax::AxError>,
+    ) -> FocusCheck {
+        let focused = self.focus_probe(pid).focused;
+        let addressed_is_focused = focused.as_ref().map(|f| f == el);
+        let focused_instead = match addressed_is_focused {
+            Some(false) => focused.as_ref().map(describe_element),
+            _ => None,
+        };
+        FocusCheck {
+            state: classify_focus(addressed_is_focused),
+            focus_write_accepted: write.is_ok(),
+            focus_write_error: write.err().map(|e| e.to_string()),
+            focused_instead,
+        }
     }
 
     fn changed_since(&self, pid: libc::pid_t, before: Option<String>) -> Observed {
@@ -3974,6 +4365,85 @@ mod tests {
         // decoration: it is the only place a caller learns that this result
         // confirms delivery and not that anything was hit.
         assert_eq!(Delivery::PidNoElement.as_str(), "pid (no element)");
+        assert_eq!(Delivery::PidKey.as_str(), "pid (keyboard)");
+    }
+
+    #[test]
+    fn focus_is_classified_from_the_read_back_not_from_the_write() {
+        // The app naming the addressed element is the only positive evidence
+        // there is, and it is enough on its own.
+        assert_eq!(classify_focus(Some(true)), FocusState::Verified);
+        // A different element of the same process. Not "failed" — the keys
+        // were still delivered — but the caller has to be told.
+        assert_eq!(classify_focus(Some(false)), FocusState::Mismatched);
+        // Silence. Deliberately its own answer rather than being folded into
+        // `Mismatched`: an app that publishes no `AXFocusedUIElement` is not
+        // an app that published the wrong one, and refusing on it would refuse
+        // almost everything.
+        assert_eq!(classify_focus(None), FocusState::Unverified);
+    }
+
+    #[test]
+    fn focus_labels_are_stable() {
+        assert_eq!(FocusState::Verified.as_str(), "verified");
+        assert_eq!(FocusState::Unverified.as_str(), "unverified");
+        assert_eq!(FocusState::Mismatched.as_str(), "mismatched");
+    }
+
+    #[test]
+    fn only_mismatched_focus_is_strict_mode_worthy() {
+        // Strict mode's rule, stated as a test so that widening it later is a
+        // deliberate edit: `Unverified` delivers. It has to, or `press_key`
+        // would start failing on every app that answers nothing.
+        let refusable = |state| state == FocusState::Mismatched;
+        assert!(refusable(FocusState::Mismatched));
+        assert!(!refusable(FocusState::Unverified));
+        assert!(!refusable(FocusState::Verified));
+    }
+
+    #[test]
+    fn mechanism_defaults_to_the_accessibility_write() {
+        // The default is the decision, not an accident of ordering: a bulk
+        // text write is the one operation AX expresses better than events.
+        assert_eq!(Mechanism::default(), Mechanism::Ax);
+        assert_eq!(Mechanism::parse("ax"), Ok(Mechanism::Ax));
+        assert_eq!(Mechanism::parse("keystrokes"), Ok(Mechanism::Keystrokes));
+        // Tolerant about shape, not about spelling.
+        assert_eq!(Mechanism::parse("  KeyStrokes "), Ok(Mechanism::Keystrokes));
+    }
+
+    #[test]
+    fn an_unknown_mechanism_is_an_error_rather_than_the_default() {
+        // Falling back to `ax` here would write `AXValue` into a terminal that
+        // ignores it and report success, which is the exact failure the
+        // explicit mechanism exists to prevent.
+        let err = Mechanism::parse("keystroke").expect_err("a near-miss must not be accepted");
+        assert!(
+            err.contains("keystrokes"),
+            "the error names the two valid values: {err}"
+        );
+        assert!(Mechanism::parse("hid").is_err());
+        assert!(Mechanism::parse("").is_err());
+    }
+
+    #[test]
+    fn mechanism_labels_are_stable() {
+        assert_eq!(Mechanism::Ax.as_str(), "ax");
+        assert_eq!(Mechanism::Keystrokes.as_str(), "keystrokes");
+    }
+
+    #[test]
+    fn strict_focus_is_off_unless_the_flag_says_otherwise() {
+        // The switch parser every env flag in this crate shares, exercised
+        // without touching the process environment (`cargo test` shares it
+        // across threads, which would make a `set_var` here racy).
+        assert!(!flag_is_on(None), "unset means off — deliver anyway");
+        assert!(!flag_is_on(Some("0")));
+        assert!(!flag_is_on(Some("")));
+        assert!(!flag_is_on(Some("yes")), "only 1/true, so a typo is off");
+        assert!(flag_is_on(Some("1")));
+        assert!(flag_is_on(Some("true")));
+        assert!(flag_is_on(Some("TRUE")));
     }
 
     #[test]

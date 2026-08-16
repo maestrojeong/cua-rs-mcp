@@ -22,9 +22,9 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use session::{
-    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, MouseOptions, Observed,
-    Permissions, PointerLocation, PostActionState, Presence, Screenshot, ScrollAmount, ScrollDir,
-    StateOptions, Target, WaitOutcome, WindowPixel,
+    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,
+    Mechanism, MouseOptions, Observed, Permissions, PointerLocation, PostActionState, Presence,
+    Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, WaitOutcome, WindowPixel,
 };
 
 /// Re-exported so a caller can name a mouse button or a modifier set without
