@@ -61,7 +61,8 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFString};
 use objc2_core_graphics::{
-    kCGWindowNumber, kCGWindowOwnerPID, CGWindowListCopyWindowInfo, CGWindowListOption,
+    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID, CGWindowListCopyWindowInfo,
+    CGWindowListOption,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -145,6 +146,14 @@ struct CursorViewState {
     /// paint is not guaranteed inside the same run-loop slice that requested it,
     /// and this converges instead of assuming.
     painted_visible: Cell<bool>,
+    /// Conversion from a caller's screen point into this view, from
+    /// [`screen_space`]. `(0, 0)` on a single-display machine.
+    ///
+    /// Held by the view rather than applied at parse time because it changes
+    /// underneath a marker that is already on screen: plugging in a display or
+    /// changing resolution moves the union, and the arrow has to stay on the
+    /// pixel it was pointing at rather than jumping by the difference.
+    offset: Cell<(f64, f64)>,
 }
 
 define_class!(
@@ -262,7 +271,7 @@ define_class!(
 );
 
 impl CursorView {
-    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, frame: NSRect, offset: (f64, f64)) -> Retained<Self> {
         let now = Instant::now();
         let this = Self::alloc(mtm).set_ivars(CursorViewState {
             target: Cell::new(Marker::default()),
@@ -272,8 +281,26 @@ impl CursorView {
             idle_since: Cell::new(None),
             last_tick: Cell::new(now),
             painted_visible: Cell::new(false),
+            offset: Cell::new(offset),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Adopt a new screen layout. The marker keeps its screen coordinates, so
+    /// the arrow stays on the pixel it was pointing at across a display change.
+    fn set_offset(&self, offset: (f64, f64)) {
+        let ivars = self.ivars();
+        if ivars.offset.get() == offset {
+            return;
+        }
+        ivars.offset.set(offset);
+        // `pos` is in view space, so it is now stale by the same amount the
+        // origin moved. Re-derive it from the target instead of sliding the
+        // spring across the screen to catch up.
+        let target = ivars.target.get();
+        let (x, y) = view_point(target, offset);
+        ivars.pos.set((x, y));
+        ivars.vel.set((0.0, 0.0));
     }
 
     /// Record a new command. Motion toward it happens later, in `advance`;
@@ -289,7 +316,7 @@ impl CursorView {
             // sliding in from wherever it last was (or the origin, for the
             // very first command), which would read as the arrow crossing
             // the screen for no reason.
-            ivars.pos.set((m.x, m.y));
+            ivars.pos.set(view_point(m, ivars.offset.get()));
             ivars.vel.set((0.0, 0.0));
             ivars.idle_since.set(Some(Instant::now()));
         }
@@ -324,8 +351,10 @@ impl CursorView {
 
         let (mut px, mut py) = ivars.pos.get();
         let (mut vx, mut vy) = ivars.vel.get();
-        let dx = target.x - px;
-        let dy = target.y - py;
+        // The spring runs in view space; the target is a screen point.
+        let (tx, ty) = view_point(target, ivars.offset.get());
+        let dx = tx - px;
+        let dy = ty - py;
         let ax = SPRING_STIFFNESS * dx - SPRING_DAMPING * vx;
         let ay = SPRING_STIFFNESS * dy - SPRING_DAMPING * vy;
         vx += ax * dt;
@@ -336,8 +365,8 @@ impl CursorView {
         let settled = (dx * dx + dy * dy).sqrt() < SETTLE_DISTANCE
             && (vx * vx + vy * vy).sqrt() < SETTLE_SPEED;
         if settled {
-            px = target.x;
-            py = target.y;
+            px = tx;
+            py = ty;
             vx = 0.0;
             vy = 0.0;
             if ivars.idle_since.get().is_none() {
@@ -361,8 +390,13 @@ fn main() {
     // human is using.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let screen = NSScreen::mainScreen(mtm).expect("no main screen");
-    let frame = screen.frame();
+    // Sized to every screen, not just the main one: callers speak global screen
+    // points, so a window that only covers `mainScreen` cannot reach an element on
+    // a second display. `current_screen_space` is re-read in the loop so plugging
+    // a display in, unplugging one, or changing resolution moves the window with
+    // it rather than leaving it covering an area that no longer exists.
+    let mut space = current_screen_space(mtm, None);
+    let frame = space.frame;
 
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -380,9 +414,11 @@ fn main() {
         // The whole point: input passes through to whatever is underneath, so
         // this window can never intercept a click meant for an app.
         window.setIgnoresMouseEvents(true);
-        // Keep the overlay at the ordinary window level. Each command orders
-        // it immediately above the exact target CGWindowID, so unrelated
-        // foreground windows naturally occlude both the target and its cursor.
+        // Starts at the ordinary level and is raised per command to match the
+        // target's own CGWindow layer — see `overlay_level_for`. Ordering alone
+        // cannot cross a level boundary, so a fixed level 0 could never annotate
+        // the floating and torn-off-menu windows at layer 3 that cua-capture
+        // accepts as targets.
         window.setLevel(0);
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -391,7 +427,7 @@ fn main() {
         );
     }
 
-    let view = CursorView::new(mtm, frame);
+    let view = CursorView::new(mtm, frame, space.offset);
     window.setContentView(Some(&view));
     eprintln!(
         "cua-overlay ready on {:.0}x{:.0}",
@@ -484,6 +520,10 @@ fn main() {
     // halves are needed: the id is the thing that can disappear, and the pid is
     // what makes a recycled id detectable.
     let mut pinned: Option<(u32, libc::pid_t)> = None;
+    // Mirrors the window's level so it is only written when it changes; every
+    // `setLevel:` reorders the window, so calling it per tick would fight the
+    // per-command ordering.
+    let mut current_level: isize = 0;
 
     // Pump the run loop in short slices, apply whatever the reader queued,
     // then step the spring/idle animation and repaint if it changed
@@ -496,10 +536,27 @@ fn main() {
             // be checked for the window closing — either way the gate below would
             // be inert, which is how the arrow used to get stranded.
             pinned = match (command.window_id, command.pid) {
-                (Some(window_id), Some(pid)) => {
-                    window.orderWindow_relativeTo(NSWindowOrderingMode::Above, window_id as isize);
-                    Some((window_id, pid))
-                }
+                // The level has to be set before the ordering, not after:
+                // `setLevel:` reorders within the new band, so raising the level
+                // afterwards would discard the placement just established.
+                (Some(window_id), Some(pid)) => match target_window_layer(window_id, pid) {
+                    Some(layer) => {
+                        let level = overlay_level_for(layer);
+                        if level != current_level {
+                            window.setLevel(level);
+                            current_level = level;
+                        }
+                        window.orderWindow_relativeTo(
+                            NSWindowOrderingMode::Above,
+                            window_id as isize,
+                        );
+                        Some((window_id, pid))
+                    }
+                    // Aimed at a window that is not on screen. Refusing here
+                    // rather than pinning and letting the gate below undo it
+                    // keeps a doomed command from producing one painted frame.
+                    None => None,
+                },
                 _ => None,
             };
             view.set_target(if pinned.is_some() {
@@ -517,12 +574,37 @@ fn main() {
         // a window that is not there, and a closed or minimized window leaves it
         // ordered against nothing. This is the check for that, and it asks about
         // the *window*, not about who has the keyboard: see
-        // `target_window_visible`.
+        // `target_window_layer`.
         if let Some((wid, pid)) = pinned {
-            if !target_window_visible(wid, pid) {
-                pinned = None;
-                view.set_target(Marker::default());
+            match target_window_layer(wid, pid) {
+                Some(layer) => {
+                    // A window can be promoted between levels while the arrow is
+                    // on it — a panel going floating, a menu tearing off — so the
+                    // level is re-checked, not just set once at pin time.
+                    let level = overlay_level_for(layer);
+                    if level != current_level {
+                        window.setLevel(level);
+                        current_level = level;
+                        window.orderWindow_relativeTo(NSWindowOrderingMode::Above, wid as isize);
+                    }
+                }
+                None => {
+                    pinned = None;
+                    view.set_target(Marker::default());
+                }
             }
+        }
+
+        // Displays can be added, removed or resized under a running overlay, and
+        // a window sized to a layout that no longer exists covers the wrong area.
+        // Cheap enough per tick: a handful of `NSScreen` objects, and the setters
+        // only run when the layout actually moved.
+        let current = current_screen_space(mtm, Some(space));
+        if current != space {
+            space = current;
+            window.setFrame_display(space.frame, false);
+            view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), space.frame.size));
+            view.set_offset(space.offset);
         }
 
         if view.advance() {
@@ -566,12 +648,19 @@ fn main() {
 /// Deliberately fails closed. Any missing key, unexpected type, or a null list
 /// means "cannot prove it is there", and a hidden arrow costs one frame while a
 /// wrongly shown one is drawn over someone's work.
-fn target_window_visible(wid: u32, pid: libc::pid_t) -> bool {
-    let Some(list) =
-        CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, NULL_WINDOW_ID)
-    else {
-        return false;
-    };
+/// Returns the target's CGWindow layer when it is still on screen and still
+/// owned by `pid`, and `None` when it is not — which is also the signal to stop
+/// drawing.
+///
+/// The layer comes back because the overlay has to live in the same level band
+/// as whatever it is annotating. `NSWindow` levels are ordered bands, not hints:
+/// every window at level 3 sits ahead of every window at level 0, so a level-0
+/// overlay ordered "above" a floating or torn-off-menu window at layer 3 still
+/// renders behind it. cua-capture accepts targets up to layer 3 precisely
+/// because menus live there, so the arrow would silently vanish for exactly the
+/// controls that need it most.
+fn target_window_layer(wid: u32, pid: libc::pid_t) -> Option<i64> {
+    let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, NULL_WINDOW_ID)?;
     let count = CFArray::count(&list);
     for i in 0..count {
         // The array is documented to hold CFDictionary descriptions; anything
@@ -584,11 +673,123 @@ fn target_window_visible(wid: u32, pid: libc::pid_t) -> bool {
         if number_for(dict, unsafe { kCGWindowNumber }) != Some(i64::from(wid)) {
             continue;
         }
-        // Right id: this is the one entry worth answering about, so report what
-        // the owner check says rather than continuing to look for a duplicate.
-        return number_for(dict, unsafe { kCGWindowOwnerPID }) == Some(pid as i64);
+        // Right id: this is the one entry worth answering about, so answer from
+        // it rather than continuing to look for a duplicate id.
+        if number_for(dict, unsafe { kCGWindowOwnerPID }) != Some(pid as i64) {
+            return None;
+        }
+        // A window with no reported layer is still a visible, owned window;
+        // treating it as level 0 keeps it drawable rather than discarding a
+        // target over a missing optional key.
+        return Some(number_for(dict, unsafe { kCGWindowLayer }).unwrap_or(0));
     }
-    false
+    None
+}
+
+/// The window level the overlay should adopt to annotate a target at
+/// `target_layer`.
+///
+/// Clamped to the same 0..=3 band `cua_capture::is_plausible_target` will accept
+/// as a target, and deliberately not a passthrough. The on-screen window list
+/// contains the Dock at roughly `i32::MIN` and system UI in the thousands, and a
+/// mis-read or recycled entry that moved the overlay into one of those bands
+/// would put a click-through window above every app on the machine. Refusing to
+/// leave the band the targets live in makes that unreachable.
+fn overlay_level_for(target_layer: i64) -> isize {
+    target_layer.clamp(0, 3) as isize
+}
+
+/// A marker's position in view coordinates.
+///
+/// `Marker` stores what the caller said — a global screen point — because that is
+/// the thing that stays true across a display rearrangement. The view's own
+/// coordinates do not, so the conversion happens at each point of use rather than
+/// being baked in at parse time. See [`screen_space`] for the derivation; on a
+/// single display `offset` is `(0, 0)` and this is the identity.
+fn view_point(m: Marker, offset: (f64, f64)) -> (f64, f64) {
+    (m.x - offset.0, m.y + offset.1)
+}
+
+/// Where the overlay window goes, and how to turn a caller's screen point into a
+/// point inside its flipped view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenSpace {
+    /// Union of every screen, in AppKit coordinates (bottom-left origin, y up).
+    frame: NSRect,
+    /// Subtract from a caller's x, add to a caller's y, to land in view
+    /// coordinates. See [`screen_space`] for the derivation.
+    offset: (f64, f64),
+}
+
+/// [`screen_space`] for the screens attached right now.
+///
+/// Split from the pure function so the arithmetic is testable without AppKit;
+/// this half is only the lookup. `mainScreen` is the origin of the caller's
+/// coordinate system, so its absence means there is no coordinate system to draw
+/// in and the previous geometry is the safest thing to keep.
+fn current_screen_space(mtm: MainThreadMarker, previous: Option<ScreenSpace>) -> ScreenSpace {
+    let Some(main) = NSScreen::mainScreen(mtm) else {
+        return previous.unwrap_or(screen_space(&[], 0.0));
+    };
+    let frames: Vec<NSRect> = NSScreen::screens(mtm)
+        .to_vec()
+        .iter()
+        .map(|s| s.frame())
+        .collect();
+    screen_space(&frames, main.frame().size.height)
+}
+
+/// Compute the overlay's geometry from the screens' AppKit frames.
+///
+/// A single fixed window sized to `mainScreen` could only ever cover one
+/// display, and callers speak *global* screen points — so an element on a second
+/// monitor was handed to a window that does not reach it, and the arrow was
+/// clipped away or drawn somewhere meaningless. The window therefore spans the
+/// union of all screens.
+///
+/// The offset exists because two coordinate systems disagree about the origin.
+/// Callers use CoreGraphics screen points: top-left origin at the *main*
+/// display's top-left, y increasing downward — the space `get_app_state` reports
+/// frames in. AppKit places windows bottom-left-origin from the main display's
+/// bottom-left, y up. With the view flipped, a point lands at
+///
+/// ```text
+/// view_x = x - union.origin.x
+/// view_y = (union.origin.y + union.height - main_height) + y
+/// ```
+///
+/// because the view's y runs down from the union's *top* edge, whose AppKit
+/// height above the main display's bottom is `union.origin.y + union.height`,
+/// while the caller's y runs down from the main display's top at `main_height`.
+///
+/// Single-display machines get `offset == (0, 0)` and the previous behaviour
+/// exactly: the union is the main screen, so both terms cancel. That equivalence
+/// is the point of writing this as a pure function — it is the part a machine
+/// with one monitor can still prove.
+fn screen_space(screens: &[NSRect], main_height: f64) -> ScreenSpace {
+    let frame = screens
+        .iter()
+        .copied()
+        .reduce(|a, b| {
+            let min_x = a.origin.x.min(b.origin.x);
+            let min_y = a.origin.y.min(b.origin.y);
+            let max_x = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+            let max_y = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+            NSRect::new(
+                NSPoint::new(min_x, min_y),
+                NSSize::new(max_x - min_x, max_y - min_y),
+            )
+        })
+        // No screens at all is not a state this can draw in, but it must not
+        // panic on the way through a display being unplugged.
+        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)));
+    ScreenSpace {
+        frame,
+        offset: (
+            frame.origin.x,
+            frame.origin.y + frame.size.height - main_height,
+        ),
+    }
 }
 
 /// Read one integer out of a `CGWindowListCopyWindowInfo` description.
@@ -607,4 +808,84 @@ fn number_for(dict: &CFDictionary, key: &CFString) -> Option<i64> {
     }
     let number: &CFNumber = unsafe { &*value.cast() };
     number.as_i64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// The regression that matters most on a one-display machine: whatever the
+    /// multi-screen arithmetic does, it must be the identity here, because that
+    /// is the configuration the overlay was measured working in.
+    #[test]
+    fn a_single_display_is_unchanged_by_the_union_math() {
+        let main = rect(0.0, 0.0, 1512.0, 982.0);
+        let space = screen_space(&[main], 982.0);
+        assert_eq!(space.frame, main);
+        assert_eq!(space.offset, (0.0, 0.0));
+        let m = Marker {
+            x: 700.0,
+            y: 400.0,
+            visible: true,
+            clicking: false,
+        };
+        assert_eq!(view_point(m, space.offset), (700.0, 400.0));
+    }
+
+    /// A display to the left gives the union a negative origin, which is the case
+    /// DESIGN called out as untested. The main display's own top-left must still
+    /// map to the main display, not to the union's corner.
+    #[test]
+    fn a_display_to_the_left_shifts_without_moving_the_main_screens_points() {
+        let main = rect(0.0, 0.0, 1512.0, 982.0);
+        let left = rect(-1920.0, 0.0, 1920.0, 1080.0);
+        let space = screen_space(&[main, left], 982.0);
+        assert_eq!(space.frame, rect(-1920.0, 0.0, 3432.0, 1080.0));
+        // x shifts by the union's left edge; y by how far the union's top rises
+        // above the main display's top.
+        assert_eq!(space.offset, (-1920.0, 98.0));
+
+        let origin = Marker {
+            x: 0.0,
+            y: 0.0,
+            visible: true,
+            clicking: false,
+        };
+        // The main display starts 1920 points right of the union's left edge, and
+        // 98 points below its top.
+        assert_eq!(view_point(origin, space.offset), (1920.0, 98.0));
+    }
+
+    /// Order must not matter: the union is a fold, and a screen list arrives in
+    /// whatever order AppKit reports it.
+    #[test]
+    fn the_union_does_not_depend_on_screen_order() {
+        let a = rect(0.0, 0.0, 1512.0, 982.0);
+        let b = rect(-1920.0, -200.0, 1920.0, 1080.0);
+        assert_eq!(screen_space(&[a, b], 982.0), screen_space(&[b, a], 982.0));
+    }
+
+    /// Unplugging every display must not panic on the way through.
+    #[test]
+    fn no_screens_is_an_empty_frame_rather_than_a_panic() {
+        let space = screen_space(&[], 0.0);
+        assert_eq!(space.frame.size.width, 0.0);
+        assert_eq!(space.offset, (0.0, 0.0));
+    }
+
+    /// The overlay follows its target into the floating band, and refuses to
+    /// follow anything into a system band. The on-screen window list contains the
+    /// Dock near `i32::MIN` and system UI in the thousands; a click-through window
+    /// at those levels would sit above every app on the machine.
+    #[test]
+    fn the_overlay_level_tracks_the_target_but_stays_inside_the_target_band() {
+        assert_eq!(overlay_level_for(0), 0, "ordinary window");
+        assert_eq!(overlay_level_for(3), 3, "floating / torn-off menu");
+        assert_eq!(overlay_level_for(2997), 3, "system UI is clamped down");
+        assert_eq!(overlay_level_for(-2147483622), 0, "the Dock is clamped up");
+    }
 }

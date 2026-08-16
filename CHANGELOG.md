@@ -5,6 +5,63 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.5.2
+
+Three defects an external review of 0.5.1 found in `cua-overlay`. All of them are
+about the arrow being in the wrong place or absent, none about input: this process
+still delivers nothing and ignores mouse events entirely.
+
+### The arrow could not appear above a menu
+
+The overlay sat at `setLevel(0)` and relied on `orderWindow(Above, target)` to
+place it. Ordering cannot cross a level boundary — `NSWindow` levels are bands,
+and every window at level 3 renders ahead of every window at level 0 — so a
+level-0 overlay ordered "above" a floating or torn-off-menu window at layer 3
+still drew behind it. `cua_capture::is_plausible_target` accepts targets up to
+layer 3 precisely because menus live there, so the arrow went missing for exactly
+the controls that are hardest to hit and most worth annotating.
+
+The overlay now reads the target's `kCGWindowLayer` from the same on-screen
+window-list lookup the visibility gate already performs, and adopts a matching
+level before ordering itself — order matters, since `setLevel:` reorders within
+the new band and would otherwise discard the placement. The level is clamped to
+the same 0..=3 band the capture layer will accept as a target, and deliberately
+not passed through: the on-screen list also contains the Dock near `i32::MIN` and
+system UI in the thousands, and a mis-read entry that moved a click-through
+window into one of those bands would put it above every app on the machine. The
+level is re-checked each tick, not just at pin time, so a panel that goes floating
+or a menu that tears off while the arrow is on it is followed rather than lost.
+
+### The overlay covered only the main display, forever
+
+The window was created once from `NSScreen::mainScreen().frame()` and never
+touched again. Callers pass *global* screen points, so an element on a second
+display was handed to a window that does not reach it and the arrow was clipped
+away; and a resolution change or a display being unplugged left the window
+covering an area that no longer existed.
+
+It now spans the union of every screen and re-reads that union each tick, moving
+with the layout. Converting a caller's point into the view needs a real
+translation once the union is not the main screen — the caller's origin is the
+main display's top-left with y down, AppKit's is the main display's bottom-left
+with y up, and the flipped view's origin is the union's top-left — so the
+arithmetic is a pure function with unit tests, including the negative-origin
+"second display to the left" case DESIGN §6 had flagged as untested. The
+single-display result is asserted to be the identity, which is the part a machine
+with one monitor can actually prove, and it was: `ready on 1512x982`, unchanged.
+
+When the layout does move, the marker keeps its screen coordinates and the spring
+is re-seeded from them, so the arrow stays on the pixel it was pointing at instead
+of sliding across the screen by the difference.
+
+### Re-verified
+
+Driving the release binary by hand against a visible background window: the arrow
+painted; `hide`, a nonexistent window id, a `NaN` coordinate, window id `0` and a
+missing pid each produced a frame byte-identical to the blank baseline from the
+0.5.1 verification. The layer-3 path is covered by unit tests and by inspection
+only — no floating-level target was available to point at live.
+
 ## 0.5.1
 
 ### The drawn cursor was not drawing at all
