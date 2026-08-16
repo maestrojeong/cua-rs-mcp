@@ -2373,13 +2373,36 @@ impl Inner {
             // here rather than duplicating the refusal.
             Target::Point { x, y, .. } => hit_test(&snap.nodes, x, y)?,
         };
+        // The snapshot is flat and every node names its parent, so the whole
+        // tree the context rule needs is a borrowed projection of it. Which
+        // ancestors count, how far up the search goes and what text inside them
+        // is evidence are all decided in `safety`; this end only hands over the
+        // shape.
+        let projection: Vec<crate::safety::ContextNode<'_>> = snap
+            .nodes
+            .iter()
+            .map(|n| crate::safety::ContextNode {
+                parent: n.parent,
+                role: &n.role,
+                subrole: n.subrole.as_deref(),
+                label: n.label.as_deref(),
+                value: n.value.as_deref(),
+                help: n.help.as_deref(),
+                settable: n.settable,
+            })
+            .collect();
+        let context = crate::safety::decision_context(&projection, node.index);
+        let caption = crate::safety::caption(&projection, node.index);
+
         Some(crate::safety::Candidate {
             role: node.role.clone(),
             label: node.label.clone(),
             value: node.value.clone(),
             help: node.help.clone(),
             settable: node.settable,
+            caption,
             description: describe_node(node),
+            context,
         })
     }
 

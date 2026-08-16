@@ -147,6 +147,29 @@ pub enum Refused {
         matched: String,
     },
 
+    /// The same gate, reached through the *question the dialog is asking*.
+    ///
+    /// Kept separate from [`Refused::NeedsConfirmation`] because the two accuse
+    /// different things. That one says "this control removes something"; this
+    /// one says "this control is terse and the sheet around it is not", which is
+    /// the ordinary shape of a macOS alert. The message quotes the question, so
+    /// a human reading the transcript can see the evidence rather than trusting
+    /// a classifier they cannot inspect.
+    #[error(
+        "refusing to {verb} {target}: it answers a {context} that reads as asking a destructive \
+         question — {question:?} (matched {matched:?}). The button is terse but the sheet it sits \
+         in is not, and cua-rs classifies the decision, not the wording of the answer. Pass \
+         confirm_destructive: true on this same call to proceed. Dismissing answers (Cancel, No, \
+         취소 …) are never refused here, so backing out of this dialog needs no confirmation"
+    )]
+    NeedsConfirmationInContext {
+        verb: &'static str,
+        target: String,
+        context: String,
+        question: String,
+        matched: String,
+    },
+
     /// The same gate, reached through the *key* rather than the label.
     ///
     /// Kept separate so the message cannot claim a scroll bar is "a destructive
@@ -640,8 +663,15 @@ pub struct Candidate {
     /// Whether the element's value can be written, i.e. whether this is a text
     /// field rather than a control.
     pub settable: bool,
+    /// What the control says in a child element rather than an attribute, for
+    /// the toolkits that do that. See [`caption`].
+    pub caption: Option<String>,
     /// How the tree rendered it, for the error message.
     pub description: String,
+    /// The question the nearest enclosing decision context is asking, if the
+    /// element sits inside one. See [`decision_context`] for what qualifies and
+    /// how far the search goes.
+    pub context: Option<DecisionContext>,
 }
 
 impl Candidate {
@@ -663,15 +693,20 @@ impl Candidate {
 
     /// The text a label heuristic is allowed to read.
     ///
-    /// Label and help always. The *value* only when the element is not
-    /// writable: a button's value is part of what it says, while a text field's
-    /// value is the user's own content, and classifying `set_value` on a note
-    /// containing the word "delete" as a destructive action would be a refusal
-    /// no confirmation could make sensible.
+    /// Label, help and caption always — all three are the control describing
+    /// itself, and which of them an app populates is a toolkit accident. The
+    /// *value* only when the element is not writable: a button's value is part
+    /// of what it says, while a text field's value is the user's own content,
+    /// and classifying `set_value` on a note containing the word "delete" as a
+    /// destructive action would be a refusal no confirmation could make
+    /// sensible.
     fn classifiable_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(l) = &self.label {
             parts.push(l);
+        }
+        if let Some(c) = &self.caption {
+            parts.push(c);
         }
         if let Some(h) = &self.help {
             parts.push(h);
@@ -683,6 +718,367 @@ impl Candidate {
         }
         parts.join(" ")
     }
+
+    /// Whether the question around this element may be held against it.
+    ///
+    /// Two exemptions, both narrow and both for the same reason — the gate has
+    /// to stay rare enough that clearing it is a decision rather than a habit:
+    ///
+    /// - **A dismissing answer.** Cancel is how a caller *avoids* the
+    ///   destruction the dialog is offering. Refusing it would leave an agent
+    ///   holding a modal sheet it cannot back out of, and the only way through
+    ///   would be to send `confirm_destructive: true` — teaching it to confirm
+    ///   its way out of alerts, which is precisely the habit that would make the
+    ///   gate useless when it matters.
+    /// - **Typing.** A text field inside a dialog is not the decision; the
+    ///   button underneath it is. `set_value` into the name field of a sheet
+    ///   that mentions deleting changes nothing on its own, and refusing it is
+    ///   the "note that says delete" mistake one level out.
+    fn accepts_context_evidence(&self) -> bool {
+        if self.is_text_entry() {
+            return false;
+        }
+        // Either place the toolkit put the answer's wording. A Chromium button
+        // whose caption is a child still says "Cancel".
+        let says = self.label.as_deref().or(self.caption.as_deref());
+        match says {
+            Some(label) => !is_dismissing_answer(label),
+            None => true,
+        }
+    }
+}
+
+// ── the question a dialog is asking ──────────────────────────────────────────
+//
+// A label heuristic that reads only the control it is about to press cannot see
+// the most common destructive arrangement on macOS: the alert holds the verb and
+// the button holds one word. "OK" under "Delete 4 items?" is not a labelling
+// accident, it is what an alert *is* — the question is asked once, at the top,
+// and the answers are terse by design.
+//
+// Widening to "the ancestor chain" is the obvious move and it is wrong. Every
+// element in a mail window descends from a window whose title is a subject line;
+// every control in a chat window descends from a window containing the whole
+// conversation. Reading ancestors indiscriminately makes the gate fire on any
+// app whose *content* mentions deleting, and a gate that fires constantly is
+// worse than no gate, because `confirm_destructive: true` then gets attached to
+// every call reflexively and stops meaning anything.
+//
+// So the rule here is about *kind*, not distance:
+//
+//  1. **Only a decision context is evidence.** An `AXSheet`, an `AXDialog`, or a
+//     window whose subrole marks it as a dialog exists for one reason — to ask a
+//     question and collect an answer — so its text *is* the question. An
+//     ordinary `AXWindow`, `AXGroup` or `AXScrollArea` is layout, and its text is
+//     the user's content. No amount of depth turns content into a question.
+//  2. **The nearest one, and no further.** The search walks up from the target
+//     and stops at the first decision context it finds, and at the first
+//     ordinary window if it finds one first. That bound is structural rather
+//     than numeric: an alert's message sits one or two levels above its buttons
+//     in AppKit and rather more in a cross-platform toolkit, and "N levels" would
+//     break differently in each. Stopping at the enclosing question also gets
+//     nesting right — a confirmation sheet raised on top of a disk-erase dialog
+//     is answering *its own* question, not the one behind it.
+//  3. **Prose, not answers.** Inside the context, only its own title/description
+//     and its static text count. Sibling buttons are deliberately not read: an
+//     alert offering "Delete" and "Cancel" would otherwise make "Cancel"
+//     destructive, and refusing the way *out* of a destructive dialog is not
+//     caution, it is the gate causing the harm it exists to prevent.
+//  4. **Content stays excluded, at every depth.** The reason a text field's own
+//     value is never classified — `set_value` on a note saying "delete the old
+//     files" must not be refused — applies unchanged to document bodies, message
+//     lists and table rows that happen to be inside a dialog. The walk does not
+//     descend into them.
+
+/// Roles that exist to ask a question.
+const DECISION_ROLES: &[&str] = &["AXSheet", "AXDialog", "AXAlert"];
+
+/// Subroles that mark an otherwise ordinary window as a question.
+///
+/// This is how AppKit ships an `NSAlert`: role `AXWindow`, subrole `AXDialog`
+/// (or `AXSystemDialog` for the ones the system raises). Matching the subrole is
+/// what keeps the rule from having to guess which windows are modal.
+const DECISION_SUBROLES: &[&str] = &["AXDialog", "AXSystemDialog", "AXAlertDialog"];
+
+/// Where the upward search gives up.
+///
+/// Reaching an ordinary window means the target is in content, not in a
+/// question, and nothing above a window can be one either.
+const CONTEXT_BOUNDARY_ROLES: &[&str] = &["AXWindow", "AXApplication", "AXSystemWide"];
+
+/// Roles whose text is the user's own material rather than the dialog's prose.
+///
+/// The walk neither reads these nor descends into them, however shallow they
+/// are. A "Move to…" sheet listing a folder called "delete me" is still a list
+/// of the user's files.
+const CONTENT_CONTAINER_ROLES: &[&str] = &[
+    "AXScrollArea",
+    "AXTable",
+    "AXOutline",
+    "AXList",
+    "AXBrowser",
+    "AXGrid",
+    "AXRow",
+    "AXCell",
+    "AXWebArea",
+    "AXDocument",
+    "AXTextArea",
+];
+
+/// Roles that are *answers* to the question, not part of it.
+///
+/// Not read and not descended into, so one destructive button in an alert does
+/// not contaminate every other button beside it.
+const ANSWER_ROLES: &[&str] = &[
+    "AXButton",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXMenuButton",
+    "AXMenuItem",
+    "AXLink",
+    "AXDisclosureTriangle",
+    "AXTab",
+    "AXSlider",
+    "AXIncrementor",
+    "AXStepper",
+    "AXTextField",
+    "AXComboBox",
+    "AXSearchField",
+];
+
+/// Roles whose text is read as part of the question.
+const QUESTION_ROLES: &[&str] = &["AXStaticText", "AXHeading"];
+
+/// How many pieces of static text one question may be assembled from.
+///
+/// Not a tuning knob — the shape rules above are what decide *what* is read, and
+/// this only bounds the cost of reading a pathological dialog with a thousand
+/// labels in it. A real alert uses two: a message and an informative text.
+const MAX_QUESTION_PARTS: usize = 24;
+
+/// Exact labels that mean "no".
+///
+/// Matched against the whole normalized label, never as a substring, so
+/// "Close Account" is not excused by "Close". The exactness is the safety
+/// property: this list is the one place the gate deliberately *stops* refusing,
+/// so it has to be impossible for a destructive control to fall into it by
+/// containing a soft word.
+///
+/// Membership is judged on the answer alone. A dismissing answer in a
+/// destructive dialog is the safe outcome, and in a harmless one it is a no-op;
+/// there is no dialog in which pressing Cancel is the thing that needed
+/// confirming.
+const DISMISSING_ANSWERS: &[&str] = &[
+    "cancel",
+    "no",
+    "not now",
+    "later",
+    "dismiss",
+    "keep",
+    "back",
+    "go back",
+    "취소",
+    "아니오",
+    "아니요",
+    "나중에",
+    "유지",
+    "돌아가기",
+];
+
+/// The question the nearest enclosing decision context is asking.
+///
+/// Assembled once at the gate and carried on the [`Candidate`], so a refusal can
+/// quote its own evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionContext {
+    /// How the context renders — `AXSheet`, `AXWindow[AXDialog]` — for the
+    /// error message.
+    pub kind: String,
+    /// The context's own title and description plus its static text, in tree
+    /// order.
+    pub question: String,
+}
+
+/// One snapshot node, as the context rule sees it.
+///
+/// Borrowed rather than cloned: the caller in `session` already holds the
+/// snapshot, and copying a 1500-node tree per action to classify one button
+/// would be paying for the whole window to judge one control. The fields are
+/// exactly what the rule reads, which also documents what it cannot read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextNode<'a> {
+    pub parent: Option<usize>,
+    pub role: &'a str,
+    pub subrole: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub value: Option<&'a str>,
+    pub help: Option<&'a str>,
+    pub settable: bool,
+}
+
+fn any_eq_ignore_case(list: &[&str], want: &str) -> bool {
+    list.iter().any(|entry| entry.eq_ignore_ascii_case(want))
+}
+
+/// Whether this node exists to ask a question rather than to lay one out.
+fn is_decision_context(node: &ContextNode<'_>) -> bool {
+    any_eq_ignore_case(DECISION_ROLES, node.role)
+        || node
+            .subrole
+            .is_some_and(|s| any_eq_ignore_case(DECISION_SUBROLES, s))
+}
+
+/// The nearest enclosing decision context of `target`, if it has one.
+///
+/// Walks parents only, stops at the first decision context, and gives up at the
+/// first ordinary window. The step count is capped at the node count so a
+/// malformed parent cycle cannot hang an action.
+fn nearest_decision_context(nodes: &[ContextNode<'_>], target: usize) -> Option<usize> {
+    let mut current = nodes.get(target)?.parent;
+    for _ in 0..nodes.len() {
+        let index = current?;
+        let node = nodes.get(index)?;
+        if is_decision_context(node) {
+            return Some(index);
+        }
+        if any_eq_ignore_case(CONTEXT_BOUNDARY_ROLES, node.role) {
+            return None;
+        }
+        current = node.parent;
+    }
+    None
+}
+
+/// The text `node` contributes to a question, under the same value rule the
+/// target itself is judged by: never a writable value, because that is the
+/// user's typing and not the dialog's prose.
+fn question_text_of(node: &ContextNode<'_>) -> Vec<String> {
+    let mut parts = Vec::new();
+    for part in [node.label, node.help] {
+        if let Some(p) = part.map(str::trim).filter(|p| !p.is_empty()) {
+            parts.push(p.to_string());
+        }
+    }
+    if !node.settable {
+        if let Some(v) = node.value.map(str::trim).filter(|v| !v.is_empty()) {
+            parts.push(v.to_string());
+        }
+    }
+    parts
+}
+
+/// The prose inside `root`, pruned at answers, at content and at any nested
+/// decision context.
+///
+/// A depth-first walk, so the text collected is bounded by the subtree's own
+/// prose no matter how large the window behind it is. `include_root` is what
+/// distinguishes the two callers: a decision context contributes its own
+/// title, while a control's own attributes are already classified elsewhere and
+/// only its caption children are wanted here.
+fn prose_in(nodes: &[ContextNode<'_>], root: usize, include_root: bool) -> String {
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            if parent < nodes.len() && parent != index {
+                children[parent].push(index);
+            }
+        }
+    }
+
+    let mut parts = if include_root {
+        question_text_of(&nodes[root])
+    } else {
+        Vec::new()
+    };
+    let mut stack: Vec<usize> = children[root].iter().rev().copied().collect();
+    while let Some(index) = stack.pop() {
+        if parts.len() >= MAX_QUESTION_PARTS {
+            break;
+        }
+        let node = &nodes[index];
+        if is_decision_context(node)
+            || any_eq_ignore_case(CONTENT_CONTAINER_ROLES, node.role)
+            || any_eq_ignore_case(ANSWER_ROLES, node.role)
+        {
+            continue;
+        }
+        if any_eq_ignore_case(QUESTION_ROLES, node.role) {
+            parts.extend(question_text_of(node));
+            // Static text has no children worth walking, and an accessible
+            // label rendered as a child of one would be the same string twice.
+            continue;
+        }
+        stack.extend(children[index].iter().rev().copied());
+    }
+
+    parts.join(" ")
+}
+
+/// Roles whose caption may be a child element instead of an attribute.
+///
+/// Chromium and the toolkits built on it publish a button as a container with
+/// its caption as an `AXStaticText` inside it, so a control that says "Delete"
+/// on screen arrives here with no label at all. Reading one level of prose out
+/// of *the control itself* is not a widening of scope — it is the same target
+/// the classifier always judged, reassembled from where this toolkit put it.
+///
+/// Restricted to button-shaped roles on purpose. `AXRow` and `AXCell` also hold
+/// their text in children, and that text is the user's mail, chat and files.
+const CAPTIONED_ROLES: &[&str] = &[
+    "AXButton",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXMenuButton",
+    "AXMenuItem",
+    "AXLink",
+    "AXTab",
+    "AXDisclosureTriangle",
+    "AXToolbarButton",
+];
+
+/// What the control at `target` says, when it says it in a child.
+///
+/// `None` for anything that is not button-shaped, and for a button that carries
+/// its caption in an attribute like every native control does.
+pub fn caption(nodes: &[ContextNode<'_>], target: usize) -> Option<String> {
+    let node = nodes.get(target)?;
+    if !any_eq_ignore_case(CAPTIONED_ROLES, node.role) {
+        return None;
+    }
+    let text = prose_in(nodes, target, false);
+    Some(text).filter(|t| !t.trim().is_empty())
+}
+
+/// The question the element at `target` is being asked to answer, if any.
+///
+/// Public because this is the interesting half of the classifier and deserves to
+/// be testable from a plain array of nodes, with no app, no snapshot and no
+/// accessibility permission.
+pub fn decision_context(nodes: &[ContextNode<'_>], target: usize) -> Option<DecisionContext> {
+    let index = nearest_decision_context(nodes, target)?;
+    let question = prose_in(nodes, index, true);
+    if question.trim().is_empty() {
+        return None;
+    }
+    let node = &nodes[index];
+    let kind = match node.subrole {
+        Some(subrole) if !subrole.is_empty() => format!("{}[{subrole}]", node.role),
+        _ => node.role.to_string(),
+    };
+    Some(DecisionContext { kind, question })
+}
+
+/// Whether a label is an exact "no".
+///
+/// Trailing punctuation and the ellipsis AppKit likes are stripped before the
+/// comparison, so "Cancel…" is still a cancel; nothing else about the string is
+/// allowed to vary.
+fn is_dismissing_answer(label: &str) -> bool {
+    let norm = normalize(label);
+    let trimmed = norm.trim_matches(|c: char| !c.is_alphanumeric());
+    !trimmed.is_empty() && DISMISSING_ANSWERS.contains(&trimmed)
 }
 
 /// Collapse whitespace and lowercase, so one label matches one way.
@@ -725,6 +1121,22 @@ pub fn destructive_token(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The question held against this candidate, and the token that convicted it.
+///
+/// The whole context half of the gate in one call, so a test can exercise the
+/// decision — not just its pieces — without an app, a window server or a
+/// permission. `None` means the context is no evidence: there is no enclosing
+/// question, the question is harmless, or the candidate is exempt from being
+/// judged by it (see [`Candidate::accepts_context_evidence`]).
+pub fn destructive_context(candidate: &Candidate) -> Option<(&DecisionContext, String)> {
+    if !candidate.accepts_context_evidence() {
+        return None;
+    }
+    let context = candidate.context.as_ref()?;
+    let matched = destructive_token(&context.question)?;
+    Some((context, matched))
 }
 
 /// Whether pressing `key` on `candidate` destroys something.
@@ -1069,6 +1481,19 @@ pub(crate) fn guard(
                     matched,
                 });
             }
+            // The control said nothing destructive about itself. Ask what it is
+            // answering — checked second so that a control which is destructive
+            // on its own evidence is reported that way, which is the shorter
+            // and more obvious explanation of the two.
+            if let Some((context, matched)) = destructive_context(c) {
+                return Err(Refused::NeedsConfirmationInContext {
+                    verb,
+                    target: c.description.clone(),
+                    context: context.kind.clone(),
+                    question: context.question.clone(),
+                    matched,
+                });
+            }
         }
     }
 
@@ -1291,6 +1716,544 @@ mod tests {
         let mut c = button("⌫");
         c.help = Some("Move this conversation to the trash".to_string());
         assert!(destructive_token(&c.classifiable_text()).is_some());
+    }
+
+    // ── the question a dialog is asking ──────────────────────────────────
+    //
+    // These build snapshot-shaped trees rather than asserting on strings,
+    // because the rule being tested is about *shape*: which ancestor, how far
+    // up, which text inside it. A string-level test would pass with the
+    // ancestor rule deleted.
+
+    /// A flat tree in the form the snapshot records one: parents before
+    /// children, every node naming its parent by index.
+    #[derive(Default)]
+    struct Tree {
+        nodes: Vec<ContextNode<'static>>,
+    }
+
+    impl Tree {
+        fn push(&mut self, node: ContextNode<'static>) -> usize {
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        }
+
+        /// An ordinary document window. Layout, never a question.
+        fn window(&mut self, title: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: None,
+                role: "AXWindow",
+                subrole: Some("AXStandardWindow"),
+                label: Some(title),
+                ..ContextNode::default()
+            })
+        }
+
+        /// What AppKit publishes for a free-standing `NSAlert`: an ordinary
+        /// window role carrying the dialog subrole.
+        fn dialog_window(&mut self, title: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: None,
+                role: "AXWindow",
+                subrole: Some("AXDialog"),
+                label: Some(title),
+                ..ContextNode::default()
+            })
+        }
+
+        /// The document-modal form: a sheet attached to a window.
+        fn sheet(&mut self, parent: usize, title: Option<&'static str>) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role: "AXSheet",
+                label: title,
+                ..ContextNode::default()
+            })
+        }
+
+        fn group(&mut self, parent: usize) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role: "AXGroup",
+                ..ContextNode::default()
+            })
+        }
+
+        fn container(&mut self, parent: usize, role: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role,
+                ..ContextNode::default()
+            })
+        }
+
+        fn text(&mut self, parent: usize, body: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role: "AXStaticText",
+                label: Some(body),
+                ..ContextNode::default()
+            })
+        }
+
+        fn button(&mut self, parent: usize, label: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role: "AXButton",
+                label: Some(label),
+                ..ContextNode::default()
+            })
+        }
+
+        fn field(&mut self, parent: usize, value: &'static str) -> usize {
+            self.push(ContextNode {
+                parent: Some(parent),
+                role: "AXTextField",
+                label: Some("Name"),
+                value: Some(value),
+                settable: true,
+                ..ContextNode::default()
+            })
+        }
+
+        /// The candidate `session::safety_candidate` would hand the gate for
+        /// this node — same fields, same context lookup.
+        fn candidate(&self, index: usize) -> Candidate {
+            let n = self.nodes[index];
+            Candidate {
+                role: n.role.to_string(),
+                label: n.label.map(str::to_string),
+                value: n.value.map(str::to_string),
+                help: n.help.map(str::to_string),
+                settable: n.settable,
+                caption: caption(&self.nodes, index),
+                description: format!("[{index}] {} {:?}", n.role, n.label.unwrap_or_default()),
+                context: decision_context(&self.nodes, index),
+            }
+        }
+
+        /// What `guard` would conclude about this node, in the same order:
+        /// the control's own words first, then the question it answers.
+        fn verdict(&self, index: usize) -> Option<String> {
+            let c = self.candidate(index);
+            destructive_token(&c.classifiable_text())
+                .or_else(|| destructive_context(&c).map(|(_, matched)| matched))
+        }
+    }
+
+    /// The commonest destructive shape on macOS: a terse button under a
+    /// sheet whose text carries the whole meaning.
+    fn confirm_sheet(
+        message: &'static str,
+        informative: &'static str,
+        answers: &[&'static str],
+    ) -> (Tree, Vec<usize>) {
+        let mut t = Tree::default();
+        let window = t.window("Documents");
+        let sheet = t.sheet(window, None);
+        let body = t.group(sheet);
+        t.text(body, message);
+        t.text(body, informative);
+        let answers = answers.iter().map(|a| t.button(sheet, a)).collect();
+        (t, answers)
+    }
+
+    #[test]
+    fn a_terse_button_inherits_the_question_its_sheet_is_asking() {
+        let (t, answers) = confirm_sheet(
+            "Delete 4 items?",
+            "This action cannot be undone.",
+            &["OK", "Cancel"],
+        );
+        assert_eq!(t.verdict(answers[0]).as_deref(), Some("delet"));
+    }
+
+    #[test]
+    fn the_korean_form_of_the_same_dialog_is_caught_too() {
+        // 확인 says nothing on its own, exactly like OK, and the maintainer's
+        // apps are Korean.
+        let (t, answers) = confirm_sheet(
+            "4개 항목을 삭제할까요?",
+            "이 동작은 되돌릴 수 없습니다.",
+            &["확인", "취소"],
+        );
+        assert_eq!(t.verdict(answers[0]).as_deref(), Some("삭제"));
+    }
+
+    #[test]
+    fn cancelling_a_destructive_dialog_is_never_refused() {
+        // The load-bearing exemption. Cancel is how a caller *avoids* the
+        // destruction on offer; refusing it would leave an agent stuck in a
+        // modal sheet whose only exit is to send confirm_destructive: true,
+        // which is the habit that would make this gate meaningless everywhere
+        // else.
+        let (t, answers) = confirm_sheet(
+            "Delete 4 items?",
+            "This action cannot be undone.",
+            &["OK", "Cancel"],
+        );
+        assert_eq!(t.verdict(answers[1]), None);
+
+        let (t, answers) = confirm_sheet(
+            "4개 항목을 삭제할까요?",
+            "이 동작은 되돌릴 수 없습니다.",
+            &["확인", "취소"],
+        );
+        assert_eq!(t.verdict(answers[1]), None);
+    }
+
+    #[test]
+    fn a_dismissing_answer_is_matched_whole_and_never_as_a_substring() {
+        for yes in [
+            "Cancel",
+            "cancel",
+            "Cancel…",
+            "(Cancel)",
+            "No",
+            "Not now",
+            "취소",
+            "유지",
+        ] {
+            assert!(is_dismissing_answer(yes), "{yes:?} is a way out");
+        }
+        // The direction that matters: a destructive control must not be
+        // excused by containing a soft word.
+        for no in [
+            "Close Account",
+            "No Backup, Delete",
+            "Cancel Subscription",
+            "Keep Nothing",
+            "취소선 삭제",
+            "",
+        ] {
+            assert!(!is_dismissing_answer(no), "{no:?} is not a way out");
+        }
+    }
+
+    #[test]
+    fn a_sheet_that_erases_a_disk_catches_continue_as_well_as_ok() {
+        let (t, answers) = confirm_sheet(
+            "Are you sure?",
+            "Erasing will permanently remove all data on “Backup”.",
+            &["Continue", "Cancel"],
+        );
+        assert!(t.verdict(answers[0]).is_some());
+        assert_eq!(t.verdict(answers[1]), None);
+    }
+
+    #[test]
+    fn an_alert_window_is_a_question_even_though_its_role_says_window() {
+        // AppKit's free-standing NSAlert: role AXWindow, subrole AXDialog. If
+        // the rule keyed on role alone this shape would sail through.
+        let mut t = Tree::default();
+        let alert = t.dialog_window("");
+        t.text(alert, "Delete “Report.pdf”?");
+        let ok = t.button(alert, "OK");
+        assert!(t.verdict(ok).is_some());
+        assert_eq!(
+            t.candidate(ok).context.unwrap().kind,
+            "AXWindow[AXDialog]".to_string()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_window_full_of_the_word_delete_is_not_a_question() {
+        // The failure mode that made this feature hard: a mail window whose
+        // content is a thread about deleting an account, a chat window whose
+        // history says 삭제 twenty times. None of it is a decision context, so
+        // none of it is evidence, at any depth.
+        let mut t = Tree::default();
+        let window = t.window("Re: please delete my account");
+        let scroll = t.container(window, "AXScrollArea");
+        let group = t.group(scroll);
+        t.text(group, "Can you delete the old backups and erase the disk?");
+        let reply = t.button(group, "Reply");
+        let send = t.button(window, "Send");
+
+        assert_eq!(t.verdict(reply), None);
+        assert_eq!(t.verdict(send), None);
+        assert!(t.candidate(reply).context.is_none());
+    }
+
+    #[test]
+    fn a_window_title_alone_is_not_a_question() {
+        // Deliberate: an ordinary window is layout even when its title reads
+        // like an alert. The dialog subrole is what distinguishes them, and a
+        // toolkit that publishes neither gets the benefit of the doubt rather
+        // than making every button in the app confirmable.
+        let mut t = Tree::default();
+        let window = t.window("Delete 4 items?");
+        let ok = t.button(window, "OK");
+        assert_eq!(t.verdict(ok), None);
+    }
+
+    #[test]
+    fn the_answers_are_not_part_of_the_question() {
+        // An alert offering Delete and Cancel must not make Cancel — or any
+        // other sibling — destructive by association. Only the prose counts.
+        let (t, answers) = confirm_sheet(
+            "Are you sure?",
+            "You can change this later.",
+            &["Delete", "Cancel", "More Info"],
+        );
+        assert_eq!(t.verdict(answers[0]).as_deref(), Some("delet")); // its own label
+        assert_eq!(t.verdict(answers[1]), None);
+        assert_eq!(t.verdict(answers[2]), None);
+
+        // The same alert as a toolkit that renders each button as a container
+        // with its caption inside it — Chromium and the Electron apps built on
+        // it publish exactly this. If the walk descended into answers, the
+        // Delete button's caption would become part of the question and Cancel
+        // would be refused for standing next to it.
+        let mut t = Tree::default();
+        let alert = t.dialog_window("");
+        t.text(alert, "Are you sure?");
+        let delete = t.button(alert, "");
+        t.text(delete, "Delete");
+        let cancel = t.button(alert, "");
+        t.text(cancel, "Cancel");
+
+        assert_eq!(
+            t.candidate(cancel).context.unwrap().question,
+            "Are you sure?".to_string()
+        );
+        assert_eq!(t.verdict(cancel), None);
+        // …and the button beside it is still caught, by its own caption rather
+        // than by the question. A control that says "Delete" on screen must not
+        // read as unlabeled just because the toolkit put the word in a child.
+        assert_eq!(t.verdict(delete).as_deref(), Some("delet"));
+    }
+
+    #[test]
+    fn a_caption_is_read_from_a_control_and_never_from_a_row() {
+        // The boundary that keeps the caption rule from becoming a content
+        // reader: a button's children are its wording, a row's children are the
+        // user's mail.
+        let mut t = Tree::default();
+        let window = t.window("Mail");
+        let table = t.container(window, "AXTable");
+        let row = t.container(table, "AXRow");
+        t.text(row, "Please delete my account");
+        assert_eq!(caption(&t.nodes, row), None);
+        assert_eq!(t.verdict(row), None);
+
+        let button = t.button(window, "");
+        t.text(button, "Empty Trash");
+        assert_eq!(caption(&t.nodes, button).as_deref(), Some("Empty Trash"));
+        assert!(t.verdict(button).is_some());
+    }
+
+    #[test]
+    fn content_inside_a_dialog_is_still_content() {
+        // A "Move to…" sheet listing the user's own files. The sheet is a
+        // decision context, but a table of file names is not its question, and
+        // a folder called "delete me" must not confirm-gate the Move button.
+        let mut t = Tree::default();
+        let window = t.window("Documents");
+        let sheet = t.sheet(window, Some("Move 3 items to:"));
+        let table = t.container(sheet, "AXTable");
+        let row = t.container(table, "AXRow");
+        t.text(row, "delete me");
+        let move_button = t.button(sheet, "Move");
+
+        assert_eq!(t.verdict(move_button), None);
+        assert_eq!(
+            t.candidate(move_button).context.unwrap().question,
+            "Move 3 items to:".to_string()
+        );
+    }
+
+    #[test]
+    fn a_text_field_inside_a_destructive_dialog_is_still_writable() {
+        // Two exclusions at once, and both have to hold. The field's own value
+        // is never classified, and the question around it is not held against
+        // typing either: the decision is the button underneath, not the name
+        // being typed into the sheet.
+        let mut t = Tree::default();
+        let window = t.window("Documents");
+        let sheet = t.sheet(window, None);
+        t.text(sheet, "Deleting this project will remove 42 files.");
+        let name = t.field(sheet, "delete the old files first");
+        assert_eq!(t.verdict(name), None);
+        assert!(
+            t.candidate(name).context.is_some(),
+            "the sheet is still a question — the field is just exempt from being asked it"
+        );
+    }
+
+    #[test]
+    fn a_writable_label_inside_a_dialog_never_becomes_the_question() {
+        // The same rule one level out: the walk reads static text, but a
+        // settable value inside the sheet is the user's own typing.
+        let mut t = Tree::default();
+        let window = t.window("Documents");
+        let sheet = t.sheet(window, Some("Rename item"));
+        t.push(ContextNode {
+            parent: Some(sheet),
+            role: "AXStaticText",
+            value: Some("delete me"),
+            settable: true,
+            ..ContextNode::default()
+        });
+        let ok = t.button(sheet, "OK");
+        assert_eq!(t.verdict(ok), None);
+    }
+
+    #[test]
+    fn the_nearest_question_is_the_one_being_answered() {
+        // A confirmation raised on top of a destructive dialog. The inner
+        // sheet is what the button answers; inheriting the outer one would
+        // make "OK" on "Rename this file?" a deletion.
+        let mut t = Tree::default();
+        let outer = t.dialog_window("");
+        t.text(outer, "Erase “Macintosh HD”?");
+        let inner = t.sheet(outer, None);
+        t.text(inner, "Rename this file?");
+        let ok = t.button(inner, "OK");
+        assert_eq!(t.verdict(ok), None);
+
+        // …and the outer dialog's own buttons still see their own question.
+        let outer_ok = t.button(outer, "OK");
+        assert!(t.verdict(outer_ok).is_some());
+    }
+
+    #[test]
+    fn a_nested_question_is_read_when_it_is_the_destructive_one() {
+        // The other direction of the same boundary: a harmless outer dialog
+        // must not shield a destructive inner sheet.
+        let mut t = Tree::default();
+        let outer = t.dialog_window("Export");
+        t.text(outer, "Choose a format.");
+        let inner = t.sheet(outer, None);
+        t.text(inner, "Overwrite the existing file?");
+        let ok = t.button(inner, "OK");
+        assert_eq!(t.verdict(ok).as_deref(), Some("overwrite"));
+        assert_eq!(
+            t.candidate(ok).context.unwrap().question,
+            "Overwrite the existing file?".to_string()
+        );
+    }
+
+    #[test]
+    fn a_nested_question_does_not_leak_upward_either() {
+        // The outer dialog's own buttons must not inherit the inner sheet's
+        // text: the walk goes up from the target, never down into a sibling
+        // question.
+        let mut t = Tree::default();
+        let outer = t.dialog_window("Export");
+        t.text(outer, "Choose a format.");
+        let inner = t.sheet(outer, None);
+        t.text(inner, "Delete the original?");
+        let outer_ok = t.button(outer, "OK");
+        assert_eq!(t.verdict(outer_ok), None);
+    }
+
+    #[test]
+    fn the_question_survives_the_layout_between_it_and_the_button() {
+        // Real alerts bury their text a few groups down, and a cross-platform
+        // toolkit buries it further. Depth inside the context is not the rule;
+        // kind of ancestor is.
+        let mut t = Tree::default();
+        let window = t.window("Project");
+        let sheet = t.sheet(window, None);
+        let mut parent = sheet;
+        for _ in 0..6 {
+            parent = t.group(parent);
+        }
+        t.text(parent, "This will permanently erase 12 recordings.");
+        let ok = t.button(sheet, "Continue");
+        assert_eq!(t.verdict(ok).as_deref(), Some("eras"));
+    }
+
+    #[test]
+    fn an_unlabeled_control_in_a_destructive_dialog_fails_closed() {
+        // No label means no dismissal exemption. An icon button in a delete
+        // sheet is judged by the sheet, which is the fail-closed reading.
+        let mut t = Tree::default();
+        let window = t.window("Photos");
+        let sheet = t.sheet(window, None);
+        t.text(sheet, "Delete 12 photos?");
+        let icon = t.push(ContextNode {
+            parent: Some(sheet),
+            role: "AXButton",
+            ..ContextNode::default()
+        });
+        assert!(t.verdict(icon).is_some());
+    }
+
+    #[test]
+    fn a_silent_dialog_produces_no_evidence() {
+        // A sheet with no readable prose is not evidence of anything. It must
+        // not refuse by virtue of being a sheet.
+        let mut t = Tree::default();
+        let window = t.window("Documents");
+        let sheet = t.sheet(window, None);
+        let ok = t.button(sheet, "OK");
+        assert!(t.candidate(ok).context.is_none());
+        assert_eq!(t.verdict(ok), None);
+    }
+
+    #[test]
+    fn the_search_terminates_on_a_malformed_tree() {
+        // Parent indices come from a walk of a live app. A cycle should cost a
+        // bounded loop, not the server.
+        let nodes = vec![
+            ContextNode {
+                parent: Some(1),
+                role: "AXGroup",
+                ..ContextNode::default()
+            },
+            ContextNode {
+                parent: Some(0),
+                role: "AXGroup",
+                ..ContextNode::default()
+            },
+        ];
+        assert!(decision_context(&nodes, 0).is_none());
+        assert!(decision_context(&[], 0).is_none());
+        // A parent pointing past the end of the tree is not a panic either.
+        let dangling = vec![ContextNode {
+            parent: Some(99),
+            role: "AXButton",
+            ..ContextNode::default()
+        }];
+        assert!(decision_context(&dangling, 0).is_none());
+    }
+
+    #[test]
+    fn one_question_cannot_cost_an_unbounded_read() {
+        // The shape rules decide what is read; this only bounds how much of a
+        // pathological dialog is read at all.
+        let mut t = Tree::default();
+        let window = t.window("Stress");
+        let sheet = t.sheet(window, None);
+        for _ in 0..200 {
+            t.text(sheet, "lorem ipsum");
+        }
+        let ok = t.button(sheet, "OK");
+        let question = t.candidate(ok).context.unwrap().question;
+        assert_eq!(
+            question.split("lorem ipsum").count() - 1,
+            MAX_QUESTION_PARTS
+        );
+    }
+
+    #[test]
+    fn a_context_refusal_quotes_the_question_and_the_way_out() {
+        let text = Refused::NeedsConfirmationInContext {
+            verb: "click",
+            target: "[7] AXButton \"OK\"".to_string(),
+            context: "AXSheet".to_string(),
+            question: "Delete 4 items?".to_string(),
+            matched: "delet".to_string(),
+        }
+        .to_string();
+        assert!(text.contains("Delete 4 items?"));
+        assert!(text.contains("AXSheet"));
+        assert!(text.contains("confirm_destructive: true"));
+        // The distinction the separate variant exists for: the button is not
+        // being accused of saying anything destructive.
+        assert!(!text.contains("reads as a destructive control"));
     }
 
     // ── destructive keys ─────────────────────────────────────────────────
