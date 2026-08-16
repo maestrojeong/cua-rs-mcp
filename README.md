@@ -30,45 +30,13 @@ flowchart LR
     style A fill:#e3f2fd,stroke:#1e88e5
 ```
 
-## Why cua-rs?
+## Contents
 
-Almost every computer-use tool for macOS drives the machine by *pretending to be
-a human*: warp the cursor with `CGWarpMouseCursorPosition`, then post synthetic
-events into the global HID tap with `CGEventPost`. It works — and it is a
-shared, single-writer channel. There is exactly one cursor and one keyboard
-focus on a Mac, so an agent driving it that way is **competing with the person
-sitting at it**.
-
-cua-rs delivers actions *directly to the target UI element* instead.
-
-| | HID-synthesis tools | cua-rs |
-|---|:--|:--|
-| click | move cursor, post mouse down/up | AX action, then pid-routed SkyLight event for custom controls |
-| type | post key events to whatever has focus | `AXUIElementSetAttributeValue(AXValue)` |
-| scroll | post wheel events at a point | `AXScrollDownByPage` |
-| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated macOS per-window capture |
-| your cursor | moves | **untouched** |
-| where the agent is acting | your own moving cursor shows it | **a separate drawn arrow**, if `cua-overlay` is running — see [The drawn cursor](#the-drawn-cursor) |
-| your keyboard focus | changes | **unchanged** |
-| your active Space | can switch | **never switches** |
-| occluded / off-Space window | blank or stale capture | **captures correctly** |
-| window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
-| you working simultaneously | input fights the agent | **works** |
-
-Every process-routed event implementation lives in `cua-hid`; shared cursor and
-keyboard synthesis are not wired into the server. The dependency graph keeps
-AX and capture independent from the private input implementation:
-
-```console
-$ grep -rln 'CGEvent::post' crates/*/src/*.rs
-crates/cua-hid/src/lib.rs
-
-$ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
-0
-```
-
-The coexistence property is not a runtime mode: cua-rs has no `--allow-hid`
-option and no product path that warps the pointer or posts keyboard events.
+[Quick start](#quick-start) · [Why cua-rs?](#why-cua-rs) ·
+[Connect a client](#connect-an-mcp-client) · [Targeting](#how-targeting-works) ·
+[Tools](#tools) · [Known limits](#known-limits) ·
+[The drawn cursor](#the-drawn-cursor) · [Development](#development) ·
+[Prior art](#prior-art)
 
 ## Quick start
 
@@ -82,7 +50,7 @@ cua-rs --help
 To pin a release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/cua-rs-mcp/main/install.sh | CUA_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/cua-rs-mcp/main/install.sh | CUA_VERSION=v0.4.2 sh
 ```
 
 Or from source:
@@ -135,6 +103,46 @@ click          → { "app": "Notes", "element_index": "12" }
 
 The workflow is always: `get_app_state`, act on an index, then re-read when you
 need to confirm.
+
+## Why cua-rs?
+
+Almost every computer-use tool for macOS drives the machine by *pretending to be
+a human*: warp the cursor with `CGWarpMouseCursorPosition`, then post synthetic
+events into the global HID tap with `CGEventPost`. It works — and it is a
+shared, single-writer channel. There is exactly one cursor and one keyboard
+focus on a Mac, so an agent driving it that way is **competing with the person
+sitting at it**.
+
+cua-rs delivers actions *directly to the target UI element* instead.
+
+| | HID-synthesis tools | cua-rs |
+|---|:--|:--|
+| click | move cursor, post mouse down/up | AX action, then pid-routed SkyLight event for custom controls |
+| type | post key events to whatever has focus | `AXUIElementSetAttributeValue(AXValue)` |
+| scroll | post wheel events at a point | `AXScrollDownByPage` |
+| screenshot | `CGWindowListCreateImage` (deprecated) | crash-isolated macOS per-window capture |
+| your cursor | moves | **untouched** |
+| where the agent is acting | your own moving cursor shows it | **a separate drawn arrow**, if `cua-overlay` is running — see [The drawn cursor](#the-drawn-cursor) |
+| your keyboard focus | changes | **unchanged** |
+| your active Space | can switch | **never switches** |
+| occluded / off-Space window | blank or stale capture | **captures correctly** |
+| window must be visible / on top | usually | **no** (measured: identical tree background vs frontmost) |
+| you working simultaneously | input fights the agent | **works** |
+
+Every process-routed event implementation lives in `cua-hid`; shared cursor and
+keyboard synthesis are not wired into the server. The dependency graph keeps
+AX and capture independent from the private input implementation:
+
+```console
+$ grep -rln 'CGEvent::post' crates/*/src/*.rs
+crates/cua-hid/src/lib.rs
+
+$ cargo tree -p cua-ax -p cua-capture | grep -c cua-hid
+0
+```
+
+The coexistence property is not a runtime mode: cua-rs has no `--allow-hid`
+option and no product path that warps the pointer or posts keyboard events.
 
 ## Connect an MCP client
 
@@ -196,7 +204,23 @@ an old snapshot is a *different element* than index 42 in the current one, so
 honoring it silently would click the wrong thing — the one failure mode here
 that a retry cannot fix and the user cannot see.
 
-Pass `snapshot_id` to turn that into an error instead of a mis-click:
+`element_token` is the stricter form, and it costs nothing extra. The snapshot
+prints one per line: join the snapshot id, the index and the role.
+
+```json
+{ "app": "Notes", "element_token": "1-3-AXButton" }
+```
+
+It carries what a bare index leaves implicit, so acting on a stale snapshot, or
+on an index whose element is now a different kind of thing, is an error rather
+than a mis-click:
+
+```text
+element_token points at index 3, which was a AXButton when the token was issued
+and is a AXRow now. Call get_app_state again and take a fresh token.
+```
+
+With a bare `element_index`, pass `snapshot_id` to get the same protection:
 
 ```json
 { "app": "Notes", "element_index": "42", "snapshot_id": 1 }
@@ -208,6 +232,22 @@ is 3. Call get_app_state again and use a fresh index.
 ```
 
 Recommended for anything destructive.
+
+### Coordinates are resolved against the snapshot
+
+`x`/`y` is accepted, and it is resolved by hit-testing the element frames of the
+latest snapshot — preferring an actionable element, then the smallest, then the
+deepest. A point covering nothing is an error, never a guess.
+
+That means coordinates need a *current* snapshot. An index names an element, so
+it survives an action; a point names a place, and the thing that occupied it may
+have moved. After an action taken with `return_state: false`, a coordinate is
+refused rather than resolved against pre-action geometry.
+
+Not a fallback for reading the tree: `AXUIElementCopyElementAtPosition` was
+measured to answer `AXMenuBar` for every point in a background app, and every app
+cua-rs drives is backgrounded, so the snapshot's own geometry is the only
+trustworthy source.
 
 ### Ambiguity is reported, never guessed
 
@@ -246,6 +286,46 @@ recognition and buy nothing.
 the expensive part), `max_image_dim`, `max_elements`, `verbose` (show the
 filtered-out containers and frame geometry when a control seems missing),
 `skeleton` + `scope_element_id` (below).
+
+### Every action reports what changed
+
+Actions re-read the window afterwards and answer with a delta against the tree
+from before — on by default. It is strictly cheaper than the `get_app_state` that
+would otherwise follow: one tree walk either way, but one round trip instead of
+two, and a few lines instead of the whole outline.
+
+```text
+SkyLight pid-routed 1-click at (949, 145) on [7] AXButton
+delivery: pid
+
+state after (snapshot_id=4, 319 elements):
+  appeared (19):
+  +     [22] AXMenu "_NS:244"
+  +       [85] AXMenuItem "Invite to chat"
+  +       [99] AXMenuItem "Chat settings"
+  +       [100] AXMenuItem "Leave chat"
+```
+
+Pass `return_state: false` for a run of actions whose intermediate states nobody
+will read — filling three fields before submitting, say.
+
+**Read it as a textual delta, not as proof.** Lines are compared without their
+index or indentation, so that an app which regroups its own subtrees on a click
+does not report hundreds of lines as change — and the cost of that is identity.
+Two rows reading exactly the same are interchangeable: if a selection moves from
+one to the other, the delta is empty although something changed. An empty delta
+means "no line-level difference", not "nothing happened". To know one specific
+element's state, read that element.
+
+It is reliable for structure arriving or leaving — a menu opening, a dialog
+replacing a pane, a row appearing — which is the common case, and the one that
+used to be invisible.
+
+The delta is also refused rather than faked when the two snapshots are not
+comparable: a different window, a scoped read, different walk caps, a walk that
+did not finish, or a snapshot some earlier action already invalidated. You get the
+reason and a fresh `snapshot_id` instead of a diff that would be arithmetically
+correct and useless.
 
 ### Dense apps: skeleton, then drill in
 
@@ -310,12 +390,8 @@ target app nor duplicates the event through the public process-post API.
 Every action result carries `delivery: ax` or `delivery: pid`, so callers can
 distinguish semantic accessibility actions from process-routed input.
 
-`ui_changed` is reported honestly and has three values, not two: `yes`, `no`,
-and `unknown`. `no` does not mean failure — some controls change nothing
-observable. `unknown` means the app published nothing to compare, which is a
-different claim: KakaoTalk exposes zero `AXWindows` while backgrounded, so both
-ends of the before/after fingerprint come back empty and prove nothing.
-Collapsing that into `false` tells an agent an action failed when it did not.
+Every action result carries `delivery: ax` or `delivery: pid`, so a caller can
+tell a semantic accessibility action from process-routed input.
 
 ## The drawn cursor
 
@@ -330,6 +406,15 @@ The overlay is ordered immediately above the exact target `CGWindowID`, not at
 a global always-on-top level. If another app covers the target window, it also
 covers the agent cursor. When a target window id cannot be resolved, the
 overlay hides instead of appearing above unrelated windows.
+
+Ordering alone is not trusted, because it stops meaning anything the moment the
+target window is not on the current Space — and the overlay joins every Space, so
+that moment arrives whenever you switch. It therefore also polls the frontmost
+application each frame and hides the arrow whenever the app it is pinned to is
+not frontmost, without asking why. That covers Space switches, full-screen apps
+and ordering races with one rule, and it fails in the safe direction: a false
+positive costs one hidden arrow that returns on the next action, a false negative
+is an arrow drawn over someone else's work.
 
 <p align="center"><img src="assets/cursor-demo.png" width="720" alt="The drawn cursor: a mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
 
@@ -358,7 +443,7 @@ ls target/release/cua-rs target/release/cua-overlay   # both present
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 79 tests, no permissions needed
+cargo test --workspace          # 98 tests, no permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
