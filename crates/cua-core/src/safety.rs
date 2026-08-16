@@ -915,6 +915,7 @@ pub struct Gate {
     target: Option<Target>,
     confirm_destructive: bool,
     key: Option<String>,
+    labelled: Option<Candidate>,
 }
 
 impl Gate {
@@ -925,6 +926,24 @@ impl Gate {
             target: Some(target.clone()),
             confirm_destructive: false,
             key: None,
+            labelled: None,
+        }
+    }
+
+    /// A gate for an action whose target has a label but no snapshot index — a
+    /// menu bar row, which is named by its path rather than by a number.
+    ///
+    /// The destructive-label heuristic matters *more* here than it does for a
+    /// click, not less: a menu bar is where "Log Out", "Quit", "Move to Trash"
+    /// and "채팅방 나가기" live, all one press from the top level and none of
+    /// them behind a confirmation of the app's own.
+    pub fn labelled(verb: &'static str, candidate: Candidate) -> Self {
+        Self {
+            verb,
+            target: None,
+            confirm_destructive: false,
+            key: None,
+            labelled: Some(candidate),
         }
     }
 
@@ -940,6 +959,7 @@ impl Gate {
             target: None,
             confirm_destructive: false,
             key: None,
+            labelled: None,
         }
     }
 
@@ -958,6 +978,11 @@ impl Gate {
     /// The element this action will land on, for the caller to resolve.
     pub fn target(&self) -> Option<&Target> {
         self.target.as_ref()
+    }
+
+    /// The already-described target, for a gate whose action resolved its own.
+    pub fn labelled_candidate(&self) -> Option<&Candidate> {
+        self.labelled.as_ref()
     }
 }
 

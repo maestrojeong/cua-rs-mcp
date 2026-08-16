@@ -226,6 +226,10 @@ pub enum CoreError {
         reason: String,
     },
 
+    /// A menu bar path did not lead anywhere pressable.
+    #[error("in `{app}`: {reason}")]
+    MenuPath { app: String, reason: String },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -1848,6 +1852,38 @@ impl Cua {
         })
     }
 
+    /// Read one level of the app's menu bar.
+    ///
+    /// `path` is `>`-separated titles — `""` for the top level, `"Edit"` for
+    /// one menu, `"Edit > Transformations"` for a submenu. This is the one menu
+    /// accessibility describes; see [`crate::menubar`] for why that matters and
+    /// what it does not extend to.
+    pub fn menu_bar(&self, app: &str, path: &str) -> Result<crate::menubar::MenuListing> {
+        let app = app.to_string();
+        let path = path.to_string();
+        self.exec(move |inner| inner.menu_bar(&app, &path))?
+    }
+
+    /// Press a menu bar row named by its path.
+    ///
+    /// The route to a row with no keyboard shortcut, when the row exists here.
+    /// `AXPress` on an `AXMenuItem` runs the item's action without opening the
+    /// menu, so nothing is drawn, the pointer does not move and the app is not
+    /// activated — measured on TextEdit while another app was frontmost.
+    pub fn press_menu_bar(
+        &self,
+        app: &str,
+        path: &str,
+        return_state: bool,
+        confirm_destructive: bool,
+    ) -> Result<ActionResult> {
+        let app = app.to_string();
+        let path = path.to_string();
+        self.exec_action(false, move |inner| {
+            inner.press_menu_bar(&app, &path, return_state, confirm_destructive)
+        })
+    }
+
     /// Elements whose label, value or role contains `needle`.
     ///
     /// Reads the existing snapshot when there is one, and takes a fresh one
@@ -2398,7 +2434,13 @@ impl Inner {
         // is gated by default instead of by remembering. An app that will not
         // resolve is left to the action, which reports that better.
         if let Ok(info) = apps::resolve_app(query) {
-            let candidate = gate.target().and_then(|t| self.safety_candidate(query, t));
+            let candidate = match gate.target() {
+                Some(t) => self.safety_candidate(query, t),
+                // A menu bar row describes itself; there is no snapshot index
+                // to look it up by, and the row's own title is exactly what the
+                // classifier wants to read.
+                None => gate.labelled_candidate().cloned(),
+            };
             crate::safety::guard(&info, &self.human, &gate, candidate.as_ref())?;
         }
 
@@ -3140,6 +3182,107 @@ impl Inner {
             element_point(&el),
         )
         .with_overlay_target(self.overlay_target(info.pid)))
+    }
+
+    fn menu_bar(&mut self, query: &str, path: &str) -> Result<crate::menubar::MenuListing> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+        let app = cua_ax::Element::for_pid(info.pid);
+        let steps = crate::menubar::menu_path_steps(path);
+        crate::menubar::walk(&app, &steps)
+            .map(|(listing, _)| listing)
+            .map_err(|e| CoreError::MenuPath {
+                app: info.name,
+                reason: e.to_string(),
+            })
+    }
+
+    fn press_menu_bar(
+        &mut self,
+        query: &str,
+        path: &str,
+        return_state: bool,
+        confirm_destructive: bool,
+    ) -> Result<ActionResult> {
+        cua_ax::require_trusted()?;
+        let info = apps::resolve_app(query)?;
+        let app_el = cua_ax::Element::for_pid(info.pid);
+        let steps = crate::menubar::menu_path_steps(path);
+        if steps.is_empty() {
+            return Err(CoreError::MenuPath {
+                app: info.name,
+                reason: "no menu path given; pass one like `Edit > Paste`".into(),
+            });
+        }
+        let name = |e: crate::menubar::MenuWalkError| CoreError::MenuPath {
+            app: info.name.clone(),
+            reason: e.to_string(),
+        };
+        let (listing, landed) = crate::menubar::walk(&app_el, &steps).map_err(name)?;
+        let Some(item) = landed else {
+            return Err(name(crate::menubar::MenuWalkError::IsSubmenu {
+                path: listing.path.clone(),
+                children: listing.items.iter().map(|i| i.title.clone()).collect(),
+            }));
+        };
+        // A row that owns a submenu is not an action. Refusing is better than
+        // pressing it: `AXPress` on such a row opens a menu nobody can see.
+        if item
+            .children()
+            .iter()
+            .any(|c| c.role().as_deref() == Some("AXMenu"))
+        {
+            return Err(name(crate::menubar::MenuWalkError::IsSubmenu {
+                path: listing.path.clone(),
+                children: listing.items.iter().map(|i| i.title.clone()).collect(),
+            }));
+        }
+
+        let title = item.label().unwrap_or_default();
+        let described = format!("menu item `{}`", listing.path);
+        // The label gate, on the row's own title. A menu bar reaches Quit and
+        // Log Out in two steps, so this is not a formality.
+        let gate = crate::safety::Gate::labelled(
+            "menu_bar",
+            crate::safety::Candidate {
+                role: "AXMenuItem".into(),
+                label: Some(title),
+                description: described.clone(),
+                ..Default::default()
+            },
+        )
+        .confirmed(confirm_destructive);
+
+        let enabled = item.bool(cua_ax::attr::ENABLED).unwrap_or(false);
+        let path_for_result = listing.path.clone();
+        self.acting(query, gate, return_state, move |i| {
+            // Reported rather than refused: a menu bar validates against the
+            // live responder, and an item that reads disabled a millisecond
+            // before the press is evidence, not proof. Pressing it is a no-op
+            // either way, and saying so is more useful than a refusal that
+            // might be wrong.
+            if !enabled {
+                return Err(CoreError::MenuPath {
+                    app: info.name.clone(),
+                    reason: format!(
+                        "menu item `{path_for_result}` is disabled right now, so pressing it \
+                         would do nothing. A menu bar validates against the app's current \
+                         focus and selection: click or select what the item acts on first, \
+                         then read the menu again"
+                    ),
+                });
+            }
+            let before = i.watch(info.pid);
+            item.perform(cua_ax::action::PRESS)?;
+            let changed = i.changed_since(info.pid, before);
+            Ok(ActionResult::ax_at(
+                format!("AXPress on menu item `{path_for_result}`"),
+                described.clone(),
+                changed,
+                None,
+            )
+            .with_overlay_target(i.overlay_target(info.pid)))
+        })
     }
 
     fn press_key(&mut self, query: &str, target: Target, key: &str) -> Result<ActionResult> {

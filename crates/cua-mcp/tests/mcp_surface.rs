@@ -121,6 +121,7 @@ fn advertises_the_expected_tools() {
             "get_app_state",
             "hover",
             "list_apps",
+            "menu_bar",
             "perform_secondary_action",
             "press_key",
             "scroll",

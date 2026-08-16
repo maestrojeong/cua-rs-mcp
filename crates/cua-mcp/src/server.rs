@@ -532,6 +532,24 @@ struct SelectTextArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct MenuBarArgs {
+    /// App name, bundle id or pid.
+    app: String,
+    /// `>`-separated menu titles, e.g. `Edit > Transformations > Make Upper
+    /// Case`. Omit for the top level.
+    #[serde(default)]
+    path: Option<String>,
+    /// Press the row `path` names, instead of listing what is there. Reading
+    /// first is the intended flow: enablement, the checkmark and the exact
+    /// title are all only knowable from a read.
+    #[serde(default)]
+    press: bool,
+    /// Set to true to proceed when the row's title reads as destructive.
+    #[serde(default)]
+    confirm_destructive: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct PressKeyArgs {
     #[serde(flatten)]
     target: ActionArgs,
@@ -854,7 +872,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Click a bare point inside a window, with no element behind it. TWO USES. (1) TRANSIENT UI — a pop-up this app has open, reported as `transient UI open above this app's content`. That is a separate window at layer 101 which accessibility does not describe at all: no elements, no indices, `find` matches nothing in it, `click` has nothing to address, so a window-local coordinate is the only addressing that exists and this tool accepts the pop-up's own window_id. READ THIS BEFORE USING IT ON A MENU: on a standard macOS menu the event is delivered and the menu DISMISSES WITHOUT SELECTING ANYTHING — measured on KakaoTalk, twice, on two different rows. A menu tracks the real pointer to decide what is highlighted, and cua-rs never moves the real pointer. Use press_key with the item's own keyboard shortcut instead (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘, …), which is measured to activate the item; cua-rs does not read those shortcuts out of the image for you, so look at the screenshot. This tool remains the right one for a pop-up that is not a menu — a popover or panel with ordinary event-driven views — and for dismissing a menu when `escape` does not. x/y are measured from the POP-UP's own top-left corner, and the screenshot already contains the menu (macOS captures a window together with the pop-up attached to it, so there is no separate image to fetch). (2) LAST RESORT for ordinary windows: use it ONLY for custom-drawn surfaces that genuinely publish no children — maps, charts, canvases, game views — after `click` and `find` have shown there is no element to address. There, it is not a retry for a `click` that failed and it is never chosen automatically, because a point that covers nothing is indistinguishable from a typo. x and y are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), NOT screen coordinates: they are re-anchored to the window's live position just before the event is sent, so moving the window between the read and the click is harmless. Delivery is the same pid-routed SkyLight path as `click` — the cursor, keyboard focus, frontmost app and Space are untouched — but the result is labelled `pid (no element)` because NOTHING WAS VERIFIED. There is no element to inspect afterwards, so a success means only that the events were delivered to that pixel of that window; whether anything was there, and whether it was the right thing, is entirely the caller's aim. Requires that the most recent get_app_state of this app read this same window_id, OR that window_id is a pop-up this same app currently has open (which cua-rs reported to you when it opened)."
+        description = "Click a bare point inside a window, with no element behind it. TWO USES. (1) TRANSIENT UI — a pop-up this app has open, reported as `transient UI open above this app's content`. That is a separate window at layer 101 which accessibility does not describe at all: no elements, no indices, `find` matches nothing in it, `click` has nothing to address, so a window-local coordinate is the only addressing that exists and this tool accepts the pop-up's own window_id. READ THIS BEFORE USING IT ON A MENU: on a standard macOS menu the event is delivered and the menu DISMISSES WITHOUT SELECTING ANYTHING — measured on KakaoTalk, twice, on two different rows. A menu tracks the real pointer to decide what is highlighted, and cua-rs never moves the real pointer. Use press_key with the item's own keyboard shortcut instead (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘, …), which is measured to activate the item. FOR A ROW WITH NO SHORTCUT, NEITHER A CLICK NOR A KEYSTROKE WORKS: the arrow keys move the menu's highlight but nothing activates the highlighted row. Use the `menu_bar` tool, which reaches the same row where the app also draws it in its menu bar, and which reports every row's key equivalent as text so you never have to read one off an image. This tool remains the right one for a pop-up that is not a menu — a popover or panel with ordinary event-driven views — and for dismissing a menu when `escape` does not. x/y are measured from the POP-UP's own top-left corner, and the screenshot already contains the menu (macOS captures a window together with the pop-up attached to it, so there is no separate image to fetch). (2) LAST RESORT for ordinary windows: use it ONLY for custom-drawn surfaces that genuinely publish no children — maps, charts, canvases, game views — after `click` and `find` have shown there is no element to address. There, it is not a retry for a `click` that failed and it is never chosen automatically, because a point that covers nothing is indistinguishable from a typo. x and y are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), NOT screen coordinates: they are re-anchored to the window's live position just before the event is sent, so moving the window between the read and the click is harmless. Delivery is the same pid-routed SkyLight path as `click` — the cursor, keyboard focus, frontmost app and Space are untouched — but the result is labelled `pid (no element)` because NOTHING WAS VERIFIED. There is no element to inspect afterwards, so a success means only that the events were delivered to that pixel of that window; whether anything was there, and whether it was the right thing, is entirely the caller's aim. Requires that the most recent get_app_state of this app read this same window_id, OR that window_id is a pop-up this same app currently has open (which cua-rs reported to you when it opened)."
     )]
     async fn click_in_window(
         &self,
@@ -995,7 +1013,7 @@ impl CuaServer {
     }
 
     #[tool(
-        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. THIS IS HOW YOU DRIVE AN OPEN MENU, and the only way measured to work. When a pop-up is up — cua-rs reports it as `transient UI open above this app's content` — accessibility cannot see inside it, and a coordinate click was measured to dismiss the menu without selecting anything, because the menu tracks the real pointer and cua-rs never moves it. Menu items nearly always draw their own key equivalent beside them (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘,, ⌥⌘⌫); read one off the screenshot and press it here. It goes through the app's own key handling, so it activates the item the app associates with that chord rather than a pixel you aimed at — verified on KakaoTalk, where ⌘T on the open chat-room menu toggled the window's always-on-top state. An item with no shortcut may not be reachable at all. cua-rs does not parse those shortcuts out of the image and will not do it for you — read them yourself. `escape` dismisses an open menu. SAFETY: `cmd+delete`, and a bare `delete`/`backspace` anywhere that is not a text field, are refused unless you also pass confirm_destructive=true — and note that a menu shortcut can be destructive too (⌥⌘⌫ leaves a KakaoTalk chat room), so read what the item says before pressing it."
+        description = "Press any key or chord on an element: `return`, `escape`, `tab`, a letter or digit, `f5`, and arbitrary combinations such as `cmd+shift+p` or `ctrl+alt+delete`. `+` or `-` separates, case does not matter, and the modifier names are the same ones the click tools take (`cmd`, `shift`, `alt`/`option`, `ctrl`, `fn`). The event is synthesized and routed to the target process by pid, never through the shared keyboard tap, so your pointer, your keyboard focus, the frontmost app and your Space are all untouched; successful results report `delivery: pid (keyboard)`. It is addressed to the PROCESS, not to the element: it lands on whatever that process's own first responder is, which cua-rs best-effort-focuses to the element you named first (AXFocused, where the app makes it settable). The result therefore reports `focus: verified | unverified | mismatched` so you can tell what actually happened — `mismatched` means the key most likely went to the named element's sibling instead, and the delivery is still made unless CUA_KEY_STRICT_FOCUS=1 is set. THIS IS HOW YOU DRIVE AN OPEN MENU, and the only way measured to work. When a pop-up is up — cua-rs reports it as `transient UI open above this app's content` — accessibility cannot see inside it, and a coordinate click was measured to dismiss the menu without selecting anything, because the menu tracks the real pointer and cua-rs never moves it. Menu items nearly always draw their own key equivalent beside them (⌘I, ⌘Y, ⌘B, ⌘T, ⌥⌘,, ⌥⌘⌫); read one off the screenshot and press it here. It goes through the app's own key handling, so it activates the item the app associates with that chord rather than a pixel you aimed at — verified on KakaoTalk, where ⌘T on the open chat-room menu toggled the window's always-on-top state. AN ITEM WITH NO SHORTCUT IS NOT REACHABLE HERE, AND THE ANSWER IS THE `menu_bar` TOOL. The arrow keys do reach an open menu and do move its highlight, but `return`, `enter` and `space` are consumed without activating the highlighted row — measured, on every event recipe tried — so do not walk a menu with `down` and assume the item ran. Most apps draw the same rows in their menu bar, which accessibility publishes in full: press `escape` here, then use `menu_bar` to read that level and press the row. `menu_bar` also reports each row's key equivalent as text already spelled for this tool, which is how you learn a pop-up row's shortcut without recognising a ⌘ glyph in a screenshot — cua-rs does no OCR. `escape` dismisses an open menu. SAFETY: `cmd+delete`, and a bare `delete`/`backspace` anywhere that is not a text field, are refused unless you also pass confirm_destructive=true — and note that a menu shortcut can be destructive too (⌥⌘⌫ leaves a KakaoTalk chat room), so read what the item says before pressing it."
     )]
     async fn press_key(
         &self,
@@ -1014,6 +1032,31 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Read the app's MENU BAR, and press a row in it. This is the ONLY menu accessibility describes, and it is the ONLY measured way to activate a menu row that has NO KEYBOARD SHORTCUT. Call it with `app` alone for the top-level menus, then with `path` (`>`-separated titles, e.g. `Edit`, then `Edit > Transformations`) to read one level at a time, then with `press: true` on a leaf. Each row comes back with its title, whether it is ENABLED right now, whether it opens a submenu, its CHECKMARK if it has one (which is how you read a toggle's state without looking at pixels), and its KEY EQUIVALENT already spelled the way press_key takes it (`cmd+i`, `cmd+alt+,`) — so you never have to recognise ⌘ glyphs in a screenshot. USE THIS WHEN A POP-UP MENU BLOCKS YOU: a menu a click opened is a separate window with no accessibility inside it, a coordinate click dismisses it without selecting, and only an item's own shortcut activates it — so a shortcut-less row in a pop-up is unreachable there. Very often the same row exists in the menu bar (a text view's context menu and its Edit menu are the same NSMenuItems), and pressing it here does exactly what choosing it there would. Press `escape` with press_key to dismiss the pop-up first. ENABLED IS LIVE: a menu bar validates against the app's current focus and selection, so `Make Upper Case` reads disabled with nothing selected and enabled once something is — select first, then read, then press. A disabled row is refused rather than pressed, because pressing one does nothing and reporting success would be a lie. NOTHING IS DRAWN AND NOTHING IS ACTIVATED: the press goes straight to the item through accessibility, so no menu opens on screen, your pointer does not move, the app is not raised and your frontmost app does not change — verified on TextEdit while another app was frontmost. A row that opens a submenu is refused with the names of its rows, because opening a submenu is not an action. SAFETY: a menu bar reaches Quit, Log Out, Move to Trash and Leave Chat in two steps and the app will not confirm any of them for you, so a destructive-looking title needs confirm_destructive=true."
+    )]
+    async fn menu_bar(
+        &self,
+        Parameters(a): Parameters<MenuBarArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let path = a.path.clone().unwrap_or_default();
+        if a.press {
+            let confirm = a.confirm_destructive;
+            return match self
+                .native(move |c| c.press_menu_bar(&app, &path, false, confirm))
+                .await
+            {
+                Ok(r) => Ok(ok(render_action(&r))),
+                Err(e) => Ok(fail(e.to_string())),
+            };
+        }
+        match self.native(move |c| c.menu_bar(&app, &path)).await {
+            Ok(listing) => Ok(ok(render_menu(&listing))),
             Err(e) => Ok(fail(e.to_string())),
         }
     }
@@ -1378,4 +1421,49 @@ impl rmcp::ServerHandler for CuaServer {
         );
         info
     }
+}
+
+/// One level of a menu bar, as lines a model reads top to bottom.
+///
+/// Deliberately one row per line with the flags inline rather than a table:
+/// what a caller needs is the exact title to pass back, whether it can be
+/// pressed now, and whether pressing it is even the right move (a submenu is
+/// not). Separators are drawn, because a menu the caller can also see should
+/// have the same shape here.
+fn render_menu(listing: &cua_core::MenuListing) -> String {
+    let where_ = if listing.path.is_empty() {
+        "menu bar".to_string()
+    } else {
+        format!("`{}`", listing.path)
+    };
+    let mut out = format!("{where_}, {} rows\n", listing.items.len());
+    for item in &listing.items {
+        if item.title.is_empty() {
+            out.push_str("  ───\n");
+            continue;
+        }
+        out.push_str("  ");
+        out.push_str(match &item.mark {
+            Some(mark) => mark,
+            None => " ",
+        });
+        out.push(' ');
+        out.push_str(&item.title);
+        if item.has_submenu {
+            out.push_str(" ›");
+        }
+        if let Some(shortcut) = &item.shortcut {
+            out.push_str(&format!("  [{shortcut}]"));
+        }
+        if !item.enabled {
+            out.push_str("  (disabled)");
+        }
+        out.push('\n');
+    }
+    if listing.items.iter().any(|i| i.has_submenu) {
+        out.push_str(
+            "rows marked › open a submenu: read that level before pressing anything in it\n",
+        );
+    }
+    out
 }
