@@ -5,7 +5,20 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
-## Unreleased
+## 0.8.1
+
+### Internal restructuring, no observable behavior change
+
+`cua-core::session` and `cua-core::safety` had grown into two files of over
+5,000 and 2,800 lines respectively, and `cua-hid`/`cua-ax`/`cua-capture` each
+carried most of their crate in a single `lib.rs`. All of that is now split by
+responsibility (pointer/keyboard/scroll/menu actions, targeting, observation,
+delivery policy, destructive-label classification, process routing, and so
+on), `cua-mcp` now depends only on the `cua-core` facade instead of reaching
+into the low-level crates directly, and a few unused dependencies were
+dropped. No public API, MCP tool behavior, or default action path changed —
+this is purely an internal reorganization plus a full README pass (English,
+shorter, with a rendered diagram instead of Mermaid).
 
 ### `is_transient_popup()` requiring `isOnScreen()` was right
 
