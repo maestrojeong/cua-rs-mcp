@@ -121,6 +121,29 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
 
 </details>
 
+<details>
+<summary><strong>Gemini CLI</strong></summary>
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{ "mcpServers": { "cua": { "command": "cua-rs" } } }
+```
+
+</details>
+
+<details>
+<summary><strong>Any other MCP client</strong></summary>
+
+Any MCP-compliant client that launches a stdio server works. The command is
+just `cua-rs`, no arguments:
+
+```json
+{ "mcpServers": { "cua": { "command": "cua-rs" } } }
+```
+
+</details>
+
 Or Streamable HTTP, for attaching to an already-running server:
 
 ```bash
