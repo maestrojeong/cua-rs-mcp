@@ -72,9 +72,54 @@ managers, etc. — reading them is still fine. See [Safety](#safety).
 
 ## Connect
 
+`cua-rs` speaks standard MCP over stdio — any compliant client connects with
+one line of config. Pick yours:
+
+<details>
+<summary><strong>Claude Code</strong></summary>
+
+```bash
+claude mcp add cua -- cua-rs
+```
+
+Registers it for the current project. Add `-s user` to register it globally
+for all projects instead. Verify with `claude mcp list`.
+
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong></summary>
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cua-rs]
+command = "cua-rs"
+```
+
+</details>
+
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Add to `claude_desktop_config.json`:
+
 ```json
 { "mcpServers": { "cua": { "command": "cua-rs" } } }
 ```
+
+</details>
+
+<details>
+<summary><strong>Cursor</strong></summary>
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
+
+```json
+{ "mcpServers": { "cua": { "command": "cua-rs" } } }
+```
+
+</details>
 
 Or Streamable HTTP, for attaching to an already-running server:
 
