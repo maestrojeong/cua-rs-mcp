@@ -2,6 +2,42 @@
 
 use super::*;
 
+/// How long to wait before the one retry [`resolve_window`] gets on
+/// `CannotComplete`.
+///
+/// Measured, not guessed: `AXUIElementCopyAttributeValue(kAXWindowsAttribute)`
+/// against KakaoTalk and Telegram — both Qt on macOS, neither Chromium nor
+/// native AppKit — returned `kAXErrorCannotComplete` after ~1.5s while
+/// `CGWindowListCopyWindowInfo` showed the exact same window `onscreen` at
+/// that moment. The app was not missing a window; its accessibility bridge
+/// just did not answer inside the messaging timeout that time. A short sleep
+/// and one more try is cheap and was measured to succeed on a following
+/// attempt where the first one alone would have reported "no window" and sent
+/// an agent looking for a fix that was never the problem.
+const WINDOW_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Prefer the focused window, fall back to main, then to the first one.
+///
+/// A minimized-only app genuinely has none of these — `Ok(None)` — and that is
+/// a real state, not an error to paper over. A `CannotComplete` from any one
+/// of the three is a different thing entirely: the call itself failed rather
+/// than answering "nothing here", so it is propagated as `Err` instead of
+/// being read as "try the next attribute", which is what `element()`/
+/// `elements()` would otherwise make it look like. See [`WINDOW_RETRY_DELAY`]
+/// for why the caller retries on that `Err` before giving up.
+fn resolve_window(app_el: &Element) -> cua_ax::Result<Option<Element>> {
+    if let Some(w) = app_el.element_checked(cua_ax::attr::FOCUSED_WINDOW)? {
+        return Ok(Some(w));
+    }
+    if let Some(w) = app_el.element_checked(cua_ax::attr::MAIN_WINDOW)? {
+        return Ok(Some(w));
+    }
+    Ok(app_el
+        .elements_checked(cua_ax::attr::WINDOWS)?
+        .into_iter()
+        .next())
+}
+
 impl Inner {
     pub(super) fn get_app_state(
         &mut self,
@@ -42,16 +78,38 @@ impl Inner {
             }
         }
 
-        // Prefer the focused window, fall back to main, then to the first one.
-        // A minimized-only app has none of these, which is a real state and not
-        // an error we can paper over.
-        let window_el = app_el
-            .element(cua_ax::attr::FOCUSED_WINDOW)
-            .or_else(|| app_el.element(cua_ax::attr::MAIN_WINDOW))
-            .or_else(|| app_el.elements(cua_ax::attr::WINDOWS).into_iter().next())
-            .ok_or_else(|| CoreError::NoWindow {
-                app: info.name.clone(),
-            })?;
+        // See `resolve_window` for the FOCUSED/MAIN/WINDOWS fallback order.
+        // A `CannotComplete` gets one short retry — some apps' accessibility
+        // bridge (Qt on macOS: KakaoTalk, Telegram) times out on this call
+        // often enough, while genuinely having a window on screen, that
+        // reporting it as "no window" on the first attempt would be wrong
+        // more often than it is right.
+        let window_el = match resolve_window(&app_el) {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                return Err(CoreError::NoWindow {
+                    app: info.name.clone(),
+                })
+            }
+            Err(cua_ax::AxError::CannotComplete) => {
+                std::thread::sleep(WINDOW_RETRY_DELAY);
+                match resolve_window(&app_el) {
+                    Ok(Some(w)) => w,
+                    Ok(None) => {
+                        return Err(CoreError::NoWindow {
+                            app: info.name.clone(),
+                        })
+                    }
+                    Err(cua_ax::AxError::CannotComplete) => {
+                        return Err(CoreError::WindowQueryTimedOut {
+                            app: info.name.clone(),
+                        })
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // A scoped walk starts from an element the caller saw in the previous
         // snapshot, not from the window. Resolved before the new snapshot

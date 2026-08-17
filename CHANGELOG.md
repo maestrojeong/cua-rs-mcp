@@ -5,6 +5,38 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.9.0
+
+### `get_app_state` no longer reports a live window as "no window"
+
+`AXUIElementCopyAttributeValue` on `AXFocusedWindow`/`AXMainWindow`/`AXWindows`
+was being read as "this app has no window" (`NoWindow`) whenever it failed for
+*any* reason, because `Element::element()`/`Element::elements()` collapsed
+every AX error into the same `None`/empty result as a genuine "asked, nothing
+there". Measured directly against KakaoTalk and Telegram — both Qt on macOS,
+neither Chromium/Electron nor native AppKit — with a raw
+`AXUIElementCopyAttributeValue` probe: the call returned `kAXErrorCannotComplete`
+(a timeout, after ~1.5s) while `CGWindowListCopyWindowInfo` showed the exact
+same window genuinely on screen at that same moment. The window was never
+missing; the app's accessibility bridge was just slow to answer that one call,
+and `NoWindow`'s message ("open a conversation once and retrying can make its
+tree available") sent an agent looking for a fix that was never the problem.
+
+`cua-ax::Element` gained `element_checked()`/`elements_checked()`, which
+surface a real AX failure as `Err` instead of folding it into "nothing here";
+`element()`/`elements()` keep their old signatures and behavior for every other
+caller. `get_app_state`'s window resolution now uses the checked path: a
+`CannotComplete` gets one retry (200ms later) before being reported, and if it
+still fails, is reported as the new, distinct `WindowQueryTimedOut` error
+rather than `NoWindow` — so the message points at the actual failure (a slow
+accessibility bridge, retry) instead of a plausible-sounding wrong one (no
+window, open one). Genuinely window-less apps still get `NoWindow`, unchanged.
+
+Verified live, repeatedly, against both apps: `get_app_state("KakaoTalk")` and
+`get_app_state("Telegram")` now succeed where they previously failed every
+time. `crates/cua-core/examples/window_timeout_probe.rs` keeps this
+re-takeable.
+
 ## 0.8.1
 
 ### Internal restructuring, no observable behavior change
