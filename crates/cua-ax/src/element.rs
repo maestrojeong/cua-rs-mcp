@@ -136,8 +136,23 @@ impl Element {
     }
 
     pub fn element(&self, name: &str) -> Option<Element> {
-        let v = self.attribute(name).ok()??;
-        v.downcast::<AXUIElement>().ok().map(Element)
+        self.element_checked(name).ok().flatten()
+    }
+
+    /// Like [`Element::element`], but a real AX failure — a timeout
+    /// (`CannotComplete`), a stale element, a permission problem — comes back
+    /// as `Err` instead of being folded into `None`. "Asked, nothing there"
+    /// (`AttributeUnsupported`/`NoValue`, what [`Element::attribute`] already
+    /// collapses to `Ok(None)`) is the only case that stays `Ok(None)` here.
+    ///
+    /// Use this where the two are not interchangeable: a caller deciding
+    /// whether a slow-to-respond app is worth retrying needs to know which one
+    /// happened, and `element`/`elements` cannot tell it.
+    pub fn element_checked(&self, name: &str) -> Result<Option<Element>> {
+        Ok(self
+            .attribute(name)?
+            .and_then(|v| v.downcast::<AXUIElement>().ok())
+            .map(Element))
     }
 
     /// Child elements under `name`.
@@ -145,11 +160,18 @@ impl Element {
     /// Yields an empty `Vec` rather than an error when the attribute is missing:
     /// leaf elements are the common case, not an exceptional one.
     pub fn elements(&self, name: &str) -> Vec<Element> {
-        let Ok(Some(v)) = self.attribute(name) else {
-            return Vec::new();
+        self.elements_checked(name).unwrap_or_default()
+    }
+
+    /// Like [`Element::elements`], but see [`Element::element_checked`] for
+    /// why a real failure needs to reach the caller as `Err` rather than as an
+    /// indistinguishable empty `Vec`.
+    pub fn elements_checked(&self, name: &str) -> Result<Vec<Element>> {
+        let Some(v) = self.attribute(name)? else {
+            return Ok(Vec::new());
         };
         let Some(arr) = v.downcast_ref::<CFArray>() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let n = arr.len();
         let mut out = Vec::with_capacity(n);
@@ -163,7 +185,7 @@ impl Element {
             let el = unsafe { &*(raw as *const AXUIElement) };
             out.push(Element(el.retain()));
         }
-        out
+        Ok(out)
     }
 
     pub fn children(&self) -> Vec<Element> {

@@ -84,8 +84,21 @@ pub enum CoreError {
     #[error("element_index {index} is out of range (the snapshot has {count} elements)")]
     BadIndex { index: usize, count: usize },
 
-    #[error("`{app}` has no accessibility window that cua-rs can drive right now. Verify Accessibility is granted to the process that launched cua-rs, then retry after the app has finished opening. Some apps, including KakaoTalk, temporarily expose no AXWindows while backgrounded; opening a conversation once and retrying can make its tree available. Call check_permissions and list_apps to distinguish a permission or process-discovery problem")]
+    #[error("`{app}` has no accessibility window that cua-rs can drive right now. Verify Accessibility is granted to the process that launched cua-rs, then retry after the app has finished opening. Call check_permissions and list_apps to distinguish a permission or process-discovery problem")]
     NoWindow { app: String },
+
+    /// Distinct from [`CoreError::NoWindow`] on purpose. That variant means AX
+    /// answered and said there is nothing; this one means AX did not answer at
+    /// all — `kAXErrorCannotComplete` on `AXFocusedWindow`/`AXMainWindow`/
+    /// `AXWindows`, twice in a row, `WINDOW_RETRY_DELAY` apart. Measured on
+    /// KakaoTalk and Telegram (both Qt on macOS): the call can time out while
+    /// `CGWindowListCopyWindowInfo` shows the same window on screen at that
+    /// exact moment, so "open a window and retry" is the wrong advice — the
+    /// window is already there, its accessibility bridge is just slow to
+    /// answer this call. Worth a caller-side retry after a longer pause than
+    /// `get_app_state` already gave it, not a different action on the app.
+    #[error("`{app}`'s accessibility bridge did not answer in time (kAXErrorCannotComplete on its window attributes, twice). This does not mean the app has no window — apps built on non-native UI toolkits (Qt: KakaoTalk, Telegram) are measured to time out on this call while a window is genuinely on screen. Wait a moment and call get_app_state again rather than trying to open a new window first")]
+    WindowQueryTimedOut { app: String },
 
     /// The requested key has no element-addressed accessibility equivalent.
     #[error("`{key}` has no accessibility equivalent. cua-rs does not synthesize shared HID keyboard input because it would steal keyboard focus. Background-safe alternatives: return/enter and escape on an element that accepts AXConfirm/AXCancel, perform_secondary_action with AXShowMenu for a context menu, or clicking the menu item directly")]

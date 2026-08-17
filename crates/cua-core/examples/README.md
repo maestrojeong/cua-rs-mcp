@@ -15,6 +15,7 @@ Recording permissions on the launching process.
 | `popup_visibility` | Characterize on-screen state for context and menu-bar pop-ups | TextEdit | Both | Regression reproduction |
 | `scroll_check` | Compare wheel delivery with key and idle controls | TextEdit, browser fixture | Both | Regression reproduction |
 | `window_click_probe` | Exercise elementless click delivery and its refusal gates | Harmless area in any app | Both | Integration probe |
+| `window_timeout_probe` | Repeat `get_app_state` and time it, to check the `CannotComplete`-vs-`NoWindow` retry | KakaoTalk, Telegram | Accessibility | Regression reproduction |
 
 The probes may send real process-routed input. Read each source file's usage and
 choose reversible targets before running it.
