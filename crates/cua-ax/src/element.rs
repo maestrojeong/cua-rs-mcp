@@ -143,7 +143,9 @@ impl Element {
     /// (`CannotComplete`), a stale element, a permission problem — comes back
     /// as `Err` instead of being folded into `None`. "Asked, nothing there"
     /// (`AttributeUnsupported`/`NoValue`, what [`Element::attribute`] already
-    /// collapses to `Ok(None)`) is the only case that stays `Ok(None)` here.
+    /// collapses to `Ok(None)`) stays `Ok(None)` here. A value of an unexpected
+    /// Core Foundation type also stays `Ok(None)`: that is a malformed answer,
+    /// but not an AX call failure this method can preserve as `Err`.
     ///
     /// Use this where the two are not interchangeable: a caller deciding
     /// whether a slow-to-respond app is worth retrying needs to know which one
@@ -165,7 +167,8 @@ impl Element {
 
     /// Like [`Element::elements`], but see [`Element::element_checked`] for
     /// why a real failure needs to reach the caller as `Err` rather than as an
-    /// indistinguishable empty `Vec`.
+    /// indistinguishable empty `Vec`. A present value of an unexpected type is
+    /// still an empty `Vec`, matching [`Element::element_checked`].
     pub fn elements_checked(&self, name: &str) -> Result<Vec<Element>> {
         let Some(v) = self.attribute(name)? else {
             return Ok(Vec::new());

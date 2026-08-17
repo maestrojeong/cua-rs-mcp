@@ -140,21 +140,37 @@ impl Inner {
     /// destructive heuristic has to judge the control the *caller* chose, which
     /// is the one the tree showed them. `None` when nothing can be resolved,
     /// which the gate treats as "unknown" rather than "harmless"; the action's
-    /// own resolution then reports the real reason.
+    /// own resolution then reports the real reason. A live default-button or
+    /// parent read that fails is different: safety cannot establish what Return
+    /// would press, so that AX error is returned before the action can run.
     pub(super) fn safety_candidate(
         &self,
         query: &str,
         target: &Target,
         key: Option<&str>,
-    ) -> Option<crate::safety::Candidate> {
-        let info = apps::resolve_app(query).ok()?;
-        let snap = self.snapshots.get(&info.pid)?;
+    ) -> Result<Option<crate::safety::Candidate>> {
+        let Some(info) = apps::resolve_app(query).ok() else {
+            return Ok(None);
+        };
+        let Some(snap) = self.snapshots.get(&info.pid) else {
+            return Ok(None);
+        };
         let node = match *target {
-            Target::Index { index, .. } => snap.nodes.get(index)?,
+            Target::Index { index, .. } => {
+                let Some(node) = snap.nodes.get(index) else {
+                    return Ok(None);
+                };
+                node
+            }
             // `snapshot_id` is the staleness guard the action itself enforces;
             // classifying a label needs only the geometry, so it is ignored
             // here rather than duplicating the refusal.
-            Target::Point { x, y, .. } => hit_test(&snap.nodes, x, y)?,
+            Target::Point { x, y, .. } => {
+                let Some(node) = hit_test(&snap.nodes, x, y) else {
+                    return Ok(None);
+                };
+                node
+            }
         };
         // The snapshot is flat and every node names its parent, so the whole
         // tree the context rule needs is a borrowed projection of it. Which
@@ -206,7 +222,7 @@ impl Inner {
         // nothing up the chain publishes a default button, which is every
         // ordinary window, this resolves to `None` and changes nothing.
         if key.is_some_and(crate::safety::key_activates_default_button) {
-            if let Some(button) = default_button_of_ancestor(&node.element) {
+            if let Some(button) = default_button_of_ancestor(&node.element)? {
                 candidate.substitute_answer(
                     button.role().unwrap_or_default(),
                     button.label(),
@@ -215,7 +231,7 @@ impl Inner {
             }
         }
 
-        Some(candidate)
+        Ok(Some(candidate))
     }
 
     pub(super) fn acting<F>(
@@ -234,7 +250,7 @@ impl Inner {
         // resolve is left to the action, which reports that better.
         if let Ok(info) = apps::resolve_app(query) {
             let candidate = match gate.target() {
-                Some(t) => self.safety_candidate(query, t, gate.key()),
+                Some(t) => self.safety_candidate(query, t, gate.key())?,
                 // A menu bar row describes itself; there is no snapshot index
                 // to look it up by, and the row's own title is exactly what the
                 // classifier wants to read.

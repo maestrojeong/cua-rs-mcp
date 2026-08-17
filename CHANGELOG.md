@@ -5,6 +5,43 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.9.1
+
+### The rest of the error-swallowing gaps the 0.9.0 checked API was meant to close
+
+0.9.0 added `element_checked()`/`elements_checked()` but only migrated the one
+call site (`get_app_state`'s window resolution) the KakaoTalk/Telegram bug was
+found through. A review of every other `element()`/`elements()` caller in
+`cua-core` turned up two more that read AX failures as absence, one of them
+safety-significant:
+
+- **`default_button_of_ancestor()` (the destructive-answer substitution).**
+  When Return is pressed inside a decision context, this walk finds the
+  dialog/sheet's actual default button so the safety gate judges *that*
+  control instead of the one the caller aimed at — it exists because a real
+  "Delete" default button was once pressed without it. It read `AXDefaultButton`
+  and `AXParent` with the old `element()`, so a `CannotComplete` on either call
+  looked exactly like "no default button published", and the gate would judge
+  the wrong (aimed-at) control while Return activated a different one. Now
+  uses `element_checked()` for both, and a real AX failure fails the action
+  closed instead of silently falling through — an agent gets an accessibility
+  error rather than an unverified keypress.
+- **Menu bar traversal (`menu_bar`, `press_menu_bar`).** `walk()` mapped every
+  `AXMenuBar` read failure to `MenuWalkError::NoMenuBar` ("this app publishes
+  no menu bar") and every child-read failure to an empty level, so a slow
+  accessibility bridge could misreport a real menu or item as missing — the
+  same false-absence class of bug as the window one, just for menus. Added
+  `MenuWalkError::Ax` and moved every `AXMenuBar`/`AXChildren` read in the
+  traversal to the checked API, so a genuine "no menu bar"/"no such item" stays
+  distinguishable from "AX did not answer".
+
+Also tightened `element_checked()`/`elements_checked()`'s doc comments: a
+present attribute of an unexpected Core Foundation type also normalizes to
+`Ok(None)`/empty, which the 0.9.0 wording understated.
+
+No new public API surface; `WindowQueryTimedOut` and the window-resolution
+retry are unchanged from 0.9.0.
+
 ## 0.9.0
 
 ### `get_app_state` no longer reports a live window as "no window"

@@ -12,7 +12,9 @@
 use cua_core::{Cua, StateOptions};
 
 fn main() {
-    let app = std::env::args().nth(1).unwrap_or_else(|| "KakaoTalk".into());
+    let app = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "KakaoTalk".into());
     let cua = Cua::new();
     for i in 1..=5 {
         let start = std::time::Instant::now();

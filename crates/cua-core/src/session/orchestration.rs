@@ -1114,7 +1114,7 @@ struct FocusProbe {
 ///
 /// `None` when nothing up the chain publishes one, which is the ordinary case
 /// outside a dialog and is why the caller only asks inside a decision context.
-fn default_button_of_ancestor(el: &Element) -> Option<Element> {
+fn default_button_of_ancestor(el: &Element) -> cua_ax::Result<Option<Element>> {
     /// Roles that can own a default button. `AXSheet` before `AXWindow` is not
     /// an ordering here — the walk is bottom-up, which gets the same result.
     const WINDOW_LIKE: &[&str] = &["AXSheet", "AXDialog", "AXWindow", "AXPopover"];
@@ -1124,16 +1124,18 @@ fn default_button_of_ancestor(el: &Element) -> Option<Element> {
 
     let mut current = Some(el.clone());
     for _ in 0..MAX_STEPS {
-        let node = current?;
+        let Some(node) = current else {
+            return Ok(None);
+        };
         let role = node.role().unwrap_or_default();
         if WINDOW_LIKE.iter().any(|w| *w == role) {
-            if let Some(button) = node.element("AXDefaultButton") {
-                return Some(button);
+            if let Some(button) = node.element_checked("AXDefaultButton")? {
+                return Ok(Some(button));
             }
         }
-        current = node.element(cua_ax::attr::PARENT);
+        current = node.element_checked(cua_ax::attr::PARENT)?;
     }
-    None
+    Ok(None)
 }
 
 fn describe_element(el: &Element) -> String {

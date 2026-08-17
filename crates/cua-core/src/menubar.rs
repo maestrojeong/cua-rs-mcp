@@ -61,6 +61,10 @@ pub struct MenuListing {
 /// What went wrong walking a path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuWalkError {
+    /// The app's AX bridge failed while the menu hierarchy was being read.
+    /// Kept separate from absence so a busy app is never described as one that
+    /// does not publish a menu bar or the requested row.
+    Ax(cua_ax::AxError),
     /// The application element publishes no `AXMenuBar` at all — a background
     /// agent, or an app that has not finished launching.
     NoMenuBar,
@@ -80,6 +84,7 @@ pub enum MenuWalkError {
 impl std::fmt::Display for MenuWalkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Ax(e) => write!(f, "could not read this app's menu bar: {e}"),
             Self::NoMenuBar => write!(f, "this app publishes no menu bar"),
             Self::NoSuchItem {
                 step,
@@ -113,6 +118,12 @@ impl std::fmt::Display for MenuWalkError {
                     .join(", ")
             ),
         }
+    }
+}
+
+impl From<cua_ax::AxError> for MenuWalkError {
+    fn from(value: cua_ax::AxError) -> Self {
+        Self::Ax(value)
     }
 }
 
@@ -191,7 +202,7 @@ pub(crate) fn walk(
     steps: &[&str],
 ) -> std::result::Result<(MenuListing, Option<Element>), MenuWalkError> {
     let mut level = app
-        .element(attr::MENU_BAR)
+        .element_checked(attr::MENU_BAR)?
         .ok_or(MenuWalkError::NoMenuBar)?;
     let mut walked = String::new();
     let mut landed: Option<Element> = None;
@@ -200,7 +211,7 @@ pub(crate) fn walk(
         // One read of the level, used both to find the step and to report what
         // was there instead. Two reads could disagree: a menu bar is live, and
         // an app is free to insert a row between them.
-        let items = level_items(&level);
+        let items = level_items(&level)?;
         let Some(hit) = items
             .iter()
             .find(|el| el.label().unwrap_or_default() == *step)
@@ -216,7 +227,7 @@ pub(crate) fn walk(
             });
         };
         walked = join(&walked, step);
-        match submenu_of(&hit) {
+        match submenu_of(&hit)? {
             // Descend, unless this is the last step: the caller may well have
             // meant "list this submenu", and pressing a row that opens one is
             // refused separately.
@@ -230,7 +241,7 @@ pub(crate) fn walk(
                 return Ok((
                     MenuListing {
                         path: walked.clone(),
-                        items: rows_of(&level, &parent_path(&walked)),
+                        items: rows_of(&level, &parent_path(&walked))?,
                     },
                     landed,
                 ));
@@ -241,15 +252,15 @@ pub(crate) fn walk(
     Ok((
         MenuListing {
             path: walked.clone(),
-            items: rows_of(&level, &walked),
+            items: rows_of(&level, &walked)?,
         },
         landed,
     ))
 }
 
 /// The menu rows directly under `level`, described.
-fn rows_of(level: &Element, path: &str) -> Vec<MenuItem> {
-    level_items(level)
+fn rows_of(level: &Element, path: &str) -> std::result::Result<Vec<MenuItem>, MenuWalkError> {
+    level_items(level)?
         .iter()
         .map(|el| describe(el, path))
         .collect()
@@ -259,9 +270,9 @@ fn rows_of(level: &Element, path: &str) -> Vec<MenuItem> {
 ///
 /// An `AXMenuBar`'s children are `AXMenuBarItem`s and an `AXMenu`'s are
 /// `AXMenuItem`s; anything else at either level is structure and is dropped.
-fn level_items(level: &Element) -> Vec<Element> {
-    level
-        .children()
+fn level_items(level: &Element) -> std::result::Result<Vec<Element>, MenuWalkError> {
+    Ok(level
+        .elements_checked(attr::CHILDREN)?
         .into_iter()
         .filter(|c| {
             matches!(
@@ -269,23 +280,24 @@ fn level_items(level: &Element) -> Vec<Element> {
                 Some("AXMenuBarItem") | Some("AXMenuItem")
             )
         })
-        .collect()
+        .collect())
 }
 
 /// The `AXMenu` a row owns, when it owns one. A row with a submenu has exactly
 /// one `AXMenu` child; a leaf has none.
-fn submenu_of(item: &Element) -> Option<Element> {
-    item.children()
+fn submenu_of(item: &Element) -> std::result::Result<Option<Element>, MenuWalkError> {
+    Ok(item
+        .elements_checked(attr::CHILDREN)?
         .into_iter()
-        .find(|c| c.role().as_deref() == Some("AXMenu"))
+        .find(|c| c.role().as_deref() == Some("AXMenu")))
 }
 
-fn describe(el: &Element, path: &str) -> MenuItem {
+fn describe(el: &Element, path: &str) -> std::result::Result<MenuItem, MenuWalkError> {
     let title = el.label().unwrap_or_default();
-    MenuItem {
+    Ok(MenuItem {
         path: join(path, &title),
         enabled: el.bool(attr::ENABLED).unwrap_or(false),
-        has_submenu: submenu_of(el).is_some(),
+        has_submenu: submenu_of(el)?.is_some(),
         shortcut: menu_shortcut(
             el.string(attr::MENU_ITEM_CMD_CHAR).as_deref(),
             el.number(attr::MENU_ITEM_CMD_MODIFIERS),
@@ -294,7 +306,7 @@ fn describe(el: &Element, path: &str) -> MenuItem {
             .string(attr::MENU_ITEM_MARK_CHAR)
             .filter(|m| !m.trim().is_empty()),
         title,
-    }
+    })
 }
 
 fn join(path: &str, step: &str) -> String {
@@ -424,6 +436,14 @@ mod tests {
             available: vec!["Edit".into()],
         };
         assert!(e.to_string().contains("the menu bar"), "{e}");
+    }
+
+    #[test]
+    fn an_ax_failure_is_not_described_as_an_absent_menu_bar() {
+        let e = MenuWalkError::Ax(cua_ax::AxError::CannotComplete);
+        let rendered = e.to_string();
+        assert!(rendered.contains("did not complete"), "{rendered}");
+        assert!(!rendered.contains("publishes no menu bar"), "{rendered}");
     }
 
     #[test]

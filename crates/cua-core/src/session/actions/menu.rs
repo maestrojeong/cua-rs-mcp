@@ -51,8 +51,8 @@ impl Inner {
         // A row that owns a submenu is not an action. Refusing is better than
         // pressing it: `AXPress` on such a row opens a menu nobody can see.
         if item
-            .children()
-            .iter()
+            .elements_checked(cua_ax::attr::CHILDREN)?
+            .into_iter()
             .any(|c| c.role().as_deref() == Some("AXMenu"))
         {
             return Err(name(crate::menubar::MenuWalkError::IsSubmenu {
