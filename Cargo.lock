@@ -196,7 +196,6 @@ dependencies = [
  "objc2-application-services",
  "objc2-core-foundation",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -211,19 +210,16 @@ dependencies = [
  "objc2-foundation",
  "objc2-screen-capture-kit",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
 name = "cua-core"
 version = "0.8.0"
 dependencies = [
- "base64",
  "cua-ax",
  "cua-capture",
  "cua-hid",
  "libc",
- "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",

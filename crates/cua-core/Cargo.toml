@@ -15,8 +15,6 @@ thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
-base64.workspace = true
-objc2 = { workspace = true }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",

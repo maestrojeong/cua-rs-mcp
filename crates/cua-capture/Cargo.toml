@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 libc.workspace = true
 block2 = "0.6"
 objc2 = { workspace = true }

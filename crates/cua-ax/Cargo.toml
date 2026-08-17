@@ -12,10 +12,6 @@ categories = ["os::macos-apis", "api-bindings", "accessibility"]
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 libc.workspace = true
 objc2-core-foundation.workspace = true
 objc2-application-services.workspace = true
-
-[dev-dependencies]
-libc.workspace = true
