@@ -54,10 +54,11 @@
   <text x="481" y="124" font-size="11" fill="#3b5bb0" text-anchor="middle">AX lookup, pid-routed</text>
 
   <!-- target app node -->
-  <rect x="564" y="96" width="300" height="80" rx="14" fill="#ffffff" stroke="#8fa6e8" stroke-width="1.5" stroke-dasharray="5 4" filter="url(#softShadow)"/>
-  <text x="714" y="126" font-size="14" font-weight="700" fill="#1f3d99" text-anchor="middle">Target app (background window)</text>
-  <text x="714" y="146" font-size="11" fill="#5670b8" text-anchor="middle">e.g. Notes, a messaging app — doesn't need to be frontmost</text>
-  <text x="714" y="164" font-size="11" fill="#5670b8" text-anchor="middle">your mouse and keyboard stay untouched</text>
+  <rect x="544" y="92" width="340" height="88" rx="14" fill="#ffffff" stroke="#8fa6e8" stroke-width="1.5" stroke-dasharray="5 4" filter="url(#softShadow)"/>
+  <text x="714" y="120" font-size="14" font-weight="700" fill="#1f3d99" text-anchor="middle">Target app</text>
+  <text x="714" y="139" font-size="10.5" fill="#5670b8" text-anchor="middle">background window, e.g. Notes</text>
+  <text x="714" y="155" font-size="10.5" fill="#5670b8" text-anchor="middle">doesn't need to be frontmost</text>
+  <text x="714" y="171" font-size="10.5" fill="#5670b8" text-anchor="middle">your mouse &amp; keyboard stay untouched</text>
 
   <!-- Human lane -->
   <rect x="24" y="220" width="872" height="176" rx="18" fill="url(#humanLane)" stroke="#ffd2ab" stroke-width="1.5"/>
@@ -74,10 +75,11 @@
   <text x="365" y="320" font-size="11" fill="#a3591a" text-anchor="middle">real mouse + keyboard</text>
 
   <!-- foreground window node -->
-  <rect x="564" y="292" width="300" height="80" rx="14" fill="#ffffff" stroke="#ffb066" stroke-width="1.5" filter="url(#softShadow)"/>
-  <text x="714" y="322" font-size="14" font-weight="700" fill="#a34d00" text-anchor="middle">Whatever you're in, frontmost</text>
-  <text x="714" y="342" font-size="11" fill="#a3712f" text-anchor="middle">writing a doc, chatting — the app you're actually using</text>
-  <text x="714" y="360" font-size="11" fill="#a3712f" text-anchor="middle">focus always stays right here</text>
+  <rect x="544" y="288" width="340" height="88" rx="14" fill="#ffffff" stroke="#ffb066" stroke-width="1.5" filter="url(#softShadow)"/>
+  <text x="714" y="316" font-size="14" font-weight="700" fill="#a34d00" text-anchor="middle">Foreground window</text>
+  <text x="714" y="335" font-size="10.5" fill="#a3712f" text-anchor="middle">whatever you're using right now</text>
+  <text x="714" y="351" font-size="10.5" fill="#a3712f" text-anchor="middle">writing, chatting, anything</text>
+  <text x="714" y="367" font-size="10.5" fill="#a3712f" text-anchor="middle">focus always stays right here</text>
 
   <!-- divider between the two lanes, deliberately no arrow across -->
   <line x1="24" y1="210" x2="896" y2="210" stroke="#c9cfdc" stroke-width="1.5" stroke-dasharray="2 6"/>
