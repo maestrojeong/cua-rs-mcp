@@ -70,8 +70,6 @@ struct ProcessSerialNumber {
 /// a contradiction, and it is exactly why an earlier attempt that sent the
 /// *public* subtypes had no effect.
 const K_CPS_NOTIFY_NEW_FRONT: i16 = 0x2;
-#[allow(dead_code)]
-const K_CPS_NOTIFY_LOST_KEY_FOCUS: i16 = 0x1000;
 const K_CPS_NOTIFY_KEY_FOCUS_TAKEN: i16 = 0x4000u16 as i16;
 const K_CPS_NOTIFY_KEY_FOCUS_RETURNED: i16 = 0x8000u16 as i16;
 

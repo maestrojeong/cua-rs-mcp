@@ -19,7 +19,6 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGEventTypes",
     "CGEventSource",
     "CGRemoteOperation",
-    "CGEventTypes",
     "CGError",
     "CGGeometry",
 ] }
