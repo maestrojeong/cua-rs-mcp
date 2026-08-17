@@ -10,7 +10,17 @@
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
+
+static WARN_OVERLAY_UNAVAILABLE: Once = Once::new();
+
+fn warn_unavailable(reason: impl std::fmt::Display) {
+    WARN_OVERLAY_UNAVAILABLE.call_once(|| {
+        tracing::warn!(
+            "cua-overlay is unavailable: {reason}. Actions still work, but drawn-cursor feedback is disabled. Install `cua-overlay` beside the canonical `cua-rs` executable (source installs: `cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp cua-overlay`)"
+        );
+    });
+}
 
 pub(crate) struct Overlay {
     child: Mutex<Option<Child>>,
@@ -51,23 +61,54 @@ impl Overlay {
             return;
         };
         let Some(stdin) = child.stdin.as_mut() else {
+            warn_unavailable("the child process has no stdin pipe");
             return;
         };
         if stdin.write_all(line.as_bytes()).is_err() {
             // The process is gone; drop the handle so the next mark respawns
             // it instead of writing into a dead pipe forever.
+            warn_unavailable("the child process exited or closed its command pipe");
             *guard = None;
         }
     }
 
     fn spawn() -> Option<Child> {
-        let sibling = sibling_overlay(&std::env::current_exe().ok()?)?;
-        Command::new(sibling)
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                warn_unavailable(format_args!("cannot locate the running executable: {err}"));
+                return None;
+            }
+        };
+        let sibling = match sibling_overlay(&exe) {
+            Some(path) => path,
+            None => {
+                warn_unavailable(format_args!(
+                    "cannot resolve the canonical executable path `{}`",
+                    exe.display()
+                ));
+                return None;
+            }
+        };
+        if !sibling.is_file() {
+            warn_unavailable(format_args!("`{}` does not exist", sibling.display()));
+            return None;
+        }
+        match Command::new(&sibling)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .ok()
+        {
+            Ok(child) => Some(child),
+            Err(err) => {
+                warn_unavailable(format_args!(
+                    "failed to launch `{}`: {err}",
+                    sibling.display()
+                ));
+                None
+            }
+        }
     }
 }
 

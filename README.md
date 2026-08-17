@@ -1,124 +1,127 @@
 # cua-rs
 
-**Your Mac, driven by an agent. Your cursor stays yours.**
+**AI 에이전트가 당신의 Mac을 대신 조작합니다. 마우스와 키보드는 그대로 당신 것입니다.**
 
 [![ci](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/maestrojeong/cua-rs-mcp)](https://github.com/maestrojeong/cua-rs-mcp/releases)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![platforms](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
 
-A macOS computer-use MCP server that drives native apps through the
-**Accessibility API** — addressing a UI element instead of moving a pointer to a
-coordinate. Nothing moves your cursor, takes your keyboard focus, or switches
-your Space, so an agent can work in a background window while you keep typing in
-another. One Rust binary.
+## 이게 뭔가요?
+
+`cua-rs`는 AI 에이전트(예: Claude, Codex 등)가 macOS의 실제 앱을 직접 조작할 수 있게 해주는
+**MCP 서버**입니다. "컴퓨터를 쓰는 AI 에이전트"를 만들 때 흔히 쓰는 방식은 화면 좌표를 계산해서
+마우스를 움직이고 클릭하는 것인데, 이 방식은 여러분이 지금 쓰고 있는 마우스/키보드/화면을
+그대로 빼앗아 버립니다.
+
+`cua-rs`는 macOS의 **접근성(Accessibility) API**로 화면의 좌표가 아니라 "저 버튼",
+"이 텍스트 필드" 같은 **요소 자체**를 찾습니다. 텍스트 값과 명시적인 AX 동작은 요소에
+직접 전달하고, 기본 `click`/`press_key`는 `cua-hid`가 만든 합성 이벤트를 SkyLight를 통해
+대상 프로세스에만 전달합니다. 공유 HID 스트림에는 쓰지 않지만 키 입력은 그 프로세스에서
+현재 포커스된 요소에 도착하므로, 결과에 포커스 검증 상태를 함께 보고합니다. 그 덕분에:
+
+- 당신의 마우스 커서는 움직이지 않습니다.
+- 다른 앱으로 키 입력을 보내거나 활성 앱을 전환하지 않습니다.
+- 다른 데스크톱(Space)으로 전환하지도 않습니다.
+
+즉, 당신이 문서를 쓰는 동안 에이전트는 백그라운드에 있는 다른 앱(메모, 메신저 등)을
+조용히 조작할 수 있습니다. 하나의 Rust 바이너리로 동작합니다.
 
 ```mermaid
 flowchart LR
-    subgraph agent["agent's lane — no cursor, no keyboard focus"]
-        A["Agent"] -->|MCP| M["cua-rs"] -->|"addresses an element"| B["any app<br/>background window"]
+    subgraph agent["에이전트의 영역 — 커서도, 키보드 포커스도 건드리지 않음"]
+        A["에이전트"] -->|MCP| M["cua-rs"] -->|"AX로 찾고 pid로 전달"| B["대상 앱<br/>백그라운드 창"]
     end
-    subgraph human["your lane — untouched"]
-        H["You"] -->|"real cursor + keyboard"| F["whatever you are in<br/>foreground"]
+    subgraph human["당신의 영역 — 그대로 유지"]
+        H["당신"] -->|"실제 마우스 + 키보드"| F["지금 보고 있는 창"]
     end
 ```
 
-There is no arrow between the lanes, and that is the whole product. What it
-will not do is the point: no flag warps the pointer, posts to the shared
-keyboard stream, or raises a window. [DESIGN.md](DESIGN.md) covers what that
-costs.
+두 영역 사이에는 화살표가 없습니다. 그게 이 프로젝트의 핵심입니다. 실제 커서를 움직이지
+않고, 공용 키보드 입력 스트림에 끼어들지 않고, 창을 앞으로 끌어오지 않습니다. 다만
+프로세스 단위 키 입력은 AX 요소 자체가 아니라 그 앱의 첫 번째 응답자(first responder)로
+전달된다는 제한이 있습니다. 더 자세한 설계 배경은 [DESIGN.md](DESIGN.md)에 있습니다.
 
-## Install
+## 설치
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/cua-rs-mcp/main/install.sh | sh
 cua-rs --help
 ```
 
-Pin a release with `CUA_VERSION=v0.4.2`, or build from source with
-`cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp`.
-
-> Downloading the binary by hand from the Releases page? Clear the quarantine
-> flag or it hangs instead of erroring: `xattr -d com.apple.quarantine ./cua-rs`.
-> The installer above does this for you.
-
-## Grant permissions
-
-Two grants, and **they attach to the process that launches `cua-rs`, not to
-`cua-rs` itself** — so a grant given to iTerm does not carry to Claude Desktop,
-Cursor, or Codex CLI, and a `cua-rs` upgrade never costs a re-approval.
-
-| Grant | Needed for | Without it |
-|---|:--|:--|
-| Accessibility | reading UI structure, every action | nothing works |
-| Screen Recording | screenshots, last-moment window validation for process-routed clicks | tree and AX actions still work; no images |
+특정 버전을 쓰려면 `CUA_VERSION=v0.4.2`, 소스에서 직접 빌드하려면 두 바이너리가 같은
+Cargo bin 디렉터리에 설치되도록 다음을 실행합니다.
 
 ```bash
-cua-rs permissions      # never prompts
+cargo install --git https://github.com/maestrojeong/cua-rs-mcp cua-mcp cua-overlay
 ```
 
-System Settings → Privacy & Security → Accessibility (then Screen Recording),
-add the **host** app, restart it.
+> Releases 페이지에서 바이너리를 직접 내려받았다면, macOS의 격리(quarantine) 표시 때문에
+> 실행이 멈출 수 있습니다. `xattr -d com.apple.quarantine ./cua-rs`로 해제하세요.
+> (위 설치 스크립트는 이 과정을 자동으로 해줍니다.)
 
-Note that cua-rs refuses to *act* on System Settings itself, along with Keychain
-Access and password managers — see [Safety](#safety). Reading them still works.
+## 권한 허용하기
 
-## Connect
+두 가지 권한만 필요합니다. **중요한 점은, 이 권한이 `cua-rs`를 실행시킨 앱(예: Claude
+Desktop, Cursor)에 부여된다는 것입니다.** 즉 다른 터미널에서 실행하면 다시 권한을 허용해야
+하지만, `cua-rs`를 업그레이드해도 다시 허용할 필요는 없습니다.
+
+| 권한 | 어디에 필요한가 | 없으면 |
+|---|:--|:--|
+| 접근성(Accessibility) | 화면 구조 읽기, 모든 동작 | 아무것도 동작하지 않음 |
+| 화면 기록(Screen Recording) | 스크린샷, 클릭 직전 안전 확인 | 화면 구조 읽기와 조작은 되지만 이미지는 못 받음 |
+
+```bash
+cua-rs permissions      # 권한을 요청하지 않고 상태만 확인
+```
+
+macOS의 **시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용**(그다음 화면 기록)에서,
+`cua-rs`를 실행하는 앱을 추가하고 그 앱을 재시작하세요.
+
+참고로 `cua-rs`는 시스템 설정 자체, 키체인 접근, 비밀번호 관리자 등에는 **조작을 거부**합니다
+(읽는 것은 가능합니다). 자세한 내용은 [안전 장치](#안전-장치) 섹션 참고.
+
+## 연결하기
 
 ```json
 { "mcpServers": { "cua": { "command": "cua-rs" } } }
 ```
 
-Or Streamable HTTP for a client that attaches to an already-running server:
+이미 실행 중인 서버에 연결하고 싶다면 Streamable HTTP 모드도 지원합니다:
 
 ```bash
-cua-rs 9331     # http://127.0.0.1:9331/mcp  ·  /health
+cua-rs 9331     # http://127.0.0.1:9331/mcp
 ```
 
-Loopback only, always — and loopback is not an authorization boundary, so `/mcp`
-also requires a bearer token. Set `CUA_HTTP_TOKEN` to pin one, or let the server
-generate one and print it on stderr at startup:
+이 모드는 로컬 컴퓨터 안에서만 접속되며, 매번 임의로 생성되는 토큰(또는
+`CUA_HTTP_TOKEN`으로 직접 지정한 토큰)으로 보호됩니다. stdio 모드(위의 기본 연결 방식)는
+클라이언트가 프로세스를 직접 실행하므로 토큰이 필요 없습니다.
 
-```text
-INFO cua_mcp: generated a bearer token for this run. Clients must send
-              `Authorization: Bearer 9f3c…` to /mcp. Set CUA_HTTP_TOKEN to pin your own.
-```
+## 안전 장치
 
-`/health` stays open, so a supervisor can probe a server it has no credential
-for. stdio mode needs no token: the client already owns the process.
+에이전트가 실수로 위험한 일을 하지 않도록 여러 안전 장치가 기본으로 켜져 있습니다.
+막힌 동작이 있으면 "왜 막혔는지, 어떻게 풀 수 있는지"를 항상 함께 알려줍니다.
 
-## Safety
+- **조작 가능한 앱을 제한할 수 있습니다.** `CUA_ALLOWED_APPS`를 설정하면 지정한 앱 외에는
+  조작(읽기는 제외)이 모두 거부됩니다. 가장 안전한 사용법으로 권장합니다.
+- **비밀번호/보안 관련 앱은 절대 조작하지 않습니다.** 키체인 접근, 비밀번호 앱, 1Password,
+  Bitwarden, 시스템 설정, 로그인/잠금 화면 등. 읽기는 가능하지만 스크린샷은 제공하지 않습니다.
+- **삭제 같은 위험한 동작에는 확인이 필요합니다.** 버튼 이름이 "삭제", "제거", "초기화" 등으로
+  읽히면 한 번 더 확인(`confirm_destructive: true`)해야 실행됩니다. 대화상자에서 엔터 키를
+  누르는 것, "확인" 버튼을 누르는 것도 이 규칙에 포함됩니다. 반대로 "취소", "저장"처럼 되돌리는
+  동작은 항상 허용됩니다.
+- **잠긴 화면이나 화면 보호기 상태에서는 아무 동작도 전달되지 않습니다.**
+- **원하면 사람이 쓰고 있는 앱은 건드리지 않게 할 수도 있습니다** (`CUA_YIELD_TO_HUMAN=1`,
+  기본은 꺼져 있음). 켜면 사람이 그 창을 쓰는 동안 에이전트가 양보합니다.
 
-Six gates. Each refusal names what to pass or change, so an agent can resolve
-it in one round trip. [DESIGN.md §7a](DESIGN.md) has the reasoning.
+이 안전 장치들은 "혹시 위험할 수도 있으면 일단 막고 물어본다" 전략을 씁니다. 가장 확실한
+안전 장치는 `CUA_ALLOWED_APPS`로 조작 가능한 앱 자체를 제한하는 것입니다 — 한번 설정하면
+에이전트 스스로는 그 범위를 넓힐 수 없습니다. 판단 기준의 세부 사항은
+[DESIGN.md §7a](DESIGN.md)에 정리되어 있습니다.
 
-| | default | how to change it |
-|---|:--|:--|
-| **Scope this run to the apps you actually want driven.** Unset, every app is actionable. Set, acting on anything else is refused — reading still works. Bundle identifiers, comma-separated; `list_apps` prints them. Setting it to an *empty* value refuses everything rather than reopening the scope, so a typo cannot quietly disarm it. | unscoped | `CUA_ALLOWED_APPS=com.kakao.KakaoTalkMac,com.apple.TextEdit` |
-| **Credential and security apps are never driven.** Keychain Access, the Passwords app, 1Password / Bitwarden / LastPass / Dashlane / KeePass and friends, System Settings, login and unlock prompts. Matched on bundle identifier, not display name. | on | `CUA_ALLOW_FORBIDDEN_TARGETS=1` |
-| **Reading them is still allowed** — `get_app_state`, `find`, `list_apps` — because a blocked app you cannot even look at is one you cannot explain. The screenshot is withheld, though: pixels reproduce the secret rather than describing it. | on | same flag |
-| **Destructive controls need confirming.** A target whose label reads as Delete / Remove / Erase / Reset / Move to Trash / Don't Save / 삭제 / 제거 / 초기화 / 나가기 is refused, as is `cmd+delete` and a bare `delete` outside a text field. | on | pass `confirm_destructive: true` on that call |
-| **…and Return is judged by the button it will actually press.** Inside a dialog, `press_key return` activates the *default* button whatever you aimed at, so the gate resolves `AXDefaultButton` and classifies that. Aiming Return at an alert's Cancel used to press Delete unrefused. | on | same parameter |
-| **…and so does a terse button under a destructive question.** "OK" in a sheet asking *Delete 4 items?*, 확인 under *4개 항목을 삭제할까요?* — the verb is in the alert, not on the button. Only a sheet or dialog counts as the question; an ordinary window's content never does, so a mail thread about deleting nothing changes. **Cancel, No, Keep, Save, 취소, 저장 are never refused** — an answer that names its own harmlessness is judged by itself, not by the question, so backing out of a destructive dialog (or saving instead of discarding) never needs confirming. | on | same parameter |
-| **Nothing is delivered to a locked screen** or one running its screen saver. Reads continue. | on | — |
-| **Yield to the human.** When enabled, cua-rs stops acting on an app while the human is using it, rather than fighting them for the window. Uses a listen-only event tap that returns every event unchanged — it reads the input stream and never writes to it. | **off** | `CUA_YIELD_TO_HUMAN=1`, `CUA_YIELD_IDLE_MS` (default 3000) |
+## 사용하는 방법 (에이전트 관점)
 
-The label classifier deliberately over-reports: a false positive costs one extra
-call, a false negative costs a deleted conversation. If a refusal looks wrong,
-confirming is the right answer.
-
-**`CUA_ALLOWED_APPS` is the recommended posture**, and the one gate that is a
-scope rather than a heuristic. The other five guess at what is dangerous; this
-one asks you what the run is *for*. A blocklist fails open on every app nobody
-thought to list — a scope cannot. It is off by default only so an upgrade does
-not break a working install, and only the human who launches the process can set
-it: there is deliberately no tool to widen it from inside, because a boundary the
-agent can move is not a boundary.
-
-## Use
-
-`get_app_state` first, always: it walks one window, captures it in the same
-moment, and numbers everything actionable. Those numbers are what actions take.
+에이전트는 먼저 `get_app_state`로 현재 창의 상태(화면에 뭐가 있는지)를 받아옵니다.
 
 ```text
 Notes (pid 41277)  snapshot_id=1
@@ -128,153 +131,82 @@ Notes (pid 41277)  snapshot_id=1
   [21] AXTextArea = "milk\neggs" (editable, focused)
 ```
 
-```json
-{ "app": "Notes", "element_token": "1-3-AXButton" }
-```
+여기서 번호가 붙은 요소(`[3]`, `[7]`, `[21]`)를 골라서 클릭하거나 값을 입력할 수 있습니다.
 
-Lines with `[N]` are targetable; the rest is context. `element_token` bundles
-the snapshot, index and role, so acting on a stale handle errors instead of
-mis-clicking. `x`/`y` also works, resolved against the snapshot's geometry.
-
-Pass `snapshot_id` whenever you act on a **coordinate** rather than an element.
-A stale index can be caught by the role it used to have; a stale pixel cannot be
-caught by anything — it is still inside the window and still covering something,
-just not what you looked at. `snapshot_id` is the only guard that catches it,
-and `click`, `click_in_window`, `drag` and `hover` all honour it.
-
-| Tool | |
+| 도구 | 설명 |
 |---|:--|
-| `get_app_state` | **call first** — tree + screenshot from one snapshot |
-| `find` · `wait_for` | search the snapshot; poll until text appears or goes |
-| `click` | a pid-routed event, no `AXPress`/`AXPick`/`AXConfirm` attempt; `button` (left/right/middle), `modifiers` (`cmd+shift`, …), `count`, `confirm_destructive` for a Delete-shaped target |
-| `drag` · `hover` | press–move–release between two ends; a `mouseMoved` that reveals hover-only UI |
-| — | every action returns what it did — verb, target, `delivery`, and a tree diff by default. Nothing is fire-and-forget |
-| `click_in_window` | a bare point, no element, nothing verified — last resort on a canvas, and the only addressing a pop-up window has |
-| `set_value` · `type_text` · `select_text` | write, append, select a substring — a single AX call. `type_text` takes `mechanism: "keystrokes"` for targets that ignore `AXValue` |
-| `press_key` | any key or chord (`⌘⇧P`, `ctrl+alt+delete`, …), pid-routed |
-| `menu_bar` | read the app's menu bar a level at a time — title, enabled-right-now, ✓, submenu, key equivalent — and press a row. The only measured way to activate a menu item that has no shortcut |
-| `scroll` · `perform_secondary_action` | pages through AX, or a wheel event where there is no AX verb; any AX verb |
-| `list_apps` · `check_permissions` | running apps; grant status |
+| `get_app_state` | 먼저 호출 — 화면 구조와 스크린샷을 한 번에 가져옵니다 |
+| `find` / `wait_for` | 특정 텍스트가 나타나거나 사라질 때까지 찾습니다 |
+| `click` / `drag` / `hover` | 요소를 클릭·드래그·마우스오버합니다 |
+| `set_value` / `type_text` / `select_text` | 텍스트를 쓰거나, 추가하거나, 선택합니다 |
+| `press_key` | 키보드 키나 단축키를 누릅니다 |
+| `menu_bar` | 메뉴바를 읽고 메뉴 항목을 클릭합니다 |
+| `scroll` | 스크롤합니다 |
+| `list_apps` / `check_permissions` | 실행 중인 앱 목록과 권한 상태를 확인합니다 |
 
-Actions re-read the window and return a delta by default, so acting and looking
-cost one round trip instead of two. Read it as a textual delta, not as proof —
-to know one element's state, read that element. For a dense app, `skeleton: true`
-summarizes big subtrees, then `scope_element_id` spends the whole budget inside
-one of them.
+모든 동작은 실행 후 화면이 어떻게 바뀌었는지 결과로 돌려줘서, 에이전트가 한 번의 요청으로
+"실행하고 확인하기"를 같이 할 수 있습니다.
 
-## Limits
+## 할 수 있는 것 / 할 수 없는 것 (요약)
 
-| | |
-|---|:--|
-| buttons, menus, tabs, rows, text fields, Electron apps | yes (Electron: the tree builds lazily, so read twice) |
-| **seeing a pop-up menu a click opened** | yes. It is a separate window with no accessibility representation, so it is never in the tree; `get_app_state` and every action's own result list it — id, level, frame, and whether it just appeared — and the window screenshot already contains it, because macOS photographs a window together with the pop-up attached to it |
-| **picking a row in that menu** | **by its keyboard shortcut, or through the menu bar.** `press_key` with the item's own key equivalent (⌘I, ⌘T, ⌥⌘,) activates it. A `click_in_window` coordinate is delivered and *dismisses* the menu without selecting anything — a menu tracks the real pointer, and cua-rs does not move the real pointer |
-| **a row in that menu with no shortcut at all** | **not inside the pop-up — use `menu_bar`.** Four routes were measured (DESIGN §10): the arrow keys really do reach the menu and move the highlight, but `return`, `enter` and `space` are consumed and activate nothing, whether the key event carries the pop-up's window number, the parent's, or none; and `AXShowMenu` is unimplemented on the controls that own these menus. What does work is that most apps draw the same rows in their **menu bar**, which accessibility publishes in full. **Measured:** `Edit ▸ Transformations ▸ Make Upper Case` — no shortcut, and a row of TextEdit's context menu — upper-cased the selection with another app frontmost. Where an app draws a row *only* in the pop-up (KakaoTalk's `톡게시판`), it is genuinely unreachable |
-| **reading a menu item's shortcut** | `menu_bar` reports it as data, already spelled the way `press_key` takes it (`cmd+i`, `cmd+alt+shift+v`), along with the ✓ on a toggle and whether the row is enabled right now. So learning a pop-up row's shortcut means reading the menu bar's copy of it, not recognising a ⌘ glyph in a screenshot — cua-rs still does no OCR |
-| any key or chord | yes, pid-routed, with an honest `focus:` verdict on where it landed. A bare character key carries the character as well as the keycode, so a non-Latin input source cannot substitute a different letter — `press_key x` under a Korean source delivered `ㅌ` before this |
-| right-click, middle-click, ⌘/⇧/⌥/⌃-click | yes, pid-routed. **Measured:** a right-click opened a context menu on TextEdit's text view; a ⇧-click extended a selection an unmodified click leaves empty |
-| drag | yes: a real down, interpolated moves and an up, both ends in one window. **Measured:** dragging across TextEdit selected exactly the text spanned |
-| hover | **yes on web content, no on the native surfaces tried.** A synthesized `mouseMoved`. **Measured:** in Chrome and in Safari, a button a page reveals only on `:hover` appeared in the accessibility tree while the point was hovered and was gone when the pointer left, and the page read back the exact coordinate the event carried. On a Finder list row the same event changed nothing — not the tree, not one byte of the window's image — while a click at the same pixel in the same run selected the row. Your cursor does not move, so an app that polls the *real* pointer position rather than reading the event cannot react, and a native hover affordance may well be the window server's own cursor tracking rather than an event the app is handed |
-| scrolling something with no AX scroll verb (Electron list, canvas, web content) | **no, and it is refused rather than faked.** The wheel event is delivered and scrolls nothing — measured against the window's pixels on a native `AXScrollArea` and on Chromium web content, in both pixel and line units — so `scroll` errors and the message sends you to `press_key` with `pagedown` / `pageup` / `down` / `up`, which does reach the same scroller. `CUA_WHEEL_SCROLL=1` delivers it anyway, for re-running the experiment. [DESIGN.md](DESIGN.md) §11 has the numbers |
-| canvas apps, games | clickable and draggable, but you supply the coordinate and the confidence |
-| terminals | reading yes; typing yes with `type_text mechanism="keystrokes"`, which sends real per-pid key events. The default `AXValue` write is still ignored by terminals, and the keystroke path is measured on TextEdit, not yet on a terminal |
+- 버튼, 메뉴, 탭, 목록, 텍스트 필드 클릭·입력: 대부분의 네이티브 앱과 Electron 앱에서 잘 동작합니다.
+- 클릭으로 열리는 팝업 메뉴: 항목을 직접 클릭하는 것은 지원하지 않고, 키보드 단축키나
+  메뉴바를 통해 선택해야 합니다 (팝업 메뉴는 접근성 API로 볼 수 없는 특수한 창이라서 그렇습니다).
+- 마우스 오버(hover) 효과: 웹 페이지(Chrome, Safari)에서는 잘 동작하지만, Finder 같은
+  네이티브 목록에서는 동작하지 않습니다.
+- 접근성 API에 스크롤 기능이 없는 화면(캔버스, 일부 Electron 목록): 스크롤 대신 페이지
+  업/다운 키를 사용하도록 안내합니다.
+- Chrome/Safari가 화면 맨 앞에 있지 않을 때(백그라운드 상태)는 클릭·마우스오버가 전혀
+  전달되지 않습니다. 웹 페이지를 다뤄야 한다면 이 프로젝트보다
+  [browser-rs](https://github.com/maestrojeong/browser-rs-mcp)(CDP 기반)가 더 적합합니다.
+- 터미널 앱: 읽기는 가능하고, 입력은 `mechanism: "keystrokes"` 옵션을 쓰면 됩니다.
 
-Every row above that says **Measured** was walked against a real app with a
-control arm — an arm that can only produce good news is not a measurement. Where
-a row says a gesture does nothing, that is a reading and not an omission: the
-wheel scroll and the Finder hover were each sent alongside something already
-known to work, at the same pixel of the same window in the same run, so a silent
-result is the gesture failing rather than nothing reaching the app.
-[DESIGN.md](DESIGN.md) §11 has the numbers, and says plainly which results are
-one app rather than a survey.
+더 자세한 실험 결과와 수치는 [DESIGN.md](DESIGN.md)에 정리되어 있습니다.
 
-Two limits worth reading before you plan around them. Chrome and Safari accepted
-**no** pid-routed pointer event at all — click as much as hover — while their
-application was not frontmost, in a session where a background click on TextEdit
-worked; so a browser you can read in the background is not necessarily a browser
-you can drive there. And `hover` is only known to reach web content.
+## 화면에 그려지는 커서
 
-`set_value` replaces and `type_text` appends via one atomic `AXValue` write; an
-app that only reacts to real key events ignores both, which is what
-`mechanism: "keystrokes"` is for — explicit rather than automatic, because a
-write cua-rs cannot tell was ignored is not a signal to start typing. `click`
-and `press_key` never attempt an AX action at all — every event is routed to the
-target process by pid, reported as `delivery: pid`, and fails rather than
-touching your pointer if that tier is unavailable.
+접근성 API로 조작하면 화면에 아무 흔적도 남지 않아서, 에이전트가 뭘 하는지 눈으로 보기
+어렵습니다. 그래서 `cua-overlay`라는 별도의 작은 프로그램이 함께 설치되어, 에이전트가
+조작하는 위치에 **클릭할 수 없는 투명한 화살표**를 그려줍니다. 이 화살표는 진짜 커서가
+아니고, 마우스 입력을 가로채지도 않습니다. 조작 중인 앱이 화면 맨 앞에 있을 때만 보이고,
+아니면 숨겨집니다.
 
-Anything that sends real keys is addressed to the *process*, so it arrives at
-whatever that process's first responder is. Those results carry
-`focus: verified | unverified | mismatched`, compared against the app's own
-focused element: `mismatched` means the keys most likely reached a sibling of
-the element you named (never another app — the event never leaves the target
-process), and `unverified` means the app published nothing to check against.
-Delivery happens anyway in both cases; `CUA_KEY_STRICT_FOCUS=1` refuses on
-`mismatched` instead. Clicking a target before typing into it is the reliable
-way to get `verified` — a window that has never been clicked can be frontmost
-and still have no key window at all.
+`cua-rs`는 정규화된 자기 실행 파일과 같은 디렉터리에서 정확히 `cua-overlay`라는 이름을
+찾습니다. 없거나 실행할 수 없으면 동작 자체는 계속하지만 stderr에 한 번 경고하고 화면의
+조작 위치 표시는 비활성화됩니다. 위 설치 스크립트와 소스 설치 명령은 둘을 함께 설치합니다.
 
-## The drawn cursor
+<p align="center"><img src="assets/cursor-demo.png" width="640" alt="에이전트가 클릭한 위치를 화살표와 링으로 표시하는 모습"></p>
 
-The AX path leaves nothing on screen — which also means you cannot see the agent
-working. `cua-overlay` is a separate binary that draws a click-through arrow where
-an action landed, never focused, never your real cursor.
-
-**The installer ships it, so this is on by default.** From the first action, an
-arrow appears over the window being driven and follows each `click`, `press_key`
-or `scroll` to the element it landed on, with a ring flashed on a click. It is
-click-through, so it never intercepts anything you do, and it hides itself when
-the driven app is not frontmost — you see the agent when you are looking at its
-window, and nothing when you are not.
-
-`cua-rs` spawns it as a sibling of its own binary, so keep the two together;
-`cargo build --workspace` and `install.sh` both produce that layout. Delete
-`cua-overlay` and the server carries on silently.
-
-<p align="center"><img src="assets/cursor-demo.png" width="640" alt="A mirrored presence-pointer arrow on move, the same arrow plus a small ring on click"></p>
-
-## Development
+## 개발자용
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 249 tests, no permissions needed
+cargo test --workspace          # 249개 테스트, 별도 권한 필요 없음
 cargo clippy --workspace --all-targets -- -D warnings
-
-# read-back tests for the keyboard path: needs an Accessibility grant,
-# a GUI session and TextEdit, so they are #[ignore]d by default
-cargo test -p cua-core --test live_keyboard -- --ignored --test-threads=1
 ```
+
+프로젝트는 역할별로 여러 크레이트(패키지)로 나뉘어 있습니다:
 
 ```text
-cua-ax        safe AXUIElement wrapper + budgeted tree walker
-cua-capture   window discovery + crash-isolated per-window PNG
-cua-core      app resolution, one native worker thread, snapshots, safety gates
-cua-hid       process-routed input — the only crate that links the event APIs
-cua-mcp       the server, binary `cua-rs`
-cua-overlay   the drawn cursor
+cua-ax        macOS 접근성(AXUIElement) API를 안전하게 감싸는 계층
+cua-capture   창을 찾고 스크린샷을 찍는 계층
+cua-core      스냅샷, 앱 탐색, 안전 장치 등 핵심 로직
+cua-hid       실제 클릭/키 입력을 프로세스 단위로 전달하는 계층
+cua-mcp       MCP 서버 본체, 실행 파일 `cua-rs`
+cua-overlay   화면에 그려지는 커서
 ```
 
-Two constraints worth knowing before touching it: every native call runs on one
-thread, because `AXUIElement` handles are honestly `!Send`; and every tree walk
-is budgeted, because an AX tree can be unbounded and is not guaranteed acyclic.
-[DESIGN.md](DESIGN.md) has the reasoning, the measurements, and the known weak
-spots.
+더 깊은 설계 이유와 제약 사항은 [DESIGN.md](DESIGN.md)에 있습니다.
 
-## Prior art
+## 비슷한 프로젝트
 
-- [**trycua/cua**](https://github.com/trycua/cua/tree/main/libs/cua-driver) — larger, cross-platform, further along; its docs are the best free writing on this domain.
-- [**lahfir/agent-desktop**](https://github.com/lahfir/agent-desktop) — Rust AX engine, CLI rather than MCP.
-- [**minghinmatthewlam/computer-use-mcp**](https://github.com/minghinmatthewlam/computer-use-mcp) — same positioning, in Swift.
+- [**trycua/cua**](https://github.com/trycua/cua/tree/main/libs/cua-driver) — 더 크고, 여러
+  플랫폼을 지원하며, 더 앞서 있는 프로젝트. 이 분야에 대한 좋은 글도 많습니다.
+- [**lahfir/agent-desktop**](https://github.com/lahfir/agent-desktop) — Rust로 만든 접근성 엔진,
+  MCP가 아니라 CLI 형태.
+- [**minghinmatthewlam/computer-use-mcp**](https://github.com/minghinmatthewlam/computer-use-mcp) —
+  비슷한 목표를 Swift로 구현.
 
-Chromium content degrades under any AX-only tool; hand the web to
-[browser-rs](https://github.com/maestrojeong/browser-rs-mcp) over CDP instead.
-Measured, and a second reason for the same advice: **Chrome and Safari accept no
-synthesized pointer input at all while their app is not frontmost** — a click and
-a `mouseMoved` at the same pixel of the same window were both ignored in the
-background and both honoured the moment the app was active, while a background
-click on TextEdit worked in the same session. So a browser is outside the one
-property this server exists to provide, and CDP is the right tool rather than the
-consolation prize.
-
-## License
+## 라이선스
 
 Apache-2.0

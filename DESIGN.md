@@ -5,7 +5,7 @@ planned next (§11), and the largest thing currently declined (§12).
 
 ---
 
-## 1. Why the Accessibility API and not `CGEventPost`
+## 1. Why AX addressing plus process-routed events, not shared input
 
 This is the decision everything else follows from.
 
@@ -31,13 +31,16 @@ below for why that changed and why `set_value`/`type_text` did not.)
 
 ### This was verified, not assumed
 
-Most of a computer-use tool can be built out of accessibility actions alone —
+Most of a computer-use tool can be built out of accessibility operations alone —
 `AXUIElementPerformAction`, `AXUIElementSetAttributeValue` and
 `AXUIElementCopyAttributeValue`, all available in the public
 `objc2-application-services` crate. Not all of it: controls that advertise no AX
 action at all still need a synthesized event, which is why `cua-hid` exists and
-why the ceiling below is stated plainly rather than implied. "Does not steal focus" is then not a feature flag but the absence of
-event-posting code, which is a property a reader can check rather than trust.
+why the ceiling below is stated plainly rather than implied. The coexistence
+property is narrower and checkable: cua-rs never warps the real cursor and never
+posts into the shared HID stream. Its default click and keyboard paths do post
+synthesized events to one target pid; keyboard delivery therefore depends on
+that process's own first responder and reports a focus verdict.
 
 cua-rs keeps a public-API event path as its reliable click tier, and additionally
 ports one piece of private SPI for a *quieter* tier — the SkyLight

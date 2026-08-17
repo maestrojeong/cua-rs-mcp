@@ -79,3 +79,10 @@ macOS, and the **Accessibility** grant on the process that launches your binary
 process).
 
 Part of [cua-rs-mcp](https://github.com/maestrojeong/cua-rs-mcp). Apache-2.0.
+
+This crate is only cua-rs's Accessibility layer. In the server, `click` and
+`press_key` use `cua-hid`'s process-routed SkyLight/CGEvent synthesis by
+default; AX remains responsible for discovery, element addressing, text writes,
+and explicitly requested semantic actions. Process routing leaves the shared
+cursor untouched, but keyboard delivery is to the target process's current
+first responder rather than directly to an AX element.

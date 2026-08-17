@@ -11,16 +11,14 @@
 //! cursor mid-sentence, it steals keyboard focus, it drags the active Space
 //! out from under you.
 //!
-//! This crate takes the other road. Actions are delivered *directly to the
-//! target UI element* through the Accessibility API — `AXUIElementPerformAction`
-//! for presses, `AXUIElementSetAttributeValue` for text — which never touches
-//! the cursor, never changes focus, and never activates an app. The agent and
-//! the human can work at the same time, on different windows, without fighting.
-//!
-//! That property is not a tuning detail; it falls straight out of never calling
-//! `CGEventPost`. Note that this crate links `CoreGraphics` only to *read*
-//! modifier state and enumerate windows. HID synthesis, if ever added, belongs
-//! behind an explicit opt-in fallback in a higher layer — never here.
+//! This crate provides the element-addressed half of cua-rs: tree inspection,
+//! `AXUIElementPerformAction` semantic actions, and
+//! `AXUIElementSetAttributeValue` text writes. It never synthesizes input.
+//! The higher-level `cua-core` crate also uses `cua-hid`: `click` and
+//! `press_key` default to process-routed SkyLight/CGEvent synthesis, while text
+//! writes and explicitly requested secondary AX actions remain element-based.
+//! Those events are routed to one pid and do not warp the shared cursor, but
+//! keyboard events still land on that process's first responder.
 //!
 //! # The two things that make AX usable for an agent
 //!
