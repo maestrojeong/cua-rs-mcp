@@ -18,7 +18,8 @@ case "$OS-$ARCH" in
 esac
 if [ "${NEED_SRC:-0}" = "1" ]; then
   echo "Build from source instead:"
-  echo "  cargo install --git https://github.com/$REPO cua-mcp"
+  echo "  cargo install --git https://github.com/$REPO cua-mcp cua-overlay"
+  echo "Both packages are required for the default drawn-cursor feedback."
   exit 1
 fi
 

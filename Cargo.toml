@@ -38,8 +38,10 @@ http = "1"
 rmcp = { version = "2.2", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars = "1"
 
-# macOS native. The whole point of this crate: the Accessibility API is the
-# action path (no CGEvent synthesis), ScreenCaptureKit is the pixel path.
+# macOS native. Accessibility supplies discovery, stable element addressing,
+# semantic AX actions, and text writes; cua-hid supplies process-routed
+# synthesized pointer/keyboard events without touching the shared cursor.
+# ScreenCaptureKit is the pixel path.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [

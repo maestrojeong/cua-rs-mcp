@@ -238,7 +238,9 @@ fn main() -> anyhow::Result<()> {
                 // nothing and every click pays the full budget". Leaving it out
                 // of the default filter made that warning unreachable in a
                 // server nobody sets RUST_LOG on, which is every server.
-                tracing_subscriber::EnvFilter::new("cua_rs=info,cua_mcp=info,cua_hid=info")
+                tracing_subscriber::EnvFilter::new(
+                    "cua_rs=info,cua_mcp=info,cua_core=info,cua_hid=info",
+                )
             }),
         )
         // stdout is the MCP transport on the stdio path; anything written there

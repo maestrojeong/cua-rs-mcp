@@ -13,9 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 cua-core.workspace = true
-cua-ax.workspace = true
-cua-capture.workspace = true
-cua-hid.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +23,3 @@ base64.workspace = true
 axum.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
