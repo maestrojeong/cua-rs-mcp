@@ -5,6 +5,55 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.10.0
+
+### Window and app management
+
+Ten new tools: `list_windows`, `focus_window`, `move_window`, `resize_window`,
+`minimize_window`, `maximize_window`, `restore_window`, `list_displays`,
+`launch_app`, `close_app`. `focus_window` raises a window with `AXRaise`
+alone — it never calls `NSRunningApplication.activate`, the same invariant
+`click` already held. `launch_app` defaults to no activation; `close_app`
+always requires `confirm_destructive` and refuses to touch session-critical
+processes (Finder, Dock, SystemUIServer, loginwindow, WindowServer). See
+DESIGN.md §13.
+
+### Clipboard
+
+`clipboard_get`, `clipboard_set`, `clipboard_clear`. A clipboard read is
+treated at least as sensitively as a screenshot: it is withheld while a
+forbidden-target app is frontmost, and pasteboard entries a writer marked
+`org.nspasteboard.ConcealedType` (the convention password managers use) are
+withheld unconditionally, independent of `CUA_ALLOW_FORBIDDEN_TARGETS`. See
+DESIGN.md §7a.
+
+### Structured error codes and delivery disposition
+
+Every tool error now carries, next to its existing message, a stable `code`
+(`STALE_REF`, `POLICY_DENIED`, `ACTION_FAILED`, …) and every result — success
+or failure — carries a `disposition` (`not_delivered` / `delivered_unverified`
+/ `delivered_verified`) with a derived `retry_safe`. Additive only: no
+existing error message's wording changed. See the README's new "Errors and
+disposition" section and DESIGN.md §10a.
+
+### `batch`
+
+Runs several of this server's tools in one call, in order, each step going
+through the exact same dispatch path a solo call takes — no second
+implementation to keep in sync. `bail_on_error` (default `true`) stops at the
+first failing step; `false` collects every result. One `spawn_blocking` hop
+for the whole batch regardless of step count.
+
+### Notification Center
+
+`list_notifications`, `dismiss_notification`, `dismiss_all_notifications`,
+`notification_action`. Built from measuring what Notification Center actually
+exposes via accessibility on macOS 26.2: live banners are not reliably
+addressable, so these read and act on the history panel instead (opened from
+the menu-bar clock, closed again around the call). Gated like any action,
+plus a refusal when the notification's source app is forbidden or, under
+`CUA_ALLOWED_APPS`, out of scope. See DESIGN.md §14.
+
 ## 0.9.1
 
 ### The rest of the error-swallowing gaps the 0.9.0 checked API was meant to close
