@@ -471,13 +471,13 @@ impl Inner {
                 "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
             ));
         }
-        let live = self.live_snapshot_window(&info).map_err(&refuse)?;
+        let live = self.live_snapshot_window(&info).map_err(refuse)?;
         let origin = self
             .aim(query, &info, &live, &from, snapshot_id)
-            .map_err(&refuse)?;
+            .map_err(refuse)?;
         let destination = self
             .aim(query, &info, &live, &to, snapshot_id)
-            .map_err(&refuse)?;
+            .map_err(refuse)?;
 
         // A drag onto its own origin is a click with extra steps, and almost
         // always a caller that resolved both ends to the same element by
@@ -583,10 +583,10 @@ impl Inner {
                 "SLEventPostToPid is not available on this macOS version, and cua-rs will not fall back to moving the real pointer".into(),
             ));
         }
-        let live = self.live_snapshot_window(&info).map_err(&refuse)?;
+        let live = self.live_snapshot_window(&info).map_err(refuse)?;
         let aim = self
             .aim(query, &info, &live, &at, snapshot_id)
-            .map_err(&refuse)?;
+            .map_err(refuse)?;
 
         let before = self.watch(info.pid);
         let believes_frontmost = {
