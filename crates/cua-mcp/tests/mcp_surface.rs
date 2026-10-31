@@ -116,18 +116,31 @@ fn advertises_the_expected_tools() {
             "check_permissions",
             "click",
             "click_in_window",
+            "clipboard_clear",
+            "clipboard_get",
+            "clipboard_set",
+            "close_app",
             "dismiss_all_notifications",
             "dismiss_notification",
             "drag",
             "find",
+            "focus_window",
             "get_app_state",
             "hover",
+            "launch_app",
             "list_apps",
+            "list_displays",
             "list_notifications",
+            "list_windows",
+            "maximize_window",
             "menu_bar",
+            "minimize_window",
+            "move_window",
             "notification_action",
             "perform_secondary_action",
             "press_key",
+            "resize_window",
+            "restore_window",
             "scroll",
             "select_text",
             "set_value",
@@ -660,4 +673,80 @@ fn http_mode_requires_the_bearer_token() {
     assert_eq!(wrong, "401", "a wrong token must be refused");
     assert_ne!(right, "401", "the right token must get through");
     assert_eq!(health, "200", "/health must stay open");
+}
+
+#[test]
+fn every_window_tool_names_a_window_the_same_way() {
+    // One selector shape across all six, so a caller who learned it on
+    // focus_window does not have to relearn it on move_window.
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for name in [
+        "focus_window",
+        "move_window",
+        "resize_window",
+        "minimize_window",
+        "maximize_window",
+        "restore_window",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        let props = &tool["inputSchema"]["properties"];
+        for key in ["app", "window_id", "window_title"] {
+            assert!(!props[key].is_null(), "{name} must accept {key}");
+        }
+    }
+}
+
+#[test]
+fn close_app_advertises_the_confirmation_and_launch_app_the_opt_in() {
+    let responses = talk(&[], &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let close = tools.iter().find(|t| t["name"] == "close_app").unwrap();
+    assert!(!close["inputSchema"]["properties"]["confirm_destructive"].is_null());
+    let launch = tools.iter().find(|t| t["name"] == "launch_app").unwrap();
+    assert!(!launch["inputSchema"]["properties"]["activate"].is_null());
+    let description = launch["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("NOT ACTIVATED"),
+        "launch_app must say it does not activate by default: {description}"
+    );
+}
+
+#[test]
+fn close_app_without_confirmation_is_refused_before_anything_quits() {
+    // Finder is always running and is also protected, so this asserts the
+    // refusal without any chance of quitting a real app, grant or no grant.
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"close_app","arguments":{"app":"com.apple.finder","confirm_destructive":true}}}"#,
+        ],
+    );
+    let text = call_text(&responses, 3);
+    assert_eq!(response(&responses, 3)["result"]["isError"], true, "{text}");
+    assert!(
+        text.contains("refusing") && text.contains("Finder"),
+        "Finder must be refused as protected: {text}"
+    );
+}
+
+#[test]
+fn list_displays_needs_no_grant() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_displays","arguments":{}}}"#,
+        ],
+    );
+    let text = call_text(&responses, 3);
+    assert!(text.contains("active displays"), "{text}");
 }

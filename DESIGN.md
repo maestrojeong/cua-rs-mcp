@@ -1,7 +1,8 @@
 # Design notes
 
 Why cua-rs is built the way it is, what is deliberately not built yet, what is
-planned next (§11), and the largest thing currently declined (§12).
+planned next (§11), the largest thing currently declined (§12), and the window
+and app management tools (§13).
 
 ---
 
@@ -708,10 +709,11 @@ with it.
 | gate | default | flag | what it refuses |
 |---|:--|:--|:--|
 | session scope | **off** | `CUA_ALLOWED_APPS=id,id` | actions on any app outside the scope the launcher named |
-| forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots |
+| forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots, plus clipboard text they wrote or that was read while one was frontmost |
+| concealed clipboard | **on** | — | `clipboard_get` text a writer marked `org.nspasteboard.ConcealedType` |
 | destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something — or that answers a sheet or dialog which does, unless the answer is a Cancel |
-| screen lock | **on** | — | every action while the session is locked or the saver is up |
-| yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using |
+| screen lock | **on** | — | every action, and every clipboard write, while the session is locked or the saver is up |
+| yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using; clipboard writes while the human is active anywhere |
 | HTTP bearer token | **on** | `CUA_HTTP_TOKEN` sets it | any `/mcp` request without `Authorization: Bearer` |
 
 Every action gate is checked once, in `Inner::acting`, which every action
@@ -811,6 +813,134 @@ one read that reproduces the secret rather than describing the UI around it, so
 `get_app_state` on a forbidden target returns the tree, drops the image, and
 says so in a warning. That keeps the app observable enough to reason about and
 closes the most direct exfiltration path.
+
+### The clipboard: a read that is a screenshot, writes that belong to no app
+
+Three tools — `clipboard_get`, `clipboard_set`, `clipboard_clear` — and two
+questions the existing gates were not shaped for: is a clipboard read a tree
+read or a screenshot, and which of the app-shaped gates mean anything for a
+buffer no app owns.
+
+**Where the code lives.** `cua-core/src/clipboard.rs` is the one file that
+names `NSPasteboard`, and `cua-core/Cargo.toml` is the one manifest that turns
+on objc2-app-kit's `NSPasteboard` feature — `cua-core` already linked AppKit
+for `NSWorkspace`, so no crate gained a dependency. The module is private to
+the crate, so the only way in from `cua-mcp` is a `Cua` method, which runs it
+on the `cua-native` worker (§4) like every AX call: a `clipboard_set` cannot
+interleave with the `press_key cmd+v` meant to paste it. Mechanism there,
+policy in `safety/clipboard.rs`, the same split as the yield tap.
+
+#### Reading: withheld like a screenshot, and earlier than one
+
+The split above was by what a read *reproduces*. A tree read describes the UI
+around a secret — a secure text field publishes no value to accessibility at
+all. A screenshot reproduces the secret, so it is withheld. The clipboard is the
+screenshot case with nothing to blur: if it holds a password, a read *is* the
+password, as text, in the transcript. So `clipboard_get` falls on the
+photographing side of the line, and the conservative reading wins where the
+evidence is ambiguous. Text is withheld — the call still succeeds, with the
+type list and the reason — when any of these holds, checked in this order:
+
+1. **The writer marked it concealed.** The [nspasteboard.org](http://nspasteboard.org)
+   convention: a password manager that puts a password on the clipboard also
+   puts an `org.nspasteboard.ConcealedType` entry beside it, so that clipboard
+   history tools do not display or record it. 1Password, KeePassXC and others
+   write it. cua-rs reading the clipboard on an agent's behalf is precisely the
+   kind of tool the marker addresses, so honouring it is in scope and costs one
+   string comparison over the type list. Matching is on the whole UTI.
+   **Not lifted by `CUA_ALLOW_FORBIDDEN_TARGETS`**: that flag corrects
+   cua-rs's own classification of *apps*, which the substring rule above can
+   get wrong. The marker is not a cua-rs classification; it is the data's owner
+   saying what the data is, so there is nothing of ours to override.
+2. **A forbidden app wrote it**, per the companion `org.nspasteboard.source`
+   marker (a bundle id), judged by the same `forbidden_bundle` as everything
+   else.
+3. **A forbidden app is frontmost.** The human may have copied a secret out of
+   Keychain Access a second ago. This over-refuses — the clipboard may hold a
+   URL from an hour earlier — and the cost of that is "switch apps and retry",
+   which is the trade §7a makes everywhere.
+
+Rules 2 and 3 are lifted by `CUA_ALLOW_FORBIDDEN_TARGETS=1`, which was always
+"I accept credential exposure from these apps".
+
+Two properties of the order matter. Everything decidable from metadata is
+decided **before any content is read**, so a withheld secret never enters the
+process — the type list and change count are format names and a counter, not
+contents. The source marker is read only when it is present. And the change
+count is compared before and after the text read: if anybody wrote in between,
+the text is something the checks never judged — a password copied in the gap —
+so it is discarded and the call fails with "retry" rather than returning it.
+
+The refusal points at the safe alternative. To move a secret into a field the
+agent does not need to *see* it: `press_key cmd+v` pastes from the clipboard
+into the app without the text passing through the transcript, and that paste is
+an action under all the usual gates.
+
+**What this does not catch, stated plainly.** A secret copied *without* the
+concealed marker, by an app that does not declare a source, after which the
+human switched to an ordinary app — the frontmost test no longer fires and the
+text is returned. Keychain Access is an example of a writer whose markers have
+not been checked. Closing that fully would mean tracking which app was frontmost
+at every change-count bump, which is an observer, and §7a's screen-lock section
+already explains why cua-rs prefers a direct read to an observer. The marker is
+the convention that exists for exactly this case; apps that do not write it are
+not protected by any clipboard tool.
+
+**macOS 26 pasteboard privacy.** A programmatic read of another app's contents
+may now raise a system alert, and the user can set the process (really, the
+responsible host app) to always allow or deny. `clipboard_get` reports
+`NSPasteboard.accessBehavior` (after a `respondsToSelector:` check, since older
+systems lack it) in every answer, so `text: none` under *always deny* is
+labelled as not evidence of an empty clipboard. `clipboard_set` verifies its
+write from the change count and type list rather than reading the text back,
+because that read-back is the one that could prompt.
+
+#### Writing: the session gates only
+
+A write lands in no app. Text reaches an app only through a paste, and when
+cua-rs does the paste it is a `press_key` under every gate. So the app-shaped
+gates have nothing to judge, and each was considered rather than dropped:
+
+- **Scope (`CUA_ALLOWED_APPS`)** — not applied. The scope answers what a run
+  may *drive*; the clipboard is not driven, and refusing every write in a
+  scoped run would make the common "set, then paste into the scoped app" flow
+  impossible in exactly the runs that are most careful.
+- **Forbidden floor** — not applied to writes. Writing or clearing the
+  clipboard while a password manager is frontmost does not act on the password
+  manager; clearing is, if anything, the hygienic move after a secret was
+  copied.
+- **Destructive confirmation** — not applied. Every `clipboard_set` overwrites
+  what was there and every `clipboard_clear` empties it, so a gate would fire
+  on every call. That is the "required parameter, not a gate" failure the
+  destructive section warns about. ⌘C overwrites the clipboard without asking,
+  too; the clipboard is a transient buffer by platform convention.
+- **Screen lock** — applied. Nobody is watching a locked session, and a write
+  is still a change the human did not see happen.
+- **Yield to human** — applied, and *wider* than for actions. The app form
+  fires only when the driven app is frontmost; the clipboard has no app, and it
+  is the one piece of state the human and cua-rs genuinely share, so any real
+  input inside the idle window refuses the write (`Refused::HumanActive`) — the
+  human may be halfway through a copy and paste of their own. Off by default,
+  like the rest of the yield gate; a broken tap fails closed here too.
+
+The residual risk of writes is the agent itself: a prompt-injected agent can put
+a command on the clipboard hoping the human pastes it into a terminal. No gate
+here can tell an honest write from that one; the tool description says the
+write overwrites what the user copied, and the transcript records exactly what
+was written.
+
+#### What was verified on a real machine
+
+macOS 26.2, through the real `cua-rs` binary over stdio, cross-checked with
+`pbpaste`: set (Korean and emoji text, change count bumped, `verified: yes`),
+get, `max_chars` truncation on a character boundary, clear, an image-only
+clipboard (`text: none` with `public.png`, `public.tiff` listed), a string
+written beside `org.nspasteboard.ConcealedType` (withheld), a string whose
+`org.nspasteboard.source` was `com.1password.1password` (withheld) or
+`com.apple.TextEdit` (returned), and Keychain Access frontmost (withheld,
+matched on bundle id although its localized name was 키체인 접근). Access
+behavior read as *always allow* for that host. The screen-lock and yield
+refusals for writes are unit-tested only.
 
 ### Bundle identifiers, not names
 
@@ -1788,6 +1918,98 @@ needed it.
 
 ---
 
+## 10a. A structured error code and delivery disposition, next to the prose
+
+Every `CoreError` and `Refused` variant already carries a careful,
+specific message — that is most of what §1a, §7a and this section's own
+measurements exist to earn. None of that prose is machine-checkable, though,
+and a caller deciding *whether to retry* was left to grep the message for
+words like "stale" or "locked", which breaks the moment the wording improves.
+
+`cua-core::outcome` adds a second, structural axis next to the prose rather
+than replacing it: a closed `ErrorCode` every variant maps to exactly once
+(`ErrorOutcome::classify` has no wildcard arm, so a new `CoreError` variant
+fails to compile here until it is given a code), and a `disposition` saying
+whether the action's input ever reached the target at all.
+
+| `code` | covers |
+|---|:--|
+| `PERM_DENIED` | — (reserved; no `CoreError` variant maps here yet. Permission state is read through `check_permissions`, which reports booleans rather than failing a call) |
+| `APP_NOT_FOUND` | `ResolveError` via `CoreError::Resolve` |
+| `AMBIGUOUS_TARGET` | — (reserved; `resolve_app` and its `ResolveError` do not yet distinguish "found nothing" from "found more than one" at the type level) |
+| `ELEMENT_NOT_FOUND` | `NoElementAtPoint` |
+| `WINDOW_NOT_FOUND` | `NoWindow` |
+| `STALE_REF` | `StaleSnapshot`, `NoSnapshot`, `ProcessReplaced`, `BadIndex`, `TargetChanged`, `TokenRoleMismatch`, `StalePointGeometry`, `StaleCoordinate` |
+| `ACTION_NOT_SUPPORTED` | `KeyNoAccessibilityEquivalent`, `KeyVerbUnsupported` |
+| `ACTION_FAILED` | `PidKeyUnavailable`, `PidClickUnavailable`, `PidClickFailed`, `WindowClickRefused`, `DragRefused`, `PointerEventRefused`, `MenuPath` |
+| `TIMEOUT` | `WindowQueryTimedOut` |
+| `PLATFORM_NOT_SUPPORTED` | — (reserved; nothing in the current enum distinguishes "this macOS version lacks the primitive" from `ACTION_FAILED`'s broader "the platform failed it". A future `cua-hid` capability probe is the natural source) |
+| `INVALID_ARGS` | `KeyChordUnparseable` |
+| `POLICY_DENIED` | every `Refused` variant, plus `FocusMismatch` (a `CUA_KEY_STRICT_FOCUS` refusal, which is a policy choice rather than a platform failure even though it is not one of `safety::Refused`'s own variants) |
+| `INTERNAL` | `Ax`, `Capture`, `WorkerGone`, `NativePanic` |
+
+`PolicyReason` subdivides `POLICY_DENIED` the same way §7a's own table already
+divides the gates — `scope`, `forbidden_target`, `destructive`,
+`screen_locked`, `yield_to_human` — plus `strict_focus` for `FocusMismatch`,
+which the gates table in `safety::destructive` does not list because it is
+not one of the five gates `Refused` enumerates; it is still a refusal reached
+before delivery, so it shares the same code.
+
+### Disposition is derived, not chosen per call site
+
+`retry_safe` is `true` for exactly one `Disposition`: `NotDelivered`. It is
+computed from `disposition`, never set independently, which is the whole
+point — a hand-set `retry_safe` next to a hand-set `disposition` is two facts
+that can quietly drift apart the first time someone edits one and not the
+other.
+
+For an **error**, the classification follows directly from how this project
+already builds its delivery paths (§1a: one mechanism per action, chosen
+once, never "try A and fall back to B"). Every `CoreError` variant above is
+reached either before an event is built at all — a gate, a stale reference,
+an app or window that never resolved — or *as* the delivery mechanism's own
+failure report, which under the one-mechanism rule means nothing reached the
+target. So every error is `NotDelivered` with one deliberate exception:
+`NativePanic`. A panic recovered by the native worker can land on either side
+of the call it interrupted, and this project has no way to ask which — so it
+is reported as `DeliveredUnverified` rather than `NotDelivered`. The direction
+of that choice matters: assuming a panic *might* have landed costs a caller
+nothing extra to find out (re-read the element), while assuming it *never*
+landed and being wrong risks a duplicated action, which is the more expensive
+mistake in this system.
+
+For a **success**, disposition restates `ActionResult::ui_changed` — already
+documented in §10 as a fingerprint heuristic that can false-negative on a real
+change (two untitled sibling text fields, a menu opening as its own window) —
+as the one question a caller actually asks before deciding whether to repeat
+a call: `Observed::Changed` is `DeliveredVerified`; `Unchanged` and `Unknown`
+are both `DeliveredUnverified`, because from the caller's side "looked and saw
+nothing" and "nobody looked" carry the identical practical answer — nothing
+independently confirms the effect, so treat this like any other unconfirmed
+send. Nothing about `ui_changed`'s own heuristic changes; this only gives its
+existing three-way answer a name that lines up with the error side's.
+
+### What is additive, and what deliberately is not
+
+The JSON block carrying `code`/`disposition`/`retry_safe` rides as a *second*
+content block next to every error's original message, and `disposition` rides
+as one more line in `render_action`'s existing text — neither replaces a word
+of the prose DESIGN.md and §7a spent so much care tuning. An agent that only
+ever read the message text continues to get exactly what it got before.
+
+Two codes are reserved rather than wired to anything yet, named in the table
+above rather than left silently absent: `AMBIGUOUS_TARGET` and
+`PLATFORM_NOT_SUPPORTED`. Both describe a real distinction this codebase does
+not currently make at the type level (resolve-found-many vs. resolve-found-
+none; a capability genuinely missing on this macOS version vs. a platform call
+that simply failed). Inventing a `CoreError` variant to populate them now
+would be guessing at a shape before a caller that needs the distinction shows
+up. Leaving the code reserved and undocumented-as-unmapped would be worse: a
+caller matching exhaustively on `ErrorCode` should be able to trust that every
+variant named here is real, even if nothing produces it yet.
+
+---
+
 ## 11. Widening the pid tier, never the shared tier
 
 The gaps in §1's capability table — no chords, no drag, no canvas, one button,
@@ -2578,7 +2800,186 @@ factor of two away is how a slideshow gets shipped.
 
 ---
 
-## 13. Notification Center
+## 13. Window and app management
+
+Ten tools: `list_windows`, `focus_window`, `move_window`, `resize_window`,
+`minimize_window`, `maximize_window`, `restore_window`, `list_displays`,
+`launch_app`, `close_app`. Each one does a single thing through public API, and
+the rules below are why each one stops where it does.
+
+### Raise, never activate
+
+`focus_window` is `AXRaise` on the `AXWindow`, plus `AXMain = true` where the app
+lets that be written. It never calls `NSRunningApplication.activate`, for the
+same reason §6 gives for clicks: activation moves the window server's key focus,
+so the human's next keystroke goes to the agent's app, and if the app's windows
+are on another Space macOS switches Spaces under them. A raise reorders that
+app's windows and nothing else. The window comes forward visually, and the
+keyboard stays wherever the human left it. That is less than the word "focus"
+usually promises, and the tool description says so instead of hiding it. An
+agent that needs a window *key* already has the synthesized-activation path
+behind `click`, which is the measured answer to that question. The `apps::activate`
+diagnostic is still not reachable from any tool.
+
+A minimized window is refused rather than quietly restored, because restoring
+it is a different, visible action and gets a tool of its own.
+
+### Window identity: the §6 pairing, applied to every window at once
+
+`list_windows` enumerates `AXWindows` and pairs each one with a window-server
+window by frame, using the same evidence and tolerance (`AX_WINDOW_MATCH_TOLERANCE`)
+as `window_focus_assist`. `_AXUIElementGetWindow` is still never called. The
+pairing is greedy on distance, and each server window can be claimed only once,
+so two AX windows can never report the same `window_id`. If they could,
+`focus_window` by id could raise the wrong window. A window that cannot be paired
+within tolerance gets no id rather than the nearest one. Selecting by id
+re-runs that same pairing live, so `list_windows` and every window tool always
+agree on which window an id names.
+
+Ids come from ScreenCaptureKit, so they need Screen Recording. Without it,
+`list_windows` still lists every window with no ids, and a window is addressed
+by exact title. If two windows share a title, the title is refused rather than
+resolved by guessing. With neither, the tools act on the focused window, then
+the main window. Windows the server reports and accessibility does not list,
+most often on another Space, are listed as `not manageable`. §9 keeps off-Space
+windows observation-only, and leaving them out would understate how many
+windows the app has.
+
+### Geometry is checked against displays and read back
+
+`move_window` and `resize_window` write `AXPosition`/`AXSize`. Both refuse a
+target frame that leaves less than 40 points on every active display, measured
+per display rather than across their union. The bar is not "any overlap":
+one point on screen exists in the strict sense and is lost in every practical
+one, because a human can no longer grab the title bar. 40 is the side length the
+rest of cua-rs already treats as the smallest addressable window, and it shrinks
+for a window smaller than that. Displays come from `CGGetActiveDisplayList`/
+`CGDisplayBounds`. These are public calls, need no grant, and use the same
+top-left-origin global points as AX, so no conversion is needed. They live in
+`cua-capture`, which already owns the window server's view of the screen, so
+`cua-core`'s CoreGraphics surface stays at the single `CGSession` read its
+manifest promises.
+
+Every window tool reads the window back afterwards and reports before and after.
+Apps clamp frames, enforce minimum sizes and round to their own grids. An agent
+told "moved to 5000,0" when the app kept it at 1200,0 would place the next
+window wrongly.
+
+### Maximize prefers the app's own zoom
+
+`maximize_window` presses the window's `AXZoomButton` (`AXPress`). That is the
+app's native zoom, the green button's non-full-screen behaviour, so the app
+decides what "big enough" means for its own content. It is not full screen and
+creates no Space. When a window has no zoom button (panels, utility windows,
+custom title bars), the fallback writes position and size to the bounds of the
+display the window is mostly on, and the response says the fallback ran. It
+uses the display's bounds rather than its visible frame because
+`NSScreen.visibleFrame` is main-thread-only and every cua-rs native call runs on
+`cua-native` (§4). AppKit apps keep their own windows below the menu bar, and
+the readback shows what the app kept.
+
+The pre-maximize frame is remembered per AX window (`CFEqual`, so it works
+without an id), with a cap of 64 entries. `restore_window` uses it, and a second
+`maximize_window` on a window it already maximized does nothing, because the
+zoom button toggles and pressing it again would *un*-maximize. A window someone
+zoomed by hand has no remembered frame, and `restore_window` reports "nothing to
+restore" instead of pressing a toggle whose state it cannot read.
+`restore_window` otherwise undoes the most recent departure from normal:
+minimized first, then full screen, then the remembered frame.
+
+### Every window tool is an action, gated as one
+
+All six go through `Inner::acting` with `Gate::elementless(<tool name>)`, the
+same entry point as `click`: scope, forbidden target, screen lock and yield to
+human, in that order. There is no destructive-label gate, because there is no
+label, and no window operation removes anything: each one is undone by another.
+A successful window tool also marks the app's snapshot `acted_on`, because a
+moved window invalidates every coordinate read from the old frame.
+
+### `launch_app`: gated before the process exists, not activated by default
+
+The app is not running yet, so there is no `AppInfo` to gate. `launch_app`
+reads the bundle id out of the `.app` it located and calls `guard` with a
+synthetic `AppInfo` (pid −1). The gates only read the bundle id, the name and
+session-wide state, so this is exactly as strict as a real one. An app outside
+`CUA_ALLOWED_APPS`, or on the forbidden list, is refused *before it starts*.
+Starting it and then refusing to drive it would be the gate failing open by one
+step. Lookup is stricter than `resolve_app`: an exact bundle id, `<name>.app` in
+the standard Applications folders, or a path. There is no substring tier,
+because nobody intends "launch whichever app contains `note`".
+
+Launch uses `openApplicationAtURL:configuration:completionHandler:` with
+`activates = false` unless the caller passes `activate: true`. Activation stays
+available as an explicit opt-in, not removed, because "open TextEdit for me" is a
+legitimate request whose whole point is the human seeing it. The default is the
+side that cannot interrupt anyone. `promptsUserIfNeeded = false`, so a
+quarantined app fails with LaunchServices' error instead of raising a dialog the
+agent cannot see in front of the human. An app that is already running is
+reported and left alone. Opening it again sends a reopen event, which in many
+apps creates a window.
+
+**`NSWorkspace.runningApplications` is stale in this process, and this was
+measured.** The list is maintained by notifications on the *main* run loop. The
+cua-rs main thread is the tokio runtime and never runs one. A Calculator launched
+after the first read stayed absent on every thread until the main run loop was
+spun, while `runningApplicationWithProcessIdentifier` found it immediately.
+Before this change, any app started after the server (by the human, or now by
+`launch_app`) could not be resolved by name for the life of the server.
+`resolve_app` now retries on a miss against `list_apps_fresh`, which keeps the
+cached list's entries, drops the ones whose process has exited, and looks up
+every other pid from `proc_listallpids` directly. A full pass measured 15–35 ms
+over ~700 pids, so only a miss pays for it. Running a main run loop would have
+been the other fix. It was declined because it changes the threading model §4
+is built on, to repair one cache.
+
+### `close_app`: graceful, confirmed every time, never the session
+
+`NSRunningApplication.terminate` sends the quit Apple event, so the app runs its
+normal shutdown, including its own "save changes?" sheet. `forceTerminate` is
+not reachable from any tool, because a forced quit discards unsaved work by
+definition. Exit is detected with `kill(pid, 0)` plus the process start time,
+not `isTerminated`, which is stale for the same run-loop reason. A quit that is
+delivered but not finished within 3 s is reported as "still running, probably
+asking about unsaved changes", which is true and tells the agent to look next.
+
+`confirm_destructive: true` is required unconditionally, not only when a label
+matches. There is no label: the quit is the destructive part, and no app
+guarantees it will ask before discarding anything. The refusal is its own
+variant (`QuitNeedsConfirmation`), so it cannot claim a control "reads as
+destructive".
+
+Some processes are refused whatever the flags, by bundle id: Finder, Dock,
+SystemUIServer, Control Center, Notification Center, Window Manager (Stage
+Manager), loginwindow, WindowServer. WindowServer and loginwindow are also
+matched by name when no bundle id is published. A bundled app that merely calls
+itself `loginwindow` is judged by its id, not its name. The criterion is
+"quitting it breaks or visibly resets the session", not "Apple ships it". launchd
+relaunches the shell processes the moment they exit, so a quit is never what it
+looks like: the desktop flashes, menu-bar extras reset, and the agent reports
+success for an action whose only effect was disruption. loginwindow and
+WindowServer end the session outright. Two pids are also protected: cua-rs's own
+process, and its parent (the terminal or agent app that launched it). Quitting
+either ends the conversation that asked for it. This list is kept apart from the
+forbidden-target list on purpose. That list is liftable by the operator and is
+about what may be *driven*. Dock is safe to click and never safe to quit, and
+folding the two together would get one of those wrong. The order is gates first
+(lock, forbidden, scope, yield), then protected, then confirmation, because a
+confirmation cannot make quitting Dock acceptable.
+
+### What was verified where
+
+On macOS 26.2, from an SSH session with neither grant: `list_displays`,
+`launch_app` (not activated, then "already running"), `close_app` (refused
+without confirmation, refused on Dock, then a real graceful quit detected in
+~110 ms), and the stale-`runningApplications` finding above. The AX-backed
+window tools are unit-tested on their pure policy (pairing, visibility,
+display choice, remembered frames, change detection) and compile against the
+real attributes. They have not been driven against a live window with
+Accessibility granted.
+
+---
+
+## 14. Notification Center
 
 `list_notifications`, `dismiss_notification`, `dismiss_all_notifications` and
 `notification_action` exist because a notification is the one piece of UI an

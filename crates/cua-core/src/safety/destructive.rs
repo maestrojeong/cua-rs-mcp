@@ -243,6 +243,53 @@ pub enum Refused {
         bundle_id: String,
         allowed: String,
     },
+    /// The session-wide form of [`Refused::HumanTookOver`], for a write that
+    /// lands in no app — the clipboard.
+    ///
+    /// No frontmost-app test here, unlike the app form: the clipboard is shared
+    /// by every app, so real input anywhere may be the human in the middle of a
+    /// copy and paste that this write would clobber.
+    #[error(
+        "refusing to {verb}: real input arrived {ago_ms}ms ago and the clipboard is shared with \
+         the human, who may be in the middle of their own copy and paste. CUA_YIELD_TO_HUMAN=1 \
+         tells cua-rs not to overwrite it while they are active. Retry once they have been idle \
+         for {idle_ms}ms, or unset CUA_YIELD_TO_HUMAN"
+    )]
+    HumanActive {
+        verb: &'static str,
+        ago_ms: u64,
+        idle_ms: u64,
+    },
+    /// The app is one the login session cannot run without.
+    ///
+    /// Not clearable by any flag, unlike [`Refused::ForbiddenTarget`]: quitting
+    /// Dock or loginwindow is not a credential risk that an operator might
+    /// knowingly accept, it is the desktop disappearing under the human. See
+    /// [`protected_process`] for the list and why each entry is on it.
+    #[error(
+        "refusing to {verb} `{app}`: it {why}. Quitting it would take part of the login session \
+         down with it (or relaunch it underneath the user), so cua-rs never does, whatever the \
+         flags. Close individual windows of it instead, or ask the human to do this themselves"
+    )]
+    ProtectedProcess {
+        verb: &'static str,
+        app: String,
+        why: &'static str,
+    },
+
+    /// `close_app` without `confirm_destructive: true`.
+    ///
+    /// Unconditional, unlike the label gate, which only fires on a label that
+    /// reads as destructive. There is no label to read here: quitting is the
+    /// action, and a quit can discard unsaved work in any app — the app may ask
+    /// first, but nothing guarantees it does.
+    #[error(
+        "refusing to quit `{app}` without confirmation. Quitting an app can discard unsaved work \
+         and always ends whatever it was doing, so close_app needs confirm_destructive: true on \
+         this same call, every time. The quit is graceful — the app may still put up its own \
+         save prompt, which get_app_state will then show"
+    )]
+    QuitNeedsConfirmation { app: String },
 }
 
 #[path = "apps.rs"]
@@ -941,6 +988,10 @@ pub fn key_activates_default_button(key: &str) -> bool {
     )
 }
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::*;
+
 #[path = "runtime.rs"]
 mod runtime;
 pub use runtime::*;
@@ -952,6 +1003,9 @@ pub use gate::*;
 #[path = "notification_source.rs"]
 mod notification_source;
 pub use notification_source::*;
+#[path = "clipboard.rs"]
+mod clipboard_policy;
+pub(crate) use clipboard_policy::*;
 
 #[cfg(test)]
 include!("tests.rs");

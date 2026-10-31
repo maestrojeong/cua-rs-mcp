@@ -4,7 +4,10 @@
 //!
 //! The tool names here (`list_apps`, `get_app_state`, `click`, `type_text`,
 //! `press_key`, `scroll`, `drag`, `hover`, `set_value`, `select_text`,
-//! `perform_secondary_action`) deliberately match the vocabulary that has become
+//! `perform_secondary_action`, and the window tools `list_windows`,
+//! `focus_window`, `move_window`, `resize_window`, `minimize_window`,
+//! `maximize_window`, `restore_window`, `list_displays`, `launch_app`,
+//! `close_app`) deliberately match the vocabulary that has become
 //! de-facto standard for this capability on macOS, which models have already
 //! seen. Inventing a prefixed dialect would buy nothing and cost recognition.
 //!
@@ -21,7 +24,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use cua_core::{
-    Cua, MouseOptions, PointerLocation, Presence, ScrollAmount, ScrollDir, StateOptions, Target,
+    disposition_of, CoreError, Cua, ErrorOutcome, MouseOptions, PointerLocation, Presence,
+    ScrollAmount, ScrollDir, StateOptions, Target,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -40,6 +44,25 @@ fn ok(s: impl Into<String>) -> CallToolResult {
 
 fn fail(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
+}
+
+/// Build an error `CallToolResult` from a [`CoreError`], carrying the same
+/// human-readable message every call site already printed via `e.to_string()`
+/// as a first block, plus a second block with the structured
+/// [`cua_core::ErrorOutcome`] (code, policy reason, disposition, retry_safe)
+/// as JSON.
+///
+/// Additive on purpose: the first block is unchanged from the old `fail(e.to_string())`
+/// so nothing that already reads the message text breaks, and the second block
+/// is new structure a caller can parse instead of re-deriving it from prose.
+fn fail_core(e: &CoreError) -> CallToolResult {
+    let outcome = ErrorOutcome::classify(e);
+    let structured =
+        serde_json::to_string(&outcome).unwrap_or_else(|_| r#"{"code":"INTERNAL"}"#.to_string());
+    CallToolResult::error(vec![
+        ContentBlock::text(e.to_string()),
+        ContentBlock::text(structured),
+    ])
 }
 
 // ── arguments ────────────────────────────────────────────────────────────────
@@ -670,6 +693,98 @@ struct WaitForArgs {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClipboardGetArgs {
+    /// Return at most this many characters of text; the total is always
+    /// reported. Defaults to 20000, capped at 200000.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClipboardSetArgs {
+    /// Plain text to put on the clipboard. Replaces everything on it.
+    text: String,
+}
+/// Which window a window tool acts on. Shared so every window tool names a
+/// window the same way.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WindowTargetArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    /// The `window_id` list_windows reports. Preferred: an id names exactly one
+    /// window, where a title can be shared. Needs Screen Recording; without it
+    /// list_windows reports no ids and window_title is the way to name one.
+    #[serde(default)]
+    window_id: Option<u32>,
+    /// The window's exact title, as list_windows shows it. Refused when two
+    /// windows share it. Ignored when window_id is given. Omit both to act on
+    /// the app's focused window (or its main window when none is focused).
+    #[serde(default)]
+    window_title: Option<String>,
+}
+
+impl WindowTargetArgs {
+    fn selector(&self) -> cua_core::WindowSelector {
+        cua_core::WindowSelector {
+            window_id: self.window_id,
+            title: self.window_title.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListWindowsArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveWindowArgs {
+    #[serde(flatten)]
+    window: WindowTargetArgs,
+    /// New left edge, in global screen POINTS (the space list_displays reports;
+    /// the main display's top-left corner is 0,0, and a display to its left has
+    /// negative x).
+    x: f64,
+    /// New top edge, in global screen POINTS, measured downward.
+    y: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResizeWindowArgs {
+    #[serde(flatten)]
+    window: WindowTargetArgs,
+    /// New width in POINTS. The top-left corner stays where it is.
+    width: f64,
+    /// New height in POINTS.
+    height: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LaunchAppArgs {
+    /// Bundle identifier (`com.apple.TextEdit`, exact), app name looked up in
+    /// the standard Applications folders (`TextEdit`), or a path to the .app.
+    app: String,
+    /// Bring the launched app to the front. OFF by default, and leave it off
+    /// unless the user asked to see the app: activation takes keyboard focus
+    /// away from whatever the human is typing into, and may switch Spaces. The
+    /// window tools and every action work on a background app.
+    #[serde(default)]
+    activate: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CloseAppArgs {
+    /// App name, bundle identifier, or bundle path of a running app.
+    app: String,
+    /// Must be true. Quitting can discard unsaved work, so close_app refuses
+    /// every call without it — there is no label to judge here, the quit
+    /// itself is the destructive part.
+    #[serde(default)]
+    confirm_destructive: bool,
+}
+
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -729,7 +844,7 @@ impl CuaServer {
                 }
                 Ok(ok(lines.join("\n")))
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -753,7 +868,7 @@ impl CuaServer {
                 out.push_str("\n* = frontmost");
                 Ok(ok(out))
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -793,7 +908,7 @@ impl CuaServer {
         let app = a.app.clone();
         let state = match self.native(move |c| c.get_app_state(&app, opts)).await {
             Ok(s) => s,
-            Err(e) => return Ok(fail(e.to_string())),
+            Err(e) => return Ok(fail_core(&e)),
         };
 
         let mut header = format!(
@@ -884,7 +999,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -912,7 +1027,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -939,7 +1054,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -967,7 +1082,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -990,7 +1105,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1029,7 +1144,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1057,7 +1172,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1080,7 +1195,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1104,7 +1219,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1124,12 +1239,12 @@ impl CuaServer {
                 .await
             {
                 Ok(r) => Ok(ok(render_action(&r))),
-                Err(e) => Ok(fail(e.to_string())),
+                Err(e) => Ok(fail_core(&e)),
             };
         }
         match self.native(move |c| c.menu_bar(&app, &path)).await {
             Ok(listing) => Ok(ok(render_menu(&listing))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1240,7 +1355,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1267,6 +1382,43 @@ impl CuaServer {
                     r.lines.join("\n")
                 )))
             }
+            Err(e) => Ok(fail_core(&e)),
+        }
+    }
+
+    #[tool(
+        description = "Read the clipboard's plain text. Not tied to any app and changes nothing. When the clipboard holds no text (an image, a file list, nothing at all) this succeeds with `text: none` and lists `available_types` instead of failing. SAFETY: text that may be a secret is withheld and only the type list is returned — when the writer marked it concealed (org.nspasteboard.ConcealedType, which password managers set), when it was written by a credential or security app, or when such an app is frontmost. To move withheld text into a field, paste it with press_key cmd+v instead of reading it. On macOS 26 the system may ask the user before letting this process read the clipboard; `access` reports that setting."
+    )]
+    async fn clipboard_get(
+        &self,
+        Parameters(a): Parameters<ClipboardGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let max = a.max_chars.unwrap_or(20_000).clamp(1, 200_000);
+        match self.native(|c| c.clipboard_get()).await {
+            Ok(r) => Ok(ok(render_clipboard_read(&r, max))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Replace the clipboard with plain text. Typical use: clipboard_set, then press_key cmd+v on the target field to paste it — the paste is the action, and it is gated like any other. Not tied to any app, so the per-app gates do not apply; nothing is written while the session is locked, and with CUA_YIELD_TO_HUMAN=1 nothing is written while the human is actively using the machine. Overwrites whatever the user had copied."
+    )]
+    async fn clipboard_set(
+        &self,
+        Parameters(a): Parameters<ClipboardSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.native(move |c| c.clipboard_set(&a.text)).await {
+            Ok(w) => Ok(ok(render_clipboard_write(&w))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Empty the clipboard. Gated like clipboard_set: refused while the session is locked, and with CUA_YIELD_TO_HUMAN=1 while the human is active."
+    )]
+    async fn clipboard_clear(&self) -> Result<CallToolResult, McpError> {
+        match self.native(|c| c.clipboard_clear()).await {
+            Ok(w) => Ok(ok(render_clipboard_write(&w))),
             Err(e) => Ok(fail(e.to_string())),
         }
     }
@@ -1313,8 +1465,292 @@ impl CuaServer {
                     Ok(fail(body))
                 }
             }
+            Err(e) => Ok(fail_core(&e)),
+        }
+    }
+
+    #[tool(
+        description = "List every window of one app: window_id, title, frame (x,y,w,h in global screen points), window level, and whether it is minimized, full screen, the app's main window and its focused window. Windows are listed front to back as accessibility orders them; windows the window server knows about but accessibility does not list (usually on another Space) come last, marked `not manageable`. window_id is the window server's CGWindowID, matched to the accessibility window by frame through public API only — it needs Screen Recording, and a window that cannot be paired unambiguously gets no id rather than a guessed one. Read-only: nothing is raised or activated."
+    )]
+    async fn list_windows(
+        &self,
+        Parameters(a): Parameters<ListWindowsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        match self.native(move |c| c.list_windows(&app)).await {
+            Ok(listing) => Ok(ok(render_window_listing(&listing))),
             Err(e) => Ok(fail(e.to_string())),
         }
+    }
+
+    #[tool(
+        description = "Raise one window to the front of its app's windows with the accessibility AXRaise action, and make it the app's main window where the app allows. It does NOT activate the app: the frontmost app, keyboard focus and Space stay exactly as the human left them, so the window comes forward visually without taking their typing. Use it before reading a window that another window of the same app covers. A minimized window is refused — call restore_window. Gated like every action (CUA_ALLOWED_APPS scope, forbidden apps, screen lock, yield to human)."
+    )]
+    async fn focus_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Focus).await
+    }
+
+    #[tool(
+        description = "Move a window so its top-left corner is at x,y in global screen POINTS (see list_displays for each display's bounds), by writing its AXPosition attribute — no drag, no cursor movement, no activation. Refused when less than 40 points of the window would land on any active display, because a window placed off screen cannot be recovered by the human. The response reads the frame back from the app, which may clamp it."
+    )]
+    async fn move_window(
+        &self,
+        Parameters(a): Parameters<MoveWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a.window, cua_core::WindowOp::Move { x: a.x, y: a.y })
+            .await
+    }
+
+    #[tool(
+        description = "Resize a window to width x height POINTS, keeping its top-left corner fixed, by writing its AXSize attribute. Refused when the result would leave less than 40 points on any active display. Apps enforce their own minimum and maximum sizes; the response reads back the size the app actually kept."
+    )]
+    async fn resize_window(
+        &self,
+        Parameters(a): Parameters<ResizeWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(
+            a.window,
+            cua_core::WindowOp::Resize {
+                width: a.width,
+                height: a.height,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Minimize a window to the Dock by setting its AXMinimized attribute. Already-minimized is reported, not an error. Undo with restore_window."
+    )]
+    async fn minimize_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Minimize).await
+    }
+
+    #[tool(
+        description = "Maximize a window. Presses the window's own zoom button through accessibility (AXZoomButton, AXPress) when it has one — the app's native zoom, which fits the window to its content or the screen as the app decides; it is NOT full screen and does not create a Space. A window with no zoom button (panels, custom title bars) is instead sized to the bounds of the display it is mostly on, and the response says so. The frame from before is remembered so restore_window can return to it; calling maximize_window again on a window it already maximized is a no-op, because the zoom button toggles."
+    )]
+    async fn maximize_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Maximize).await
+    }
+
+    #[tool(
+        description = "Undo the last thing that took a window out of its normal state, in this order: un-minimize it (AXMinimized=false) if minimized; otherwise leave full screen (AXFullScreen=false) if in full screen; otherwise put back the frame it had before maximize_window. Anything else is reported as nothing to restore."
+    )]
+    async fn restore_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Restore).await
+    }
+
+    #[tool(
+        description = "List the active displays: display id, bounds in global screen POINTS (the coordinate space move_window and list_windows use; the main display's top-left is 0,0), pixels per point, and which one is main. Needs no permission."
+    )]
+    async fn list_displays(&self) -> Result<CallToolResult, McpError> {
+        match self.native(|c| c.list_displays()).await {
+            Ok(displays) => Ok(ok(render_displays(&displays))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Launch an installed app through NSWorkspace, by bundle identifier (exact), app name (looked up in /Applications, /System/Applications and ~/Applications), or path to the .app. By DEFAULT IT IS NOT ACTIVATED: it starts behind whatever the human is using, which is enough for get_app_state and every action. Pass activate=true only when the user wants to see the app, since activation takes their keyboard focus. Launching an app that is already running does nothing and says so. Gated like every action: CUA_ALLOWED_APPS scope (an app outside it is refused before it starts), the forbidden-app list, and the screen lock. System prompts for quarantined apps are suppressed; such a launch fails instead of putting a dialog in front of the human."
+    )]
+    async fn launch_app(
+        &self,
+        Parameters(a): Parameters<LaunchAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let activate = a.activate;
+        match self.native(move |c| c.launch_app(&app, activate)).await {
+            Ok(r) => Ok(ok(render_launch(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Quit a running app gracefully — the same quit request its own Quit menu item sends, never a force quit. The app may ask about unsaved changes and stay open; the response says whether the process actually exited within 3 seconds, and get_app_state then shows any save prompt. REQUIRES confirm_destructive=true on every call, because quitting can discard work. Session-critical processes are always refused whatever the flags: Finder, Dock, SystemUIServer, Control Center, Notification Center, Window Manager, loginwindow, WindowServer, plus this server's own process and the app that launched it. Gated like every action (scope, forbidden apps, screen lock, yield to human)."
+    )]
+    async fn close_app(
+        &self,
+        Parameters(a): Parameters<CloseAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let confirm = a.confirm_destructive;
+        match self.native(move |c| c.close_app(&app, confirm)).await {
+            Ok(r) => Ok(ok(render_close(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+}
+
+impl CuaServer {
+    /// Every window-changing tool is this with a different [`cua_core::WindowOp`].
+    async fn window_op(
+        &self,
+        a: WindowTargetArgs,
+        op: cua_core::WindowOp,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let sel = a.selector();
+        match self.native(move |c| c.window_action(&app, sel, op)).await {
+            Ok(r) => Ok(ok(render_window_outcome(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+}
+
+fn render_frame(f: &cua_core::CGRect) -> String {
+    format!(
+        "{:.0},{:.0} {:.0}x{:.0}",
+        f.origin.x, f.origin.y, f.size.width, f.size.height
+    )
+}
+
+/// One window per line, flags inline, so the exact id or title to pass back is
+/// at the start of the line a model reads.
+fn render_window(w: &cua_core::WindowSummary) -> String {
+    let mut line = match w.window_id {
+        Some(id) => format!("window_id={id}"),
+        None => "window_id=-".to_string(),
+    };
+    line.push_str(&format!(
+        "  {:?}",
+        w.title.as_deref().unwrap_or("(untitled)")
+    ));
+    match &w.frame {
+        Some(f) => line.push_str(&format!("  at {}", render_frame(f))),
+        None => line.push_str("  (no frame)"),
+    }
+    if let Some(level) = w.level {
+        line.push_str(&format!("  level={level}"));
+    }
+    if let Some(sub) = &w.subrole {
+        line.push_str(&format!("  {sub}"));
+    }
+    let flags: Vec<&str> = [
+        (w.focused, "focused"),
+        (w.main, "main"),
+        (w.minimized, "minimized"),
+        (w.full_screen, "full screen"),
+        (w.on_screen == Some(false) && !w.minimized, "off screen"),
+        (
+            !w.manageable,
+            "not manageable: accessibility does not list it (another Space?)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, label)| on.then_some(label))
+    .collect();
+    if !flags.is_empty() {
+        line.push_str(&format!("  ({})", flags.join(", ")));
+    }
+    line
+}
+
+fn render_window_listing(listing: &cua_core::WindowListing) -> String {
+    let mut out = format!(
+        "{} (pid {}), {} windows, front to back\n",
+        listing.app.name,
+        listing.app.pid,
+        listing.windows.len()
+    );
+    for w in &listing.windows {
+        out.push_str("  ");
+        out.push_str(&render_window(w));
+        out.push('\n');
+    }
+    for warning in &listing.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    out
+}
+
+/// What a window tool did, then the window as the app reports it afterwards.
+fn render_window_outcome(r: &cua_core::WindowOutcome) -> String {
+    let mut out = format!(
+        "{} on {}\ndelivery: {}  (accessibility attribute/action on the window: cursor, keyboard focus and frontmost app untouched)\nchanged: {}\nbefore: {}\nafter:  {}",
+        r.action.verb,
+        r.action.target,
+        r.action.delivery.as_str(),
+        r.action.ui_changed.as_str(),
+        render_window(&r.before),
+        render_window(&r.after),
+    );
+    if let Some(note) = &r.note {
+        out.push_str(&format!("\nnote: {note}"));
+    }
+    out.push_str(
+        "\nThe app's element tree was not re-read; call get_app_state before acting on \
+         coordinates in this window, since its geometry may have changed.",
+    );
+    out
+}
+
+fn render_displays(displays: &[cua_core::DisplayInfo]) -> String {
+    let mut out = format!("{} active displays (global points)\n", displays.len());
+    for d in displays {
+        out.push_str(&format!(
+            "  display_id={}  at {}  {:.1} px per point{}\n",
+            d.id,
+            render_frame(&d.frame),
+            d.scale,
+            if d.main { "  (main)" } else { "" }
+        ));
+    }
+    out
+}
+
+fn render_launch(r: &cua_core::LaunchOutcome) -> String {
+    let head = if r.already_running {
+        format!(
+            "{} was already running (pid {}); nothing was launched or activated",
+            r.app.name, r.app.pid
+        )
+    } else {
+        format!(
+            "launched {} (pid {}) from {}",
+            r.app.name, r.app.pid, r.path
+        )
+    };
+    let front = match (r.frontmost, r.activate_requested) {
+        (true, true) => "frontmost: yes (activation was requested)",
+        (true, false) => {
+            "frontmost: yes — it came forward on its own although activation was not requested"
+        }
+        (false, true) => {
+            "frontmost: not yet (activation was requested; it may still be coming forward)"
+        }
+        (false, false) => "frontmost: no (not activated; the human's focus is unchanged)",
+    };
+    format!(
+        "{head}\nbundle_id: {}\n{front}\nIts windows may take a moment to appear; call list_windows or get_app_state next.",
+        r.app.bundle_id.as_deref().unwrap_or("-")
+    )
+}
+
+fn render_close(r: &cua_core::CloseOutcome) -> String {
+    if r.quit {
+        format!(
+            "{} (pid {}) quit after {}ms",
+            r.app.name, r.app.pid, r.waited_ms
+        )
+    } else {
+        format!(
+            "asked {} (pid {}) to quit, and it is still running after {}ms. It is most likely \
+             asking about unsaved changes: call get_app_state to see the prompt, and answer it \
+             (Save, or Don't Save with confirm_destructive) to finish quitting. cua-rs never \
+             force-quits.",
+            r.app.name, r.app.pid, r.waited_ms
+        )
     }
 }
 
@@ -1361,6 +1797,69 @@ fn render_popups(popups: &[cua_core::TransientWindow]) -> String {
     s
 }
 
+/// Render a clipboard read.
+///
+/// The type list is printed in every branch: for `none` it is the answer to
+/// "what is there instead", and for a withheld read it is what makes the
+/// refusal checkable.
+fn render_clipboard_read(r: &cua_core::ClipboardRead, max_chars: usize) -> String {
+    let mut s = String::new();
+    match &r.contents {
+        cua_core::ClipboardContents::Text(text) => {
+            let total = text.chars().count();
+            if total > max_chars {
+                let cut: String = text.chars().take(max_chars).collect();
+                s.push_str(&format!(
+                    "text: {total} chars, showing the first {max_chars} (raise max_chars for more)\n{cut}\n"
+                ));
+            } else {
+                s.push_str(&format!("text: {total} chars\n{text}\n"));
+            }
+        }
+        cua_core::ClipboardContents::NoText => {
+            s.push_str("text: none (the clipboard holds no plain text)\n");
+            if r.access == cua_core::ClipboardAccess::AlwaysDeny {
+                s.push_str(
+                    "  macOS is set to DENY this process clipboard access, so this does not mean the clipboard is empty. The user can change it in System Settings > Privacy & Security > Paste from Other Apps\n",
+                );
+            }
+        }
+        cua_core::ClipboardContents::Withheld(reason) => {
+            s.push_str(&format!("text: withheld\n  {reason}\n"));
+        }
+    }
+    s.push_str(&format!("available_types: {}\n", render_types(&r.types)));
+    s.push_str(&format!("change_count: {}\n", r.change_count));
+    s.push_str(&format!("access: {}", r.access.as_str()));
+    s
+}
+
+fn render_types(types: &[String]) -> String {
+    if types.is_empty() {
+        "(none — the clipboard is empty)".to_string()
+    } else {
+        types.join(", ")
+    }
+}
+
+fn render_clipboard_write(w: &cua_core::ClipboardWrite) -> String {
+    let what = if w.verb == "clipboard_clear" {
+        "cleared the clipboard".to_string()
+    } else {
+        format!("wrote {} chars of plain text to the clipboard", w.chars)
+    };
+    format!(
+        "{}: {what}\nchange_count: {}\nverified: {}",
+        w.verb,
+        w.change_count,
+        if w.verified {
+            "yes (metadata re-read matches: no other writer in between)"
+        } else {
+            "NO (the clipboard's metadata does not match the write — another app may have written in between; call clipboard_get to see what is there)"
+        }
+    )
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "granted"
@@ -1399,6 +1898,15 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         },
         r.ui_changed.as_str(),
     );
+    // `disposition` restates `delivery` + `ui_changed` as the one thing most
+    // callers actually need before deciding whether to retry: did the input
+    // land, and is that landing confirmed. It is derived, never independent —
+    // see `cua_core::outcome` — so it can never disagree with the two lines
+    // above it; it exists to save a caller from re-deriving the same rule.
+    s.push_str(&format!(
+        "\ndisposition: {}",
+        disposition_of(r.ui_changed).as_str()
+    ));
     // The advice attached to `ui_changed` all ends in "go and look" — which is
     // wrong to print when the section below *is* the result of having looked.
     // Two answers to the same question, one hedged and one measured, read as a
@@ -1864,5 +2372,79 @@ mod tests {
         assert!(out.contains("STOPPED on BB"));
         assert!(out.contains("refused"));
         assert!(out.contains("3 notification(s) remain"));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_render_tests {
+    use super::*;
+    use cua_core::{ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite};
+
+    fn read(contents: ClipboardContents, types: &[&str], access: ClipboardAccess) -> ClipboardRead {
+        ClipboardRead {
+            contents,
+            types: types.iter().map(|t| t.to_string()).collect(),
+            change_count: 7,
+            access,
+        }
+    }
+
+    #[test]
+    fn no_text_is_a_success_that_lists_the_types() {
+        let r = read(
+            ClipboardContents::NoText,
+            &["public.png", "public.tiff"],
+            ClipboardAccess::AlwaysAllow,
+        );
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("text: none"));
+        assert!(s.contains("available_types: public.png, public.tiff"));
+        assert!(!s.contains("DENY"));
+    }
+
+    #[test]
+    fn no_text_under_always_deny_says_it_is_not_evidence_of_empty() {
+        let r = read(ClipboardContents::NoText, &[], ClipboardAccess::AlwaysDeny);
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("does not mean the clipboard is empty"));
+        assert!(s.contains("(none — the clipboard is empty)"));
+    }
+
+    #[test]
+    fn long_text_is_cut_on_a_character_boundary_and_the_total_reported() {
+        let r = read(
+            ClipboardContents::Text("안녕하세요 world".to_string()),
+            &["public.utf8-plain-text"],
+            ClipboardAccess::NotApplicable,
+        );
+        let s = render_clipboard_read(&r, 3);
+        assert!(s.contains("text: 11 chars, showing the first 3"));
+        assert!(s.contains("\n안녕하\n"));
+    }
+
+    #[test]
+    fn a_withheld_read_prints_the_reason_and_never_the_text() {
+        let r = read(
+            ClipboardContents::Withheld("marked as a secret".to_string()),
+            &["org.nspasteboard.ConcealedType", "public.utf8-plain-text"],
+            ClipboardAccess::Default,
+        );
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("text: withheld"));
+        assert!(s.contains("marked as a secret"));
+        assert!(s.contains("org.nspasteboard.ConcealedType"));
+    }
+
+    #[test]
+    fn an_unverified_write_says_so() {
+        let w = ClipboardWrite {
+            verb: "clipboard_set",
+            change_count: 9,
+            chars: 5,
+            verified: false,
+        };
+        let s = render_clipboard_write(&w);
+        assert!(s.contains("wrote 5 chars"));
+        assert!(s.contains("verified: NO"));
     }
 }
