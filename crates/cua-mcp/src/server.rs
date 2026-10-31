@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use cua_core::{
-    Cua, MouseOptions, PointerLocation, Presence, ScrollAmount, ScrollDir, StateOptions, Target,
+    disposition_of, CoreError, Cua, ErrorOutcome, MouseOptions, PointerLocation, Presence,
+    ScrollAmount, ScrollDir, StateOptions, Target,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -40,6 +41,25 @@ fn ok(s: impl Into<String>) -> CallToolResult {
 
 fn fail(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
+}
+
+/// Build an error `CallToolResult` from a [`CoreError`], carrying the same
+/// human-readable message every call site already printed via `e.to_string()`
+/// as a first block, plus a second block with the structured
+/// [`cua_core::ErrorOutcome`] (code, policy reason, disposition, retry_safe)
+/// as JSON.
+///
+/// Additive on purpose: the first block is unchanged from the old `fail(e.to_string())`
+/// so nothing that already reads the message text breaks, and the second block
+/// is new structure a caller can parse instead of re-deriving it from prose.
+fn fail_core(e: &CoreError) -> CallToolResult {
+    let outcome = ErrorOutcome::classify(e);
+    let structured =
+        serde_json::to_string(&outcome).unwrap_or_else(|_| r#"{"code":"INTERNAL"}"#.to_string());
+    CallToolResult::error(vec![
+        ContentBlock::text(e.to_string()),
+        ContentBlock::text(structured),
+    ])
 }
 
 // ── arguments ────────────────────────────────────────────────────────────────
@@ -661,7 +681,7 @@ impl CuaServer {
                 }
                 Ok(ok(lines.join("\n")))
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -685,7 +705,7 @@ impl CuaServer {
                 out.push_str("\n* = frontmost");
                 Ok(ok(out))
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -725,7 +745,7 @@ impl CuaServer {
         let app = a.app.clone();
         let state = match self.native(move |c| c.get_app_state(&app, opts)).await {
             Ok(s) => s,
-            Err(e) => return Ok(fail(e.to_string())),
+            Err(e) => return Ok(fail_core(&e)),
         };
 
         let mut header = format!(
@@ -816,7 +836,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -844,7 +864,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -871,7 +891,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -899,7 +919,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -922,7 +942,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -961,7 +981,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -989,7 +1009,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1012,7 +1032,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1036,7 +1056,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1056,12 +1076,12 @@ impl CuaServer {
                 .await
             {
                 Ok(r) => Ok(ok(render_action(&r))),
-                Err(e) => Ok(fail(e.to_string())),
+                Err(e) => Ok(fail_core(&e)),
             };
         }
         match self.native(move |c| c.menu_bar(&app, &path)).await {
             Ok(listing) => Ok(ok(render_menu(&listing))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1085,7 +1105,7 @@ impl CuaServer {
             .await
         {
             Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1112,7 +1132,7 @@ impl CuaServer {
                     r.lines.join("\n")
                 )))
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 
@@ -1158,7 +1178,7 @@ impl CuaServer {
                     Ok(fail(body))
                 }
             }
-            Err(e) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail_core(&e)),
         }
     }
 }
@@ -1244,6 +1264,15 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         },
         r.ui_changed.as_str(),
     );
+    // `disposition` restates `delivery` + `ui_changed` as the one thing most
+    // callers actually need before deciding whether to retry: did the input
+    // land, and is that landing confirmed. It is derived, never independent —
+    // see `cua_core::outcome` — so it can never disagree with the two lines
+    // above it; it exists to save a caller from re-deriving the same rule.
+    s.push_str(&format!(
+        "\ndisposition: {}",
+        disposition_of(r.ui_changed).as_str()
+    ));
     // The advice attached to `ui_changed` all ends in "go and look" — which is
     // wrong to print when the section below *is* the result of having looked.
     // Two answers to the same question, one hedged and one measured, read as a
