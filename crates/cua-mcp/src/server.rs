@@ -4,7 +4,10 @@
 //!
 //! The tool names here (`list_apps`, `get_app_state`, `click`, `type_text`,
 //! `press_key`, `scroll`, `drag`, `hover`, `set_value`, `select_text`,
-//! `perform_secondary_action`) deliberately match the vocabulary that has become
+//! `perform_secondary_action`, and the window tools `list_windows`,
+//! `focus_window`, `move_window`, `resize_window`, `minimize_window`,
+//! `maximize_window`, `restore_window`, `list_displays`, `launch_app`,
+//! `close_app`) deliberately match the vocabulary that has become
 //! de-facto standard for this capability on macOS, which models have already
 //! seen. Inventing a prefixed dialect would buy nothing and cost recognition.
 //!
@@ -622,6 +625,85 @@ struct WaitForArgs {
     timeout_ms: Option<u64>,
 }
 
+/// Which window a window tool acts on. Shared so every window tool names a
+/// window the same way.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WindowTargetArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+    /// The `window_id` list_windows reports. Preferred: an id names exactly one
+    /// window, where a title can be shared. Needs Screen Recording; without it
+    /// list_windows reports no ids and window_title is the way to name one.
+    #[serde(default)]
+    window_id: Option<u32>,
+    /// The window's exact title, as list_windows shows it. Refused when two
+    /// windows share it. Ignored when window_id is given. Omit both to act on
+    /// the app's focused window (or its main window when none is focused).
+    #[serde(default)]
+    window_title: Option<String>,
+}
+
+impl WindowTargetArgs {
+    fn selector(&self) -> cua_core::WindowSelector {
+        cua_core::WindowSelector {
+            window_id: self.window_id,
+            title: self.window_title.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListWindowsArgs {
+    /// App name, bundle identifier, or bundle path.
+    app: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveWindowArgs {
+    #[serde(flatten)]
+    window: WindowTargetArgs,
+    /// New left edge, in global screen POINTS (the space list_displays reports;
+    /// the main display's top-left corner is 0,0, and a display to its left has
+    /// negative x).
+    x: f64,
+    /// New top edge, in global screen POINTS, measured downward.
+    y: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResizeWindowArgs {
+    #[serde(flatten)]
+    window: WindowTargetArgs,
+    /// New width in POINTS. The top-left corner stays where it is.
+    width: f64,
+    /// New height in POINTS.
+    height: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LaunchAppArgs {
+    /// Bundle identifier (`com.apple.TextEdit`, exact), app name looked up in
+    /// the standard Applications folders (`TextEdit`), or a path to the .app.
+    app: String,
+    /// Bring the launched app to the front. OFF by default, and leave it off
+    /// unless the user asked to see the app: activation takes keyboard focus
+    /// away from whatever the human is typing into, and may switch Spaces. The
+    /// window tools and every action work on a background app.
+    #[serde(default)]
+    activate: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CloseAppArgs {
+    /// App name, bundle identifier, or bundle path of a running app.
+    app: String,
+    /// Must be true. Quitting can discard unsaved work, so close_app refuses
+    /// every call without it — there is no label to judge here, the quit
+    /// itself is the destructive part.
+    #[serde(default)]
+    confirm_destructive: bool,
+}
+
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1180,6 +1262,290 @@ impl CuaServer {
             }
             Err(e) => Ok(fail_core(&e)),
         }
+    }
+
+    #[tool(
+        description = "List every window of one app: window_id, title, frame (x,y,w,h in global screen points), window level, and whether it is minimized, full screen, the app's main window and its focused window. Windows are listed front to back as accessibility orders them; windows the window server knows about but accessibility does not list (usually on another Space) come last, marked `not manageable`. window_id is the window server's CGWindowID, matched to the accessibility window by frame through public API only — it needs Screen Recording, and a window that cannot be paired unambiguously gets no id rather than a guessed one. Read-only: nothing is raised or activated."
+    )]
+    async fn list_windows(
+        &self,
+        Parameters(a): Parameters<ListWindowsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        match self.native(move |c| c.list_windows(&app)).await {
+            Ok(listing) => Ok(ok(render_window_listing(&listing))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Raise one window to the front of its app's windows with the accessibility AXRaise action, and make it the app's main window where the app allows. It does NOT activate the app: the frontmost app, keyboard focus and Space stay exactly as the human left them, so the window comes forward visually without taking their typing. Use it before reading a window that another window of the same app covers. A minimized window is refused — call restore_window. Gated like every action (CUA_ALLOWED_APPS scope, forbidden apps, screen lock, yield to human)."
+    )]
+    async fn focus_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Focus).await
+    }
+
+    #[tool(
+        description = "Move a window so its top-left corner is at x,y in global screen POINTS (see list_displays for each display's bounds), by writing its AXPosition attribute — no drag, no cursor movement, no activation. Refused when less than 40 points of the window would land on any active display, because a window placed off screen cannot be recovered by the human. The response reads the frame back from the app, which may clamp it."
+    )]
+    async fn move_window(
+        &self,
+        Parameters(a): Parameters<MoveWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a.window, cua_core::WindowOp::Move { x: a.x, y: a.y })
+            .await
+    }
+
+    #[tool(
+        description = "Resize a window to width x height POINTS, keeping its top-left corner fixed, by writing its AXSize attribute. Refused when the result would leave less than 40 points on any active display. Apps enforce their own minimum and maximum sizes; the response reads back the size the app actually kept."
+    )]
+    async fn resize_window(
+        &self,
+        Parameters(a): Parameters<ResizeWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(
+            a.window,
+            cua_core::WindowOp::Resize {
+                width: a.width,
+                height: a.height,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Minimize a window to the Dock by setting its AXMinimized attribute. Already-minimized is reported, not an error. Undo with restore_window."
+    )]
+    async fn minimize_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Minimize).await
+    }
+
+    #[tool(
+        description = "Maximize a window. Presses the window's own zoom button through accessibility (AXZoomButton, AXPress) when it has one — the app's native zoom, which fits the window to its content or the screen as the app decides; it is NOT full screen and does not create a Space. A window with no zoom button (panels, custom title bars) is instead sized to the bounds of the display it is mostly on, and the response says so. The frame from before is remembered so restore_window can return to it; calling maximize_window again on a window it already maximized is a no-op, because the zoom button toggles."
+    )]
+    async fn maximize_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Maximize).await
+    }
+
+    #[tool(
+        description = "Undo the last thing that took a window out of its normal state, in this order: un-minimize it (AXMinimized=false) if minimized; otherwise leave full screen (AXFullScreen=false) if in full screen; otherwise put back the frame it had before maximize_window. Anything else is reported as nothing to restore."
+    )]
+    async fn restore_window(
+        &self,
+        Parameters(a): Parameters<WindowTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.window_op(a, cua_core::WindowOp::Restore).await
+    }
+
+    #[tool(
+        description = "List the active displays: display id, bounds in global screen POINTS (the coordinate space move_window and list_windows use; the main display's top-left is 0,0), pixels per point, and which one is main. Needs no permission."
+    )]
+    async fn list_displays(&self) -> Result<CallToolResult, McpError> {
+        match self.native(|c| c.list_displays()).await {
+            Ok(displays) => Ok(ok(render_displays(&displays))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Launch an installed app through NSWorkspace, by bundle identifier (exact), app name (looked up in /Applications, /System/Applications and ~/Applications), or path to the .app. By DEFAULT IT IS NOT ACTIVATED: it starts behind whatever the human is using, which is enough for get_app_state and every action. Pass activate=true only when the user wants to see the app, since activation takes their keyboard focus. Launching an app that is already running does nothing and says so. Gated like every action: CUA_ALLOWED_APPS scope (an app outside it is refused before it starts), the forbidden-app list, and the screen lock. System prompts for quarantined apps are suppressed; such a launch fails instead of putting a dialog in front of the human."
+    )]
+    async fn launch_app(
+        &self,
+        Parameters(a): Parameters<LaunchAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let activate = a.activate;
+        match self.native(move |c| c.launch_app(&app, activate)).await {
+            Ok(r) => Ok(ok(render_launch(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Quit a running app gracefully — the same quit request its own Quit menu item sends, never a force quit. The app may ask about unsaved changes and stay open; the response says whether the process actually exited within 3 seconds, and get_app_state then shows any save prompt. REQUIRES confirm_destructive=true on every call, because quitting can discard work. Session-critical processes are always refused whatever the flags: Finder, Dock, SystemUIServer, Control Center, Notification Center, Window Manager, loginwindow, WindowServer, plus this server's own process and the app that launched it. Gated like every action (scope, forbidden apps, screen lock, yield to human)."
+    )]
+    async fn close_app(
+        &self,
+        Parameters(a): Parameters<CloseAppArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let confirm = a.confirm_destructive;
+        match self.native(move |c| c.close_app(&app, confirm)).await {
+            Ok(r) => Ok(ok(render_close(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+}
+
+impl CuaServer {
+    /// Every window-changing tool is this with a different [`cua_core::WindowOp`].
+    async fn window_op(
+        &self,
+        a: WindowTargetArgs,
+        op: cua_core::WindowOp,
+    ) -> Result<CallToolResult, McpError> {
+        let app = a.app.clone();
+        let sel = a.selector();
+        match self.native(move |c| c.window_action(&app, sel, op)).await {
+            Ok(r) => Ok(ok(render_window_outcome(&r))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+}
+
+fn render_frame(f: &cua_core::CGRect) -> String {
+    format!(
+        "{:.0},{:.0} {:.0}x{:.0}",
+        f.origin.x, f.origin.y, f.size.width, f.size.height
+    )
+}
+
+/// One window per line, flags inline, so the exact id or title to pass back is
+/// at the start of the line a model reads.
+fn render_window(w: &cua_core::WindowSummary) -> String {
+    let mut line = match w.window_id {
+        Some(id) => format!("window_id={id}"),
+        None => "window_id=-".to_string(),
+    };
+    line.push_str(&format!(
+        "  {:?}",
+        w.title.as_deref().unwrap_or("(untitled)")
+    ));
+    match &w.frame {
+        Some(f) => line.push_str(&format!("  at {}", render_frame(f))),
+        None => line.push_str("  (no frame)"),
+    }
+    if let Some(level) = w.level {
+        line.push_str(&format!("  level={level}"));
+    }
+    if let Some(sub) = &w.subrole {
+        line.push_str(&format!("  {sub}"));
+    }
+    let flags: Vec<&str> = [
+        (w.focused, "focused"),
+        (w.main, "main"),
+        (w.minimized, "minimized"),
+        (w.full_screen, "full screen"),
+        (w.on_screen == Some(false) && !w.minimized, "off screen"),
+        (
+            !w.manageable,
+            "not manageable: accessibility does not list it (another Space?)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, label)| on.then_some(label))
+    .collect();
+    if !flags.is_empty() {
+        line.push_str(&format!("  ({})", flags.join(", ")));
+    }
+    line
+}
+
+fn render_window_listing(listing: &cua_core::WindowListing) -> String {
+    let mut out = format!(
+        "{} (pid {}), {} windows, front to back\n",
+        listing.app.name,
+        listing.app.pid,
+        listing.windows.len()
+    );
+    for w in &listing.windows {
+        out.push_str("  ");
+        out.push_str(&render_window(w));
+        out.push('\n');
+    }
+    for warning in &listing.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    out
+}
+
+/// What a window tool did, then the window as the app reports it afterwards.
+fn render_window_outcome(r: &cua_core::WindowOutcome) -> String {
+    let mut out = format!(
+        "{} on {}\ndelivery: {}  (accessibility attribute/action on the window: cursor, keyboard focus and frontmost app untouched)\nchanged: {}\nbefore: {}\nafter:  {}",
+        r.action.verb,
+        r.action.target,
+        r.action.delivery.as_str(),
+        r.action.ui_changed.as_str(),
+        render_window(&r.before),
+        render_window(&r.after),
+    );
+    if let Some(note) = &r.note {
+        out.push_str(&format!("\nnote: {note}"));
+    }
+    out.push_str(
+        "\nThe app's element tree was not re-read; call get_app_state before acting on \
+         coordinates in this window, since its geometry may have changed.",
+    );
+    out
+}
+
+fn render_displays(displays: &[cua_core::DisplayInfo]) -> String {
+    let mut out = format!("{} active displays (global points)\n", displays.len());
+    for d in displays {
+        out.push_str(&format!(
+            "  display_id={}  at {}  {:.1} px per point{}\n",
+            d.id,
+            render_frame(&d.frame),
+            d.scale,
+            if d.main { "  (main)" } else { "" }
+        ));
+    }
+    out
+}
+
+fn render_launch(r: &cua_core::LaunchOutcome) -> String {
+    let head = if r.already_running {
+        format!(
+            "{} was already running (pid {}); nothing was launched or activated",
+            r.app.name, r.app.pid
+        )
+    } else {
+        format!(
+            "launched {} (pid {}) from {}",
+            r.app.name, r.app.pid, r.path
+        )
+    };
+    let front = match (r.frontmost, r.activate_requested) {
+        (true, true) => "frontmost: yes (activation was requested)",
+        (true, false) => {
+            "frontmost: yes — it came forward on its own although activation was not requested"
+        }
+        (false, true) => {
+            "frontmost: not yet (activation was requested; it may still be coming forward)"
+        }
+        (false, false) => "frontmost: no (not activated; the human's focus is unchanged)",
+    };
+    format!(
+        "{head}\nbundle_id: {}\n{front}\nIts windows may take a moment to appear; call list_windows or get_app_state next.",
+        r.app.bundle_id.as_deref().unwrap_or("-")
+    )
+}
+
+fn render_close(r: &cua_core::CloseOutcome) -> String {
+    if r.quit {
+        format!(
+            "{} (pid {}) quit after {}ms",
+            r.app.name, r.app.pid, r.waited_ms
+        )
+    } else {
+        format!(
+            "asked {} (pid {}) to quit, and it is still running after {}ms. It is most likely \
+             asking about unsaved changes: call get_app_state to see the prompt, and answer it \
+             (Save, or Don't Save with confirm_destructive) to finish quitting. cua-rs never \
+             force-quits.",
+            r.app.name, r.app.pid, r.waited_ms
+        )
     }
 }
 

@@ -38,6 +38,16 @@ pub use session::{
     Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome,
     WindowPixel,
 };
+pub use session::{
+    CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
+    WindowSummary,
+};
+
+/// Re-exported so the MCP layer can render a display without depending on
+/// `cua-capture` directly.
+pub use cua_capture::DisplayInfo;
+/// Re-exported so frames in public results can be named by callers.
+pub use objc2_core_foundation::CGRect;
 
 /// Re-exported so a caller can name a mouse button or a modifier set without
 /// depending on `cua-hid` directly. `cua-hid` is the only crate that

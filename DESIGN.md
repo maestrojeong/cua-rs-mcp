@@ -1,7 +1,8 @@
 # Design notes
 
 Why cua-rs is built the way it is, what is deliberately not built yet, what is
-planned next (§11), and the largest thing currently declined (§12).
+planned next (§11), the largest thing currently declined (§12), and the window
+and app management tools (§13).
 
 ---
 
@@ -2667,3 +2668,182 @@ the per-frame `list_windows` saves 28 ms, skipping `sips` saves 10–40, keeping
 one temp directory saves a few — call it 60 ms off a 163 ms frame, landing at
 ~10 fps and still a third of a core. Optimizing toward a target that is a
 factor of two away is how a slideshow gets shipped.
+
+---
+
+## 13. Window and app management
+
+Ten tools: `list_windows`, `focus_window`, `move_window`, `resize_window`,
+`minimize_window`, `maximize_window`, `restore_window`, `list_displays`,
+`launch_app`, `close_app`. Each one does a single thing through public API, and
+the rules below are why each one stops where it does.
+
+### Raise, never activate
+
+`focus_window` is `AXRaise` on the `AXWindow`, plus `AXMain = true` where the app
+lets that be written. It never calls `NSRunningApplication.activate`, for the
+same reason §6 gives for clicks: activation moves the window server's key focus,
+so the human's next keystroke goes to the agent's app, and if the app's windows
+are on another Space macOS switches Spaces under them. A raise reorders that
+app's windows and nothing else. The window comes forward visually, and the
+keyboard stays wherever the human left it. That is less than the word "focus"
+usually promises, and the tool description says so instead of hiding it. An
+agent that needs a window *key* already has the synthesized-activation path
+behind `click`, which is the measured answer to that question. The `apps::activate`
+diagnostic is still not reachable from any tool.
+
+A minimized window is refused rather than quietly restored, because restoring
+it is a different, visible action and gets a tool of its own.
+
+### Window identity: the §6 pairing, applied to every window at once
+
+`list_windows` enumerates `AXWindows` and pairs each one with a window-server
+window by frame, using the same evidence and tolerance (`AX_WINDOW_MATCH_TOLERANCE`)
+as `window_focus_assist`. `_AXUIElementGetWindow` is still never called. The
+pairing is greedy on distance, and each server window can be claimed only once,
+so two AX windows can never report the same `window_id`. If they could,
+`focus_window` by id could raise the wrong window. A window that cannot be paired
+within tolerance gets no id rather than the nearest one. Selecting by id
+re-runs that same pairing live, so `list_windows` and every window tool always
+agree on which window an id names.
+
+Ids come from ScreenCaptureKit, so they need Screen Recording. Without it,
+`list_windows` still lists every window with no ids, and a window is addressed
+by exact title. If two windows share a title, the title is refused rather than
+resolved by guessing. With neither, the tools act on the focused window, then
+the main window. Windows the server reports and accessibility does not list,
+most often on another Space, are listed as `not manageable`. §9 keeps off-Space
+windows observation-only, and leaving them out would understate how many
+windows the app has.
+
+### Geometry is checked against displays and read back
+
+`move_window` and `resize_window` write `AXPosition`/`AXSize`. Both refuse a
+target frame that leaves less than 40 points on every active display, measured
+per display rather than across their union. The bar is not "any overlap":
+one point on screen exists in the strict sense and is lost in every practical
+one, because a human can no longer grab the title bar. 40 is the side length the
+rest of cua-rs already treats as the smallest addressable window, and it shrinks
+for a window smaller than that. Displays come from `CGGetActiveDisplayList`/
+`CGDisplayBounds`. These are public calls, need no grant, and use the same
+top-left-origin global points as AX, so no conversion is needed. They live in
+`cua-capture`, which already owns the window server's view of the screen, so
+`cua-core`'s CoreGraphics surface stays at the single `CGSession` read its
+manifest promises.
+
+Every window tool reads the window back afterwards and reports before and after.
+Apps clamp frames, enforce minimum sizes and round to their own grids. An agent
+told "moved to 5000,0" when the app kept it at 1200,0 would place the next
+window wrongly.
+
+### Maximize prefers the app's own zoom
+
+`maximize_window` presses the window's `AXZoomButton` (`AXPress`). That is the
+app's native zoom, the green button's non-full-screen behaviour, so the app
+decides what "big enough" means for its own content. It is not full screen and
+creates no Space. When a window has no zoom button (panels, utility windows,
+custom title bars), the fallback writes position and size to the bounds of the
+display the window is mostly on, and the response says the fallback ran. It
+uses the display's bounds rather than its visible frame because
+`NSScreen.visibleFrame` is main-thread-only and every cua-rs native call runs on
+`cua-native` (§4). AppKit apps keep their own windows below the menu bar, and
+the readback shows what the app kept.
+
+The pre-maximize frame is remembered per AX window (`CFEqual`, so it works
+without an id), with a cap of 64 entries. `restore_window` uses it, and a second
+`maximize_window` on a window it already maximized does nothing, because the
+zoom button toggles and pressing it again would *un*-maximize. A window someone
+zoomed by hand has no remembered frame, and `restore_window` reports "nothing to
+restore" instead of pressing a toggle whose state it cannot read.
+`restore_window` otherwise undoes the most recent departure from normal:
+minimized first, then full screen, then the remembered frame.
+
+### Every window tool is an action, gated as one
+
+All six go through `Inner::acting` with `Gate::elementless(<tool name>)`, the
+same entry point as `click`: scope, forbidden target, screen lock and yield to
+human, in that order. There is no destructive-label gate, because there is no
+label, and no window operation removes anything: each one is undone by another.
+A successful window tool also marks the app's snapshot `acted_on`, because a
+moved window invalidates every coordinate read from the old frame.
+
+### `launch_app`: gated before the process exists, not activated by default
+
+The app is not running yet, so there is no `AppInfo` to gate. `launch_app`
+reads the bundle id out of the `.app` it located and calls `guard` with a
+synthetic `AppInfo` (pid −1). The gates only read the bundle id, the name and
+session-wide state, so this is exactly as strict as a real one. An app outside
+`CUA_ALLOWED_APPS`, or on the forbidden list, is refused *before it starts*.
+Starting it and then refusing to drive it would be the gate failing open by one
+step. Lookup is stricter than `resolve_app`: an exact bundle id, `<name>.app` in
+the standard Applications folders, or a path. There is no substring tier,
+because nobody intends "launch whichever app contains `note`".
+
+Launch uses `openApplicationAtURL:configuration:completionHandler:` with
+`activates = false` unless the caller passes `activate: true`. Activation stays
+available as an explicit opt-in, not removed, because "open TextEdit for me" is a
+legitimate request whose whole point is the human seeing it. The default is the
+side that cannot interrupt anyone. `promptsUserIfNeeded = false`, so a
+quarantined app fails with LaunchServices' error instead of raising a dialog the
+agent cannot see in front of the human. An app that is already running is
+reported and left alone. Opening it again sends a reopen event, which in many
+apps creates a window.
+
+**`NSWorkspace.runningApplications` is stale in this process, and this was
+measured.** The list is maintained by notifications on the *main* run loop. The
+cua-rs main thread is the tokio runtime and never runs one. A Calculator launched
+after the first read stayed absent on every thread until the main run loop was
+spun, while `runningApplicationWithProcessIdentifier` found it immediately.
+Before this change, any app started after the server (by the human, or now by
+`launch_app`) could not be resolved by name for the life of the server.
+`resolve_app` now retries on a miss against `list_apps_fresh`, which keeps the
+cached list's entries, drops the ones whose process has exited, and looks up
+every other pid from `proc_listallpids` directly. A full pass measured 15–35 ms
+over ~700 pids, so only a miss pays for it. Running a main run loop would have
+been the other fix. It was declined because it changes the threading model §4
+is built on, to repair one cache.
+
+### `close_app`: graceful, confirmed every time, never the session
+
+`NSRunningApplication.terminate` sends the quit Apple event, so the app runs its
+normal shutdown, including its own "save changes?" sheet. `forceTerminate` is
+not reachable from any tool, because a forced quit discards unsaved work by
+definition. Exit is detected with `kill(pid, 0)` plus the process start time,
+not `isTerminated`, which is stale for the same run-loop reason. A quit that is
+delivered but not finished within 3 s is reported as "still running, probably
+asking about unsaved changes", which is true and tells the agent to look next.
+
+`confirm_destructive: true` is required unconditionally, not only when a label
+matches. There is no label: the quit is the destructive part, and no app
+guarantees it will ask before discarding anything. The refusal is its own
+variant (`QuitNeedsConfirmation`), so it cannot claim a control "reads as
+destructive".
+
+Some processes are refused whatever the flags, by bundle id: Finder, Dock,
+SystemUIServer, Control Center, Notification Center, Window Manager (Stage
+Manager), loginwindow, WindowServer. WindowServer and loginwindow are also
+matched by name when no bundle id is published. A bundled app that merely calls
+itself `loginwindow` is judged by its id, not its name. The criterion is
+"quitting it breaks or visibly resets the session", not "Apple ships it". launchd
+relaunches the shell processes the moment they exit, so a quit is never what it
+looks like: the desktop flashes, menu-bar extras reset, and the agent reports
+success for an action whose only effect was disruption. loginwindow and
+WindowServer end the session outright. Two pids are also protected: cua-rs's own
+process, and its parent (the terminal or agent app that launched it). Quitting
+either ends the conversation that asked for it. This list is kept apart from the
+forbidden-target list on purpose. That list is liftable by the operator and is
+about what may be *driven*. Dock is safe to click and never safe to quit, and
+folding the two together would get one of those wrong. The order is gates first
+(lock, forbidden, scope, yield), then protected, then confirmation, because a
+confirmation cannot make quitting Dock acceptable.
+
+### What was verified where
+
+On macOS 26.2, from an SSH session with neither grant: `list_displays`,
+`launch_app` (not activated, then "already running"), `close_app` (refused
+without confirmation, refused on Dock, then a real graceful quit detected in
+~110 ms), and the stale-`runningApplications` finding above. The AX-backed
+window tools are unit-tested on their pure policy (pairing, visibility,
+display choice, remembered frames, change detection) and compile against the
+real attributes. They have not been driven against a live window with
+Accessibility granted.

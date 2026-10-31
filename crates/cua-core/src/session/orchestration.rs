@@ -249,6 +249,18 @@ pub enum CoreError {
     #[error("in `{app}`: {reason}")]
     MenuPath { app: String, reason: String },
 
+    /// A window tool could not select or change the window it was given.
+    ///
+    /// One variant with a reason rather than one per failure, for the same
+    /// reason as [`CoreError::DragRefused`]: what the caller needs is which
+    /// window and what to do instead, and that is all in `reason`.
+    #[error("window of `{app}`: {reason}")]
+    Window { app: String, reason: String },
+
+    /// `launch_app` or `close_app` reached the system and the system declined.
+    #[error("`{app}`: {reason}")]
+    Lifecycle { app: String, reason: String },
+
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
     WorkerGone,
@@ -1598,6 +1610,13 @@ mod scroll_actions;
 mod targeting;
 #[path = "actions/text.rs"]
 mod text_actions;
+#[path = "actions/window.rs"]
+mod window_actions;
+
+pub use window_actions::{
+    CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
+    WindowSummary,
+};
 
 /// Window ids of the transient UI one process currently has up.
 fn popup_ids(windows: &[WindowInfo], pid: libc::pid_t) -> Vec<u32> {
