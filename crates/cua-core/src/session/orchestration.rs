@@ -1449,7 +1449,7 @@ fn sorted(set: &HashSet<String>) -> Vec<&String> {
 #[path = "worker.rs"]
 mod worker;
 
-pub use worker::Cua;
+pub use worker::{Cua, Op};
 use worker::{Inner, ProcessKey};
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]

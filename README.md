@@ -195,8 +195,32 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `menu_bar` | read the menu bar and click an item |
 | `scroll` | scroll a view |
 | `list_apps` / `check_permissions` | list apps; check permission status |
+| `batch` | run several of the tools above in one call, in order |
 
 Every action returns what changed, so acting and verifying take one round trip.
+
+`batch` sends a sequence of steps in a single call. Each step names a tool and
+passes exactly the arguments that tool takes on its own:
+
+```json
+{
+  "steps": [
+    {"tool": "set_value", "params": {"app": "Notes", "element_token": "1-7-AXTextField", "value": "eggs", "return_state": false}},
+    {"tool": "press_key", "params": {"app": "Notes", "element_token": "1-7-AXTextField", "key": "return"}},
+    {"tool": "find", "params": {"app": "Notes", "text": "eggs"}}
+  ],
+  "bail_on_error": true
+}
+```
+
+Results come back tagged by step index. With `bail_on_error` (the default) the
+batch stops at the first failing step and lists the steps it did not run; pass
+`false` to run them all. Each step goes through the same safety checks and
+`snapshot_id` checks as a solo call. So if a step re-reads the window (any
+action with `return_state` on, or `get_app_state`), a later step that cites the
+old snapshot fails just as it would on its own. Turn `return_state` off on the
+steps in between. Every tool except `batch` itself can be a step, up to 50 per
+call.
 
 ## What works, what doesn't
 

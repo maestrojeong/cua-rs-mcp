@@ -467,6 +467,59 @@ Each job runs inside `catch_unwind`, so one malformed tree cannot take the worke
 down and with it every future call. This is why the workspace uses
 `panic = "unwind"` where the sibling projects use `abort`.
 
+### `batch`: one dispatch path, one hop
+
+`batch` runs several tool calls in one MCP round trip. Two ways to build it were
+wrong, and seeing why shaped the version that shipped.
+
+**Reimplementing steps in the batch executor** would give each action two code
+paths. They would drift apart, and the safety gates are exactly what must not
+drift. So each tool's whole behaviour lives in one `prep_*` function in
+`server.rs`. It parses the arguments, builds a `cua_core::Op`, and says how the
+outcome is rendered. The `#[tool]` method dispatches that value, and a batch
+step dispatches the same value. `BatchStep` is a `tool`/`params` tagged enum
+whose variants wrap each tool's existing argument struct, so the step schema
+cannot fall out of step with the tool's schema.
+
+**Looping over the existing `Cua` methods inside one `spawn_blocking`** looks
+like one hop, but it is not. Each `Cua` method is its own `exec`: one job sent
+to `cua-native` and one reply waited for. N steps would still cost N channel
+round trips. Worse, another caller's job could slot in between two steps, which
+is the interleaving this section exists to prevent. Calling a `Cua` method from
+*inside* a worker job is not an escape either: the call would queue behind the
+job that is making it, and deadlock.
+
+So `cua-core` splits building an operation from running it. `Op::click(..)` and
+its siblings hold the bodies the `Cua` methods used to inline. Each builds its
+`safety::Gate` on the calling thread and defers the `Inner::acting` closure to
+the worker. `Cua::click` is now `self.run(Op::click(..))`. `Cua::run_batch`
+sends a whole `Vec<Op>` as one job, and the worker runs the steps back to back.
+The result:
+
+- **One hop.** One `spawn_blocking` and one worker job per batch, however many
+  steps it holds. A test shows that a job another thread sends while step 0 is
+  running lands after the last step, never between two steps.
+- **Same gates.** Every step passes through `Inner::acting` (or
+  `press_menu_bar`'s own gate) exactly as a solo call does: app scope, refused
+  apps, `confirm_destructive`, screen lock, yield-to-human. A batch has no gate
+  of its own to get wrong, and so no way around one.
+- **Same staleness.** Each step resolves its target against the snapshot store
+  as the previous step left it. A step that re-reads the window replaces the
+  snapshot, and a later step citing the old `snapshot_id` fails with the
+  ordinary `StaleSnapshot`/`StaleCoordinate` error. The batch adds no leniency
+  because it has no check of its own.
+- **Isolated failures.** Each step has its own `catch_unwind`, so a panic in
+  step k is step k's `NativePanic` and the results before it survive.
+  `bail_on_error` is checked on the worker after each step, so steps after a
+  failure never run, as opposed to running with their results thrown away.
+
+The cost is that a batch holds the native thread for its full length. That is
+the serialization guarantee working as intended, but it means `wait_for`
+timeouts in one batch add up. A batch is therefore capped at 50 steps. Rendering
+a step's result also moved onto the worker (`Op::map`), for solo calls as well,
+so that "did this step fail" can be judged in time to stop. This is string
+formatting plus, for a screenshot, one base64 encode.
+
 ---
 
 ## 5. Electron and Chromium

@@ -29,7 +29,7 @@ pub use menubar::{menu_path_steps, menu_shortcut, MenuItem, MenuListing, MenuWal
 pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,
-    Mechanism, MouseOptions, Observed, Permissions, PointerLocation, PostActionState, Presence,
+    Mechanism, MouseOptions, Observed, Op, Permissions, PointerLocation, PostActionState, Presence,
     Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome,
     WindowPixel,
 };

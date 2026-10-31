@@ -963,3 +963,161 @@ fn a_popup_may_be_stamped_on_an_event_but_the_overlay_and_desktop_may_not() {
     };
     assert!(live_window_for_pid_click(&[desktop], 70000, 34667).is_err());
 }
+
+// ── batches ──────────────────────────────────────────────────────────────────
+
+fn ok_op(n: u32) -> Op<u32> {
+    Op::query(move |_| Ok(n))
+}
+
+fn failing_op() -> Op<u32> {
+    Op::query(|_| Err(CoreError::NativePanic))
+}
+
+#[test]
+fn a_batch_that_bails_stops_at_the_first_failure() {
+    let cua = Cua::new();
+    let third_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = third_ran.clone();
+    let ops = vec![
+        ok_op(1),
+        failing_op(),
+        Op::query(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(3)
+        }),
+    ];
+    let ran = cua.run_batch(ops, |r| r.is_err()).unwrap();
+    assert_eq!(ran.len(), 2, "only the steps up to the failure may run");
+    assert_eq!(*ran[0].as_ref().unwrap(), 1);
+    assert!(ran[1].is_err());
+    assert!(
+        !third_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "a step after the failure must never reach the worker"
+    );
+}
+
+#[test]
+fn a_batch_that_does_not_bail_runs_and_reports_every_step() {
+    let cua = Cua::new();
+    let ops = vec![ok_op(1), failing_op(), ok_op(3)];
+    let ran = cua.run_batch(ops, |_| false).unwrap();
+    assert_eq!(ran.len(), 3);
+    assert_eq!(*ran[0].as_ref().unwrap(), 1);
+    assert!(ran[1].is_err());
+    assert_eq!(*ran[2].as_ref().unwrap(), 3);
+}
+
+fn snapshot_with_id(id: u64, pid: libc::pid_t) -> Snapshot {
+    Snapshot {
+        id,
+        nodes: Vec::new(),
+        window: None,
+        process_key: ProcessKey::for_pid(pid),
+        limits: Limits::default(),
+        complete: true,
+        scoped: false,
+        acted_on: false,
+        taken_at: Instant::now(),
+        popups: Vec::new(),
+    }
+}
+
+/// A step that cites snapshot 7, judged by the real generation guard.
+fn cites_seven(info: AppInfo) -> Op<()> {
+    Op::query(move |inner| inner.check_coordinate_generation(&info, Some(7), (10.0, 10.0)))
+}
+
+#[test]
+fn a_snapshot_superseded_mid_batch_fails_the_later_step_the_ordinary_way() {
+    let cua = Cua::new();
+    let info = AppInfo {
+        name: "Test".into(),
+        bundle_id: None,
+        pid: 4242,
+        active: false,
+        regular: true,
+    };
+    let pid = info.pid;
+    let after_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = after_ran.clone();
+    let ops: Vec<Op<()>> = vec![
+        // A read: snapshot 7 becomes current.
+        Op::query(move |inner| {
+            inner.snapshots.insert(pid, snapshot_with_id(7, pid));
+            Ok(())
+        }),
+        // Cites 7 while 7 is current: fine.
+        cites_seven(info.clone()),
+        // Something re-reads the window — an action's return_state, or a
+        // get_app_state — and 8 replaces 7.
+        Op::query(move |inner| {
+            inner.snapshots.insert(pid, snapshot_with_id(8, pid));
+            Ok(())
+        }),
+        // Still cites 7: must fail exactly here, with the solo-call error.
+        cites_seven(info.clone()),
+        Op::query(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+    ];
+    let ran = cua.run_batch(ops, |r| r.is_err()).unwrap();
+    assert_eq!(ran.len(), 4, "the batch stops at the stale step");
+    assert!(ran[..3].iter().all(|r| r.is_ok()));
+    match &ran[3] {
+        Err(CoreError::StaleCoordinate { given, current, .. }) => {
+            assert_eq!((*given, *current), (7, 8));
+        }
+        other => panic!("expected StaleCoordinate at step 3, got {other:?}"),
+    }
+    assert!(!after_ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn a_panicking_batch_step_is_that_steps_error_and_keeps_earlier_results() {
+    let cua = Cua::new();
+    let ops = vec![ok_op(1), Op::query(|_| panic!("synthetic")), ok_op(3)];
+    let ran = cua.run_batch(ops, |_| false).unwrap();
+    assert_eq!(ran.len(), 3);
+    assert!(matches!(ran[1], Err(CoreError::NativePanic)));
+    assert_eq!(*ran[2].as_ref().unwrap(), 3);
+}
+
+/// The single-hop claim, made observable: the whole batch is one worker job,
+/// so a call another thread sends while step 0 is running lands after the
+/// last step, never between two of them.
+#[test]
+fn a_batch_is_one_worker_job_so_nothing_interleaves_with_it() {
+    use std::sync::{Arc, Mutex};
+    let cua = Cua::new();
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+
+    let other = {
+        let cua = cua.clone();
+        let log = log.clone();
+        std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            cua.exec(move |_| log.lock().unwrap().push("other"))
+                .unwrap();
+        })
+    };
+
+    let (l0, l1) = (log.clone(), log.clone());
+    let ops: Vec<Op<()>> = vec![
+        Op::query(move |_| {
+            l0.lock().unwrap().push("step0");
+            started_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        }),
+        Op::query(move |_| {
+            l1.lock().unwrap().push("step1");
+            Ok(())
+        }),
+    ];
+    cua.run_batch(ops, |_| false).unwrap();
+    other.join().unwrap();
+    assert_eq!(*log.lock().unwrap(), ["step0", "step1", "other"]);
+}
