@@ -308,6 +308,41 @@ impl Element {
         )
     }
 
+    /// Write a point-valued attribute — `AXPosition` on a window, in global
+    /// top-left-origin points.
+    ///
+    /// The value is wrapped in an `AXValue` the same way [`Element::position`]
+    /// unwraps one. A failed wrap is reported as [`AxError::Other`] rather than
+    /// a panic: it can only happen if the framework refuses a well-formed
+    /// struct, which is not the caller's mistake.
+    pub fn set_point(&self, name: &str, point: CGPoint) -> Result<()> {
+        let mut p = point;
+        // SAFETY: `p` is a live CGPoint for the duration of the call, and
+        // AXValueCreate copies it.
+        let value =
+            unsafe { AXValue::new(AXValueType::CGPoint, NonNull::from(&mut p).cast::<c_void>()) }
+                .ok_or(AxError::Other(AXError::IllegalArgument.0))?;
+        let key = CFString::from_str(name);
+        check(
+            unsafe { self.0.set_attribute_value(&key, value.as_ref()) },
+            Ctx::Attr(name),
+        )
+    }
+
+    /// Write a size-valued attribute — `AXSize` on a window, in points.
+    pub fn set_size(&self, name: &str, size: CGSize) -> Result<()> {
+        let mut s = size;
+        // SAFETY: as in [`Element::set_point`].
+        let value =
+            unsafe { AXValue::new(AXValueType::CGSize, NonNull::from(&mut s).cast::<c_void>()) }
+                .ok_or(AxError::Other(AXError::IllegalArgument.0))?;
+        let key = CFString::from_str(name);
+        check(
+            unsafe { self.0.set_attribute_value(&key, value.as_ref()) },
+            Ctx::Attr(name),
+        )
+    }
+
     /// Replace an attribute that holds an array of elements, e.g.
     /// `AXSelectedRows` on a table or outline.
     ///

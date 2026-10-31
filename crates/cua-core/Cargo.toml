@@ -15,10 +15,14 @@ thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
+block2 = "0.6"
+objc2 = { workspace = true }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    "NSBundle",
     "NSEnumerator",
+    "NSError",
     "NSObject",
     "NSString",
     "NSURL",
@@ -49,6 +53,7 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "libc",
+    "block2",
     "NSRunningApplication",
     "NSWorkspace",
 ] }

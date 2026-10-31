@@ -164,6 +164,8 @@ how to unblock it.
 - **Destructive actions need confirming** — buttons like "Delete", "Erase",
   "Reset" require `confirm_destructive: true`. "Cancel"/"Save" are always
   allowed.
+- **Quitting an app always needs confirming**, and Finder, Dock, the menu
+  bar, loginwindow and WindowServer are never quit.
 - **Nothing reaches a locked screen or screensaver.**
 - **Optional: yield to a human actively using the app** —
   `CUA_YIELD_TO_HUMAN=1` (off by default).
@@ -194,6 +196,11 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `press_key` | press a key or shortcut |
 | `menu_bar` | read the menu bar and click an item |
 | `scroll` | scroll a view |
+| `list_windows` / `list_displays` | every window of an app (id, title, frame, level, state); every display |
+| `focus_window` | raise a window — without activating the app or taking your keyboard |
+| `move_window` / `resize_window` | set a window's position or size (refused if it would end up off screen) |
+| `minimize_window` / `maximize_window` / `restore_window` | Dock, zoom, and back |
+| `launch_app` / `close_app` | start an app (in the background unless asked); quit one gracefully (always needs `confirm_destructive`) |
 | `list_apps` / `check_permissions` | list apps; check permission status |
 
 Every action returns what changed, so acting and verifying take one round trip.
@@ -230,7 +237,7 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 249 tests, no special permissions needed
+cargo test --workspace          # 282 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

@@ -34,6 +34,10 @@ pub(super) struct Inner {
     /// [`Cua`] so the tap is torn down when the last handle goes away rather
     /// than leaking for the life of the process. Inert unless the flag is set.
     pub(super) human: std::sync::Arc<crate::safety::HumanWatch>,
+    /// Frames from before `maximize_window`, so `restore_window` can put a
+    /// window back. Keyed by the AX window itself (`CFEqual`), not by window
+    /// id, so it works without Screen Recording; bounded, oldest dropped.
+    pub(super) pre_maximize: Vec<(Element, CGRect)>,
 }
 
 /// Identifies a process incarnation, not just a pid slot.
@@ -471,6 +475,48 @@ impl Cua {
         self.exec_action(false, move |inner| {
             inner.press_menu_bar(&app, &path, return_state, confirm_destructive)
         })
+    }
+
+    /// Every window of one app, with ids, frames and state.
+    ///
+    /// A read, so it is not gated: like `get_app_state`, it is what makes a
+    /// later refusal diagnosable.
+    pub fn list_windows(&self, app: &str) -> Result<WindowListing> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.list_windows(&app))?
+    }
+
+    /// Raise, move, resize, minimize, maximize or restore one window.
+    ///
+    /// Goes through the same [`Inner::acting`] gate as `click`: scope,
+    /// forbidden target, screen lock and yield-to-human all apply. There is no
+    /// destructive-label check because there is no label: no window operation
+    /// here removes anything, and every one is undone by another.
+    pub fn window_action(
+        &self,
+        app: &str,
+        window: WindowSelector,
+        op: WindowOp,
+    ) -> Result<WindowOutcome> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.window_action(&app, window, op))?
+    }
+
+    /// Every active display. Needs no grant.
+    pub fn list_displays(&self) -> Result<Vec<cua_capture::DisplayInfo>> {
+        self.exec(|_| cua_capture::list_displays().map_err(CoreError::from))?
+    }
+
+    /// Launch an app that is not running, without activating it unless asked.
+    pub fn launch_app(&self, spec: &str, activate: bool) -> Result<LaunchOutcome> {
+        let spec = spec.to_string();
+        self.exec(move |inner| inner.launch_app(&spec, activate))?
+    }
+
+    /// Ask an app to quit gracefully. Needs `confirm_destructive`, always.
+    pub fn close_app(&self, app: &str, confirm_destructive: bool) -> Result<CloseOutcome> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.close_app(&app, confirm_destructive))?
     }
 
     /// Elements whose label, value or role contains `needle`.

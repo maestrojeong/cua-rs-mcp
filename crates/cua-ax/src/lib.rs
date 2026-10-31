@@ -163,6 +163,17 @@ pub mod attr {
     pub const FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
+    /// Whether a window is in the Dock. Settable on standard windows, which
+    /// is how a window is minimized and restored without a click on its
+    /// yellow button.
+    pub const MINIMIZED: &str = "AXMinimized";
+    /// Whether a window is in native full screen.
+    pub const FULL_SCREEN: &str = "AXFullScreen";
+    /// Whether a window is its app's main window. Writing `true` changes the
+    /// app's own idea of its main window only; it does not activate the app.
+    pub const MAIN: &str = "AXMain";
+    /// A window's green title-bar button, as an element of its own.
+    pub const ZOOM_BUTTON: &str = "AXZoomButton";
     /// The point the *app itself* nominates as where this element is clicked.
     ///
     /// Optional and often absent, but when present it beats the frame centre:
