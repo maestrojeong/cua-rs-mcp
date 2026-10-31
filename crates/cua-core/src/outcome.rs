@@ -102,6 +102,12 @@ pub enum PolicyReason {
     /// `CUA_KEY_STRICT_FOCUS` refused because the app names a different
     /// element as focused than the one addressed.
     StrictFocus,
+    /// The app is one the login session cannot run without (Finder, Dock,
+    /// loginwindow, …). Kept separate from `ForbiddenTarget` because it is
+    /// not clearable by `CUA_ALLOW_FORBIDDEN_TARGETS` or any other flag — the
+    /// risk is not a credential, it is the desktop disappearing under the
+    /// human.
+    ProtectedProcess,
 }
 
 /// Whether an action's input ever reached the app, and whether its effect is
@@ -180,7 +186,10 @@ impl ErrorOutcome {
             | WindowClickRefused { .. }
             | DragRefused { .. }
             | PointerEventRefused { .. }
-            | MenuPath { .. } => (ErrorCode::ActionFailed, None),
+            | MenuPath { .. }
+            | Clipboard { .. }
+            | Window { .. }
+            | Lifecycle { .. } => (ErrorCode::ActionFailed, None),
 
             // A different gate from the other four `PolicyDenied` reasons —
             // it fires on a mismatch the keyboard tier itself detects, not on
@@ -226,8 +235,12 @@ fn policy_reason_of(r: &Refused) -> PolicyReason {
         NotInAllowlist { .. } | UnidentifiableUnderAllowlist { .. } => PolicyReason::Scope,
         NeedsConfirmation { .. }
         | NeedsConfirmationInContext { .. }
-        | NeedsConfirmationForKey { .. } => PolicyReason::Destructive,
-        HumanTookOver { .. } | YieldWatchUnavailable { .. } => PolicyReason::YieldToHuman,
+        | NeedsConfirmationForKey { .. }
+        | QuitNeedsConfirmation { .. } => PolicyReason::Destructive,
+        HumanTookOver { .. } | YieldWatchUnavailable { .. } | HumanActive { .. } => {
+            PolicyReason::YieldToHuman
+        }
+        ProtectedProcess { .. } => PolicyReason::ProtectedProcess,
     }
 }
 

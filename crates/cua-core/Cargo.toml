@@ -16,6 +16,9 @@ tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
 block2 = "0.6"
+# Also for `autoreleasepool`: `clipboard.rs` wraps every pasteboard read in
+# one, since a read returns autoreleased Foundation objects and the native
+# worker thread has no pool of its own.
 objc2 = { workspace = true }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -50,10 +53,15 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "objc2",
     "CGSession",
 ] }
+# `NSPasteboard` is enabled here and in no other manifest in the workspace.
+# `clipboard.rs` is the one file that names it, so "which code can read or
+# write the clipboard" is answered by grepping these files for the feature,
+# the same way "which crate can synthesize input" is answered for CGEvent.
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "libc",
     "block2",
     "NSRunningApplication",
     "NSWorkspace",
+    "NSPasteboard",
 ] }

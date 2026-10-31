@@ -1179,4 +1179,138 @@ mod tests {
             "OK under a delete question is refused even when a field was aimed at"
         );
     }
+
+    // ── clipboard ────────────────────────────────────────────────────────
+
+    fn types(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn running(name: &str, bundle: &str) -> AppInfo {
+        AppInfo {
+            name: name.to_string(),
+            bundle_id: Some(bundle.to_string()),
+            pid: 42,
+            active: true,
+            regular: true,
+        }
+    }
+
+    #[test]
+    fn ordinary_clipboard_text_is_returned() {
+        let t = types(&[crate::clipboard::STRING_TYPE]);
+        let safari = running("Safari", "com.apple.Safari");
+        assert!(clipboard_read_refusal(&t, None, Some(&safari), false).is_none());
+        assert!(clipboard_read_refusal(&t, Some("com.apple.TextEdit"), None, false).is_none());
+    }
+
+    #[test]
+    fn a_concealed_marker_withholds_the_text() {
+        let t = types(&[crate::clipboard::STRING_TYPE, crate::clipboard::CONCEALED_TYPE]);
+        let why = clipboard_read_refusal(&t, None, None, false);
+        assert!(why.is_some_and(|w| w.contains("org.nspasteboard.ConcealedType")));
+    }
+
+    #[test]
+    fn the_forbidden_override_does_not_lift_a_concealed_marker() {
+        // The override corrects cua-rs's classification of apps. The marker is
+        // the writer's own statement about the data, so there is nothing of
+        // cua-rs's to override.
+        let t = types(&[crate::clipboard::CONCEALED_TYPE, crate::clipboard::STRING_TYPE]);
+        assert!(clipboard_read_refusal(&t, None, None, true).is_some());
+    }
+
+    #[test]
+    fn the_concealed_marker_matches_the_whole_type_only() {
+        let t = types(&["org.nspasteboard.ConcealedTypeX", "x.org.nspasteboard.ConcealedType"]);
+        assert!(clipboard_read_refusal(&t, None, None, false).is_none());
+    }
+
+    #[test]
+    fn text_from_a_forbidden_writer_is_withheld() {
+        let t = types(&[crate::clipboard::STRING_TYPE, crate::clipboard::SOURCE_TYPE]);
+        let why = clipboard_read_refusal(&t, Some("com.1password.1password"), None, false);
+        assert!(why.is_some_and(|w| w.contains("com.1password.1password")));
+    }
+
+    #[test]
+    fn a_forbidden_frontmost_app_withholds_the_text() {
+        // The human may have just copied a password out of it.
+        let t = types(&[crate::clipboard::STRING_TYPE]);
+        let keychain = running("Keychain Access", "com.apple.keychainaccess");
+        let why = clipboard_read_refusal(&t, None, Some(&keychain), false);
+        assert!(why.is_some_and(|w| w.contains("frontmost")));
+    }
+
+    #[test]
+    fn the_forbidden_override_lifts_the_app_based_clipboard_checks() {
+        let t = types(&[crate::clipboard::STRING_TYPE]);
+        let keychain = running("Keychain Access", "com.apple.keychainaccess");
+        assert!(clipboard_read_refusal(&t, Some("com.bitwarden.desktop"), Some(&keychain), true)
+            .is_none());
+    }
+
+    #[test]
+    fn the_concealed_marker_is_reported_before_the_frontmost_app() {
+        let t = types(&[crate::clipboard::CONCEALED_TYPE]);
+        let keychain = running("Keychain Access", "com.apple.keychainaccess");
+        let why = clipboard_read_refusal(&t, None, Some(&keychain), false);
+        assert!(why.is_some_and(|w| w.contains("marked it as a secret")));
+    }
+
+    #[test]
+    fn clipboard_writes_are_refused_while_locked() {
+        let r = session_gate("clipboard_set", true, YieldReading::Off, 1500);
+        assert!(matches!(r, Err(Refused::SessionLocked { verb: "clipboard_set" })));
+    }
+
+    #[test]
+    fn the_lock_is_reported_before_the_yield_watch() {
+        let r = session_gate(
+            "clipboard_clear",
+            true,
+            YieldReading::Watching { since_input_ms: Some(10) },
+            1500,
+        );
+        assert!(matches!(r, Err(Refused::SessionLocked { .. })));
+    }
+
+    #[test]
+    fn clipboard_writes_pass_with_no_yield_watch() {
+        assert!(session_gate("clipboard_set", false, YieldReading::Off, 1500).is_ok());
+    }
+
+    #[test]
+    fn a_broken_yield_watch_fails_clipboard_writes_closed() {
+        let r = session_gate("clipboard_set", false, YieldReading::Broken("no tap"), 1500);
+        assert!(matches!(r, Err(Refused::YieldWatchUnavailable { .. })));
+    }
+
+    #[test]
+    fn recent_human_input_anywhere_refuses_a_clipboard_write() {
+        // No frontmost-app condition: the clipboard is shared by every app.
+        let r = session_gate(
+            "clipboard_set",
+            false,
+            YieldReading::Watching { since_input_ms: Some(200) },
+            1500,
+        );
+        assert!(matches!(
+            r,
+            Err(Refused::HumanActive { ago_ms: 200, idle_ms: 1500, .. })
+        ));
+    }
+
+    #[test]
+    fn an_idle_human_does_not_block_a_clipboard_write() {
+        for since in [Some(5000), None] {
+            let r = session_gate(
+                "clipboard_set",
+                false,
+                YieldReading::Watching { since_input_ms: since },
+                1500,
+            );
+            assert!(r.is_ok(), "{since:?}");
+        }
+    }
 }

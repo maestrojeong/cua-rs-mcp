@@ -249,6 +249,9 @@ pub enum CoreError {
     #[error("in `{app}`: {reason}")]
     MenuPath { app: String, reason: String },
 
+    /// A pasteboard call failed, or a read raced a write and was discarded.
+    #[error("{verb}: {reason}")]
+    Clipboard { verb: &'static str, reason: String },
     /// A window tool could not select or change the window it was given.
     ///
     /// One variant with a reason rather than one per failure, for the same
@@ -1596,6 +1599,9 @@ fn page_points(element_height: Option<f64>) -> i32 {
 
 // ── worker-side implementation ───────────────────────────────────────────────
 
+#[path = "actions/clipboard.rs"]
+mod clipboard_actions;
+pub use clipboard_actions::{ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite};
 #[path = "actions/keyboard.rs"]
 mod keyboard_actions;
 #[path = "actions/menu.rs"]

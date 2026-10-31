@@ -21,6 +21,9 @@
 //! error instead of a mis-click.
 
 pub mod apps;
+// Private on purpose: the only way to reach the pasteboard from outside this
+// crate is through `Cua`, which runs it on the native worker behind the gates.
+mod clipboard;
 pub mod menubar;
 pub mod outcome;
 mod overlay;
@@ -33,10 +36,10 @@ pub use menubar::{menu_path_steps, menu_shortcut, MenuItem, MenuListing, MenuWal
 pub use outcome::{disposition_of, Disposition, ErrorCode, ErrorOutcome, PolicyReason};
 pub use safety::Refused;
 pub use session::{
-    ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,
-    Mechanism, MouseOptions, Observed, Permissions, PointerLocation, PostActionState, Presence,
-    Screenshot, ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome,
-    WindowPixel,
+    ActionResult, AppState, ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite,
+    CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState, Mechanism, MouseOptions,
+    Observed, Permissions, PointerLocation, PostActionState, Presence, Screenshot, ScrollAmount,
+    ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome, WindowPixel,
 };
 pub use session::{
     CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
