@@ -25,6 +25,7 @@ pub mod apps;
 // crate is through `Cua`, which runs it on the native worker behind the gates.
 mod clipboard;
 pub mod menubar;
+pub mod notifications;
 pub mod outcome;
 mod overlay;
 pub mod safety;

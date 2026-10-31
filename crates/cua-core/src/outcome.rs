@@ -172,11 +172,18 @@ impl ErrorOutcome {
             | StalePointGeometry { .. }
             | StaleCoordinate { .. } => (ErrorCode::StaleRef, None),
 
-            NoElementAtPoint { .. } => (ErrorCode::ElementNotFound, None),
-
-            KeyNoAccessibilityEquivalent { .. } | KeyVerbUnsupported { .. } => {
-                (ErrorCode::ActionNotSupported, None)
+            NoElementAtPoint { .. } | NotificationNotFound { .. } => {
+                (ErrorCode::ElementNotFound, None)
             }
+
+            KeyNoAccessibilityEquivalent { .. }
+            | KeyVerbUnsupported { .. }
+            | NotificationActionUnavailable { .. } => (ErrorCode::ActionNotSupported, None),
+
+            // Notification Center itself (or ControlCenter's clock) is not
+            // reachable through accessibility right now — a platform-reach
+            // problem, not an attempted-and-failed action.
+            NotificationCenterUnavailable { .. } => (ErrorCode::PlatformNotSupported, None),
 
             KeyChordUnparseable { .. } => (ErrorCode::InvalidArgs, None),
 
@@ -230,9 +237,13 @@ impl ErrorOutcome {
 fn policy_reason_of(r: &Refused) -> PolicyReason {
     use Refused::*;
     match r {
-        ForbiddenTarget { .. } => PolicyReason::ForbiddenTarget,
+        ForbiddenTarget { .. } | ForbiddenNotificationSource { .. } => {
+            PolicyReason::ForbiddenTarget
+        }
         SessionLocked { .. } => PolicyReason::ScreenLocked,
-        NotInAllowlist { .. } | UnidentifiableUnderAllowlist { .. } => PolicyReason::Scope,
+        NotInAllowlist { .. }
+        | UnidentifiableUnderAllowlist { .. }
+        | NotificationSourceOutOfScope { .. } => PolicyReason::Scope,
         NeedsConfirmation { .. }
         | NeedsConfirmationInContext { .. }
         | NeedsConfirmationForKey { .. }

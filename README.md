@@ -209,6 +209,15 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `minimize_window` / `maximize_window` / `restore_window` | Dock, zoom, and back |
 | `launch_app` / `close_app` | start an app (in the background unless asked); quit one gracefully (always needs `confirm_destructive`) |
 | `list_apps` / `check_permissions` | list apps; check permission status |
+| `list_notifications` | read notification banners, and with `include_history` the Notification Center history (app, title, body, actions, stable id) |
+| `dismiss_notification` / `dismiss_all_notifications` | close one notification by id, or all of them one at a time (stops at the first failure and reports progress) |
+| `notification_action` | press a named action a notification advertises (Show Details, …) — **app-defined buttons like Reply are unverified** |
+
+Notification tools were measured on macOS 26.2 only. Close was verified with
+the Korean label (닫기); other locales rely on expected translations. Close
+deletes the notification from history, so notifications from credential apps
+(and, under `CUA_ALLOWED_APPS`, from out-of-scope or unidentifiable apps) are
+refused. Details: [DESIGN.md §13](DESIGN.md).
 
 Every action returns what changed, so acting and verifying take one round trip.
 Every action's result also names its `disposition` — `delivered_verified`,
@@ -287,7 +296,7 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 320 tests, no special permissions needed
+cargo test --workspace          # 341 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

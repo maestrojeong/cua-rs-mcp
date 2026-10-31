@@ -11,6 +11,7 @@ Recording permissions on the launching process.
 | `keyboard_probe` | Inspect focus and text read-back around pid-routed keys | TextEdit | Accessibility | Live regression diagnostic |
 | `menu_life` | Measure pop-up lifetime and keyboard/menu reachability | KakaoTalk, TextEdit | Both | Regression reproduction |
 | `mouse_verify` | Verify right-click, modifier-click, drag, hover, and wheel arms | TextEdit or a chosen app | Both | Integration probe |
+| `notification_probe` | Dump NotificationCenter's AX tree, press a notification's custom action, or open the history panel via the menu-bar clock | `osascript` test notifications | Accessibility | Investigation probe (DESIGN.md §13) |
 | `popup_capture_probe` | Compare shell and in-process capture of pop-up window ids | Calculator, TextEdit | Both | Regression reproduction |
 | `popup_visibility` | Characterize on-screen state for context and menu-bar pop-ups | TextEdit | Both | Regression reproduction |
 | `scroll_check` | Compare wheel delivery with key and idle controls | TextEdit, browser fixture | Both | Regression reproduction |

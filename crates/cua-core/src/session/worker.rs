@@ -477,6 +477,51 @@ impl Cua {
         })
     }
 
+    /// Notifications Notification Center is showing: live banners, and with
+    /// `include_history` the history panel too (opened from the menu-bar clock
+    /// and closed again). Without history this is a pure read.
+    pub fn list_notifications(
+        &self,
+        include_history: bool,
+    ) -> Result<crate::notifications::NotificationListing> {
+        self.exec(move |inner| inner.list_notifications(include_history))?
+    }
+
+    /// Press a notification's Close action, through every gate an action takes
+    /// plus the notification-source gate.
+    pub fn dismiss_notification(
+        &self,
+        id: &str,
+        include_history: bool,
+    ) -> Result<crate::notifications::NotificationActed> {
+        let id = id.to_string();
+        self.exec(move |inner| inner.dismiss_notification(&id, include_history))?
+    }
+
+    /// Close notifications one at a time until none are left or one fails.
+    pub fn dismiss_all_notifications(
+        &self,
+        include_history: bool,
+    ) -> Result<crate::notifications::DismissAllOutcome> {
+        self.exec(move |inner| inner.dismiss_all_notifications(include_history))?
+    }
+
+    /// Press a named custom action Notification Center advertises on a
+    /// notification.
+    pub fn notification_action(
+        &self,
+        id: &str,
+        action: &str,
+        include_history: bool,
+        confirm_destructive: bool,
+    ) -> Result<crate::notifications::NotificationActed> {
+        let id = id.to_string();
+        let action = action.to_string();
+        self.exec(move |inner| {
+            inner.notification_action(&id, &action, include_history, confirm_destructive)
+        })?
+    }
+
     /// Read the clipboard's plain text.
     ///
     /// Not an action and not app-scoped: it resolves no app and passes no app
