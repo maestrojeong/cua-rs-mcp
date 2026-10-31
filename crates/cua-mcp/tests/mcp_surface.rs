@@ -113,6 +113,7 @@ fn advertises_the_expected_tools() {
     assert_eq!(
         names,
         [
+            "batch",
             "check_permissions",
             "click",
             "click_in_window",
@@ -673,6 +674,39 @@ fn http_mode_requires_the_bearer_token() {
     assert_eq!(wrong, "401", "a wrong token must be refused");
     assert_ne!(right, "401", "the right token must get through");
     assert_eq!(health, "200", "/health must stay open");
+}
+
+/// `batch` over the real wire: advertised with a `steps` array, and a step
+/// refused by its own tool's argument check stops the run at that index.
+/// Grant-free: `list_apps` needs no permission and the refused `click` never
+/// reaches accessibility.
+#[test]
+fn batch_runs_steps_in_order_and_bails_at_the_first_failure() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"batch","arguments":{"steps":[{"tool":"list_apps"},{"tool":"click","params":{"app":"Finder"}},{"tool":"list_apps","params":{}}]}}}"#,
+        ],
+    );
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    let batch = tools
+        .iter()
+        .find(|t| t["name"] == "batch")
+        .expect("batch is advertised");
+    assert_eq!(batch["inputSchema"]["properties"]["steps"]["type"], "array");
+
+    assert_eq!(response(&responses, 3)["result"]["isError"], true);
+    let text = call_text(&responses, 3);
+    assert!(
+        text.starts_with("batch: ran 2 of 3 step(s), 1 failed"),
+        "{text}"
+    );
+    assert!(text.contains("── step 0: list_apps — ok"), "{text}");
+    assert!(text.contains("── step 1: click — ERROR"), "{text}");
+    assert!(text.contains("── step 2: list_apps — not run"), "{text}");
 }
 
 #[test]

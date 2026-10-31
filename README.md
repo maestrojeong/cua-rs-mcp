@@ -212,12 +212,13 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `list_notifications` | read notification banners, and with `include_history` the Notification Center history (app, title, body, actions, stable id) |
 | `dismiss_notification` / `dismiss_all_notifications` | close one notification by id, or all of them one at a time (stops at the first failure and reports progress) |
 | `notification_action` | press a named action a notification advertises (Show Details, …) — **app-defined buttons like Reply are unverified** |
+| `batch` | run several of the tools above in one call, in order |
 
 Notification tools were measured on macOS 26.2 only. Close was verified with
 the Korean label (닫기); other locales rely on expected translations. Close
 deletes the notification from history, so notifications from credential apps
 (and, under `CUA_ALLOWED_APPS`, from out-of-scope or unidentifiable apps) are
-refused. Details: [DESIGN.md §13](DESIGN.md).
+refused. Details: [DESIGN.md §14](DESIGN.md).
 
 Every action returns what changed, so acting and verifying take one round trip.
 Every action's result also names its `disposition` — `delivered_verified`,
@@ -264,6 +265,29 @@ replacement for it. See [DESIGN.md](DESIGN.md) §10a for the full reasoning,
 including why `NativePanic` is the one case reported as unverified rather than
 not-delivered.
 
+`batch` sends a sequence of steps in a single call. Each step names a tool and
+passes exactly the arguments that tool takes on its own:
+
+```json
+{
+  "steps": [
+    {"tool": "set_value", "params": {"app": "Notes", "element_token": "1-7-AXTextField", "value": "eggs", "return_state": false}},
+    {"tool": "press_key", "params": {"app": "Notes", "element_token": "1-7-AXTextField", "key": "return"}},
+    {"tool": "find", "params": {"app": "Notes", "text": "eggs"}}
+  ],
+  "bail_on_error": true
+}
+```
+
+Results come back tagged by step index. With `bail_on_error` (the default) the
+batch stops at the first failing step and lists the steps it did not run; pass
+`false` to run them all. Each step goes through the same safety checks and
+`snapshot_id` checks as a solo call. So if a step re-reads the window (any
+action with `return_state` on, or `get_app_state`), a later step that cites the
+old snapshot fails just as it would on its own. Turn `return_state` off on the
+steps in between. Every tool except `batch` itself can be a step, up to 50 per
+call.
+
 ## What works, what doesn't
 
 - Buttons, menus, tabs, lists, text fields — works well, native and Electron.
@@ -296,7 +320,7 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 341 tests, no special permissions needed
+cargo test --workspace          # 353 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

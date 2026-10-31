@@ -4,10 +4,7 @@
 //!
 //! The tool names here (`list_apps`, `get_app_state`, `click`, `type_text`,
 //! `press_key`, `scroll`, `drag`, `hover`, `set_value`, `select_text`,
-//! `perform_secondary_action`, and the window tools `list_windows`,
-//! `focus_window`, `move_window`, `resize_window`, `minimize_window`,
-//! `maximize_window`, `restore_window`, `list_displays`, `launch_app`,
-//! `close_app`) deliberately match the vocabulary that has become
+//! `perform_secondary_action`) deliberately match the vocabulary that has become
 //! de-facto standard for this capability on macOS, which models have already
 //! seen. Inventing a prefixed dialect would buy nothing and cost recognition.
 //!
@@ -24,8 +21,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use cua_core::{
-    disposition_of, CoreError, Cua, ErrorOutcome, MouseOptions, PointerLocation, Presence,
-    ScrollAmount, ScrollDir, StateOptions, Target,
+    Cua, MouseOptions, Op, PointerLocation, Presence, ScrollAmount, ScrollDir, StateOptions, Target,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -44,25 +40,6 @@ fn ok(s: impl Into<String>) -> CallToolResult {
 
 fn fail(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
-}
-
-/// Build an error `CallToolResult` from a [`CoreError`], carrying the same
-/// human-readable message every call site already printed via `e.to_string()`
-/// as a first block, plus a second block with the structured
-/// [`cua_core::ErrorOutcome`] (code, policy reason, disposition, retry_safe)
-/// as JSON.
-///
-/// Additive on purpose: the first block is unchanged from the old `fail(e.to_string())`
-/// so nothing that already reads the message text breaks, and the second block
-/// is new structure a caller can parse instead of re-deriving it from prose.
-fn fail_core(e: &CoreError) -> CallToolResult {
-    let outcome = ErrorOutcome::classify(e);
-    let structured =
-        serde_json::to_string(&outcome).unwrap_or_else(|_| r#"{"code":"INTERNAL"}"#.to_string());
-    CallToolResult::error(vec![
-        ContentBlock::text(e.to_string()),
-        ContentBlock::text(structured),
-    ])
 }
 
 // ── arguments ────────────────────────────────────────────────────────────────
@@ -785,6 +762,589 @@ struct CloseAppArgs {
     confirm_destructive: bool,
 }
 
+// ── prepared calls ───────────────────────────────────────────────────────────
+//
+// Each tool's whole behaviour lives in one `prep_*` function: parse and
+// validate the arguments, build the matching `cua_core::Op`, and say how its
+// outcome is rendered. The `#[tool]` method only dispatches it, and `batch`
+// dispatches the very same value — so a step in a batch and a solo call are one
+// code path, not two that have to be kept in step.
+
+/// A tool call ready to send to the worker, or the refusal its arguments
+/// earned before anything native was attempted.
+type Prepared = Result<Op<CallToolResult>, CallToolResult>;
+
+fn rendered_action(op: Op<cua_core::ActionResult>) -> Op<CallToolResult> {
+    op.map(|r| match r {
+        Ok(r) => ok(render_action(&r)),
+        Err(e) => fail(e.to_string()),
+    })
+}
+
+fn prep_check_permissions() -> Op<CallToolResult> {
+    Op::permissions().map(|r| match r {
+        Ok(p) => {
+            let mut lines = vec![
+                format!("accessibility:    {}", yes_no(p.accessibility)),
+                format!("screen_recording: {}", yes_no(p.screen_recording)),
+            ];
+            if !p.accessibility {
+                lines.push(
+                    "\nGrant Accessibility in System Settings > Privacy & Security > Accessibility. Add the app that LAUNCHED this server (your terminal or agent app), not the cua-rs binary: macOS attributes the request to the host process."
+                        .into(),
+                );
+            }
+            if !p.screen_recording {
+                lines.push(
+                    "\nGrant Screen Recording in System Settings > Privacy & Security > Screen Recording, same host process. The accessibility tree and AX actions still work without it; screenshots and the custom-control pid-routed click fallback are unavailable because their target window cannot be revalidated."
+                        .into(),
+                );
+            }
+            ok(lines.join("\n"))
+        }
+        Err(e) => fail(e.to_string()),
+    })
+}
+
+fn prep_list_apps() -> Op<CallToolResult> {
+    Op::list_apps().map(|r| match r {
+        Ok(apps) => {
+            let mut out = String::new();
+            for a in apps {
+                out.push_str(&format!(
+                    "{}{}  {}  pid={}{}\n",
+                    if a.active { "* " } else { "  " },
+                    a.name,
+                    a.bundle_id.as_deref().unwrap_or("-"),
+                    a.pid,
+                    if a.regular { "" } else { "  (background)" }
+                ));
+            }
+            out.push_str("\n* = frontmost");
+            ok(out)
+        }
+        Err(e) => fail(e.to_string()),
+    })
+}
+
+fn prep_get_app_state(a: AppArgs) -> Prepared {
+    let mut opts = StateOptions {
+        include_screenshot: a.include_screenshot,
+        ..Default::default()
+    };
+    if let Some(d) = a.max_image_dim {
+        opts.max_image_dim = d;
+    }
+    if let Some(n) = a.max_elements {
+        opts.limits.max_nodes = n.clamp(1, 20_000);
+    }
+    if a.verbose {
+        opts.render.include_noise = true;
+        opts.render.include_frames = true;
+    }
+    opts.render.skeleton = a.skeleton;
+    if let Some(raw) = &a.scope_element_id {
+        match raw.trim().parse::<usize>() {
+            Ok(i) => opts.scope = Some(i),
+            Err(_) => {
+                return Err(fail(format!(
+                    "scope_element_id must be a whole number, got {raw:?}"
+                )))
+            }
+        }
+    }
+    Ok(Op::get_app_state(&a.app, opts).map(|r| match r {
+        Ok(state) => render_app_state(state),
+        Err(e) => fail(e.to_string()),
+    }))
+}
+
+fn render_app_state(state: cua_core::AppState) -> CallToolResult {
+    let mut header = format!(
+        "{} (pid {})  snapshot_id={}\nelement_token: join this snapshot_id, the [N] in a tree line, and that line's role with dashes — e.g. `{}-12-AXButton` — and pass it as element_token to pin the action to exactly this element\nwindow: {}\nelements: {} total, {} actionable\n",
+        state.app.name,
+        state.app.pid,
+        state.snapshot_id,
+        state.snapshot_id,
+        match state.window_id {
+            // Printed rather than kept internal because it is the only
+            // handle `click_in_window` accepts, and that tool refuses an id
+            // this app's latest read did not produce.
+            Some(id) => format!(
+                "{}  (window_id={id})",
+                state.window_title.as_deref().unwrap_or("(untitled)")
+            ),
+            None => format!(
+                "{}  (no verified window id)",
+                state.window_title.as_deref().unwrap_or("(untitled)")
+            ),
+        },
+        state.node_count,
+        state.actionable_count,
+    );
+    for w in &state.warnings {
+        header.push_str(&format!("warning: {w}\n"));
+    }
+
+    let popups = render_popups(&state.popups);
+    let mut blocks = vec![ContentBlock::text(format!(
+        "{header}{popups}\n{}",
+        state.tree
+    ))];
+    if let Some(shot) = state.screenshot {
+        // The extent is stated, not assumed. `screencapture -l<id>`
+        // photographs the window group, so with a menu open the image covers
+        // the union of the window and the menu — bigger than the window, and
+        // with the scale to match. A caller converting a pixel back to a
+        // point has to divide by *this* scale and measure from *this*
+        // origin, so both are printed rather than left to be inferred from
+        // the window frame.
+        let grew = shot.frame.size.width > shot.window_frame.size.width
+            || shot.frame.size.height > shot.window_frame.size.height;
+        blocks.push(ContentBlock::text(format!(
+            "screenshot: {}x{} px, {:.2} px per point, covering {:.0},{:.0} {:.0}x{:.0} points{}",
+            shot.width,
+            shot.height,
+            shot.scale,
+            shot.frame.origin.x,
+            shot.frame.origin.y,
+            shot.frame.size.width,
+            shot.frame.size.height,
+            if grew {
+                "  (LARGER than the window itself: macOS captures a window together with the pop-up UI attached to it, so this one image already contains the menu — there is no separate screenshot to ask for. Subtract the origin above, not the window's, when turning a pixel into a point)"
+            } else {
+                ""
+            }
+        )));
+        blocks.push(ContentBlock::image(
+            base64::engine::general_purpose::STANDARD.encode(&shot.png),
+            "image/png",
+        ));
+    }
+    CallToolResult::success(blocks)
+}
+
+fn prep_click(a: ClickArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let mouse = a.mouse.options().map_err(fail)?;
+    let want_state = a.target.return_state();
+    let mouse = mouse.with_count(a.count.unwrap_or(1).clamp(1, 3));
+    Ok(rendered_action(Op::click(
+        &a.target.app,
+        target,
+        mouse,
+        want_state,
+        a.confirm_destructive,
+    )))
+}
+
+fn prep_drag(a: DragArgs) -> Prepared {
+    let from = a.drag_origin().map_err(fail)?;
+    let to = a.drag_destination().map_err(fail)?;
+    let mouse = a.mouse.options().map_err(fail)?;
+    let want_state = a.return_state.unwrap_or(true);
+    Ok(rendered_action(Op::drag(
+        &a.app,
+        from,
+        to,
+        mouse,
+        a.snapshot_id,
+        want_state,
+    )))
+}
+
+fn prep_hover(a: HoverArgs) -> Prepared {
+    let at = a.at.location(a.snapshot_id, "").map_err(fail)?;
+    let modifiers = MouseOptions::parse("", a.modifiers.as_deref().unwrap_or(""))
+        .map_err(fail)?
+        .modifiers;
+    let want_state = a.return_state.unwrap_or(true);
+    Ok(rendered_action(Op::hover(
+        &a.app,
+        at,
+        modifiers,
+        a.snapshot_id,
+        want_state,
+    )))
+}
+
+fn prep_click_in_window(a: ClickInWindowArgs) -> Prepared {
+    let at = cua_core::WindowPixel {
+        window_id: a.window_id,
+        x: a.x,
+        y: a.y,
+        snapshot_id: a.snapshot_id,
+    };
+    let want_state = a.return_state.unwrap_or(true);
+    let mouse = a
+        .mouse
+        .options()
+        .map_err(fail)?
+        .with_count(a.count.unwrap_or(1).clamp(1, 3));
+    Ok(rendered_action(Op::click_in_window(
+        &a.app, at, mouse, want_state,
+    )))
+}
+
+fn prep_set_value(a: SetValueArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let want_state = a.target.return_state();
+    Ok(rendered_action(Op::set_value(
+        &a.target.app,
+        target,
+        &a.value,
+        want_state,
+    )))
+}
+
+fn prep_scroll(a: ScrollArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let dir = match a.direction.to_lowercase().as_str() {
+        "up" => ScrollDir::Up,
+        "down" => ScrollDir::Down,
+        "left" => ScrollDir::Left,
+        "right" => ScrollDir::Right,
+        other => {
+            return Err(fail(format!(
+                "direction must be up/down/left/right, got {other:?}"
+            )))
+        }
+    };
+    let want_state = a.target.return_state();
+    // `pixels` wins when both are given: it is the more specific request,
+    // and it is the only one of the two that can express a distance at all.
+    let amount = match a.pixels {
+        Some(px) => ScrollAmount::Points(px.clamp(1, 20_000)),
+        None => ScrollAmount::Pages(a.pages.unwrap_or(1).clamp(1, 50)),
+    };
+    Ok(rendered_action(Op::scroll(
+        &a.target.app,
+        target,
+        dir,
+        amount,
+        want_state,
+    )))
+}
+
+fn prep_type_text(a: TypeTextArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let mechanism = match a.mechanism.as_deref().map(cua_core::Mechanism::parse) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => return Err(fail(e)),
+        None => cua_core::Mechanism::default(),
+    };
+    let want_state = a.target.return_state();
+    Ok(rendered_action(Op::type_text(
+        &a.target.app,
+        target,
+        &a.text,
+        mechanism,
+        want_state,
+    )))
+}
+
+fn prep_select_text(a: SelectTextArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let want_state = a.target.return_state();
+    Ok(rendered_action(Op::select_text(
+        &a.target.app,
+        target,
+        &a.text,
+        a.prefix,
+        a.suffix,
+        want_state,
+    )))
+}
+
+fn prep_press_key(a: PressKeyArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let want_state = a.target.return_state();
+    Ok(rendered_action(Op::press_key(
+        &a.target.app,
+        target,
+        &a.key,
+        want_state,
+        a.confirm_destructive,
+    )))
+}
+
+fn prep_menu_bar(a: MenuBarArgs) -> Prepared {
+    let path = a.path.unwrap_or_default();
+    if a.press {
+        return Ok(rendered_action(Op::press_menu_bar(
+            &a.app,
+            &path,
+            false,
+            a.confirm_destructive,
+        )));
+    }
+    Ok(Op::menu_bar(&a.app, &path).map(|r| match r {
+        Ok(listing) => ok(render_menu(&listing)),
+        Err(e) => fail(e.to_string()),
+    }))
+}
+
+fn prep_perform_secondary_action(a: SecondaryActionArgs) -> Prepared {
+    let target = a.target.target().map_err(fail)?;
+    let want_state = a.target.return_state();
+    Ok(rendered_action(Op::perform_action(
+        &a.target.app,
+        target,
+        &a.action,
+        want_state,
+        a.confirm_destructive,
+    )))
+}
+
+fn prep_find(a: FindArgs) -> Prepared {
+    let limit = a.limit.unwrap_or(20).clamp(1, 200);
+    let text = a.text;
+    Ok(Op::find(&a.app, &text, limit).map(move |r| match r {
+        Ok(r) => {
+            if r.lines.is_empty() {
+                return ok(format!(
+                    "no element matching {:?} among {} elements (snapshot {})",
+                    text, r.searched, r.snapshot_id
+                ));
+            }
+            ok(format!(
+                "{} match(es) for {:?}  snapshot_id={}\n\n{}",
+                r.total,
+                text,
+                r.snapshot_id,
+                r.lines.join("\n")
+            ))
+        }
+        Err(e) => fail(e.to_string()),
+    }))
+}
+
+fn prep_wait_for(a: WaitForArgs) -> Prepared {
+    let want = if a.gone.unwrap_or(false) {
+        Presence::Disappears
+    } else {
+        Presence::Appears
+    };
+    // Capped: a tool call that can block for minutes will hit the MCP
+    // client's own timeout and strand the poll loop.
+    let timeout_ms = a.timeout_ms.unwrap_or(5_000).clamp(250, 60_000);
+    let text = a.text;
+    Ok(
+        Op::wait_for(&a.app, &text, want, timeout_ms).map(move |r| match r {
+            Ok(r) => {
+                let verb = if want == Presence::Appears {
+                    "appeared"
+                } else {
+                    "disappeared"
+                };
+                let head = if r.satisfied {
+                    format!("{:?} {verb} after {}ms", text, r.elapsed_ms)
+                } else {
+                    format!(
+                        "timed out after {}ms: {:?} never {verb}",
+                        r.elapsed_ms, text
+                    )
+                };
+                let body = format!("{head}\npolls: {}\nsnapshot_id: {}", r.polls, r.snapshot_id);
+                if r.satisfied {
+                    ok(body)
+                } else {
+                    fail(body)
+                }
+            }
+            Err(e) => fail(e.to_string()),
+        }),
+    )
+}
+
+// ── batch ────────────────────────────────────────────────────────────────────
+
+/// One step of a `batch`: the name of another tool and exactly the arguments
+/// that tool takes on its own.
+///
+/// Every variant wraps the tool's existing argument struct, so a field added to
+/// a tool is a field its batch step accepts, with no second definition to
+/// forget. `batch` itself is deliberately absent: a nested batch would add
+/// nothing a flat one cannot say, and only obscure which step failed.
+/// The `params` of a step whose tool takes no arguments. Strict, so a field
+/// meant for some other tool is an error rather than silently dropped.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "tool", content = "params", rename_all = "snake_case")]
+enum BatchStep {
+    /// No params: omit `params`, or pass `null` or `{}`.
+    CheckPermissions(
+        #[expect(
+            dead_code,
+            reason = "exists only so `params: {}` deserializes; there is nothing to read"
+        )]
+        Option<NoArgs>,
+    ),
+    /// No params: omit `params`, or pass `null` or `{}`.
+    ListApps(
+        #[expect(
+            dead_code,
+            reason = "exists only so `params: {}` deserializes; there is nothing to read"
+        )]
+        Option<NoArgs>,
+    ),
+    GetAppState(AppArgs),
+    Find(FindArgs),
+    WaitFor(WaitForArgs),
+    Click(ClickArgs),
+    ClickInWindow(ClickInWindowArgs),
+    Drag(DragArgs),
+    Hover(HoverArgs),
+    SetValue(SetValueArgs),
+    TypeText(TypeTextArgs),
+    SelectText(SelectTextArgs),
+    PressKey(PressKeyArgs),
+    MenuBar(MenuBarArgs),
+    Scroll(ScrollArgs),
+    PerformSecondaryAction(SecondaryActionArgs),
+}
+
+impl BatchStep {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::CheckPermissions(_) => "check_permissions",
+            Self::ListApps(_) => "list_apps",
+            Self::GetAppState(_) => "get_app_state",
+            Self::Find(_) => "find",
+            Self::WaitFor(_) => "wait_for",
+            Self::Click(_) => "click",
+            Self::ClickInWindow(_) => "click_in_window",
+            Self::Drag(_) => "drag",
+            Self::Hover(_) => "hover",
+            Self::SetValue(_) => "set_value",
+            Self::TypeText(_) => "type_text",
+            Self::SelectText(_) => "select_text",
+            Self::PressKey(_) => "press_key",
+            Self::MenuBar(_) => "menu_bar",
+            Self::Scroll(_) => "scroll",
+            Self::PerformSecondaryAction(_) => "perform_secondary_action",
+        }
+    }
+
+    /// The same `prep_*` the solo tool dispatches.
+    fn prepare(self) -> Prepared {
+        match self {
+            Self::CheckPermissions(_) => Ok(prep_check_permissions()),
+            Self::ListApps(_) => Ok(prep_list_apps()),
+            Self::GetAppState(a) => prep_get_app_state(a),
+            Self::Find(a) => prep_find(a),
+            Self::WaitFor(a) => prep_wait_for(a),
+            Self::Click(a) => prep_click(a),
+            Self::ClickInWindow(a) => prep_click_in_window(a),
+            Self::Drag(a) => prep_drag(a),
+            Self::Hover(a) => prep_hover(a),
+            Self::SetValue(a) => prep_set_value(a),
+            Self::TypeText(a) => prep_type_text(a),
+            Self::SelectText(a) => prep_select_text(a),
+            Self::PressKey(a) => prep_press_key(a),
+            Self::MenuBar(a) => prep_menu_bar(a),
+            Self::Scroll(a) => prep_scroll(a),
+            Self::PerformSecondaryAction(a) => prep_perform_secondary_action(a),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BatchArgs {
+    /// The calls to make, in order. Each is `{"tool": "<name>", "params":
+    /// {...}}` with exactly the arguments that tool takes on its own;
+    /// `list_apps` and `check_permissions` take no `params`.
+    steps: Vec<BatchStep>,
+    /// Stop at the first step that fails (the default), reporting which steps
+    /// were not run. Pass false to run every step regardless and get every
+    /// result back.
+    #[serde(default = "yes")]
+    bail_on_error: bool,
+}
+
+/// Steps one batch may carry. The batch holds the native thread for its whole
+/// duration, so it is bounded like every other budget in this server.
+const MAX_BATCH_STEPS: usize = 50;
+
+fn step_failed(r: &cua_core::session::Result<CallToolResult>) -> bool {
+    match r {
+        Ok(result) => result.is_error == Some(true),
+        Err(_) => true,
+    }
+}
+
+/// Run a whole batch. Called once, inside one `spawn_blocking`, and itself
+/// issues one worker job for all the steps (`Cua::run_batch`).
+fn run_batch_blocking(cua: &Cua, a: BatchArgs) -> CallToolResult {
+    let total = a.steps.len();
+    if total == 0 {
+        return fail("steps is empty: pass at least one {\"tool\": \"<name>\", \"params\": {...}}");
+    }
+    if total > MAX_BATCH_STEPS {
+        return fail(format!(
+            "a batch holds at most {MAX_BATCH_STEPS} steps, got {total}: split it"
+        ));
+    }
+    let names: Vec<&'static str> = a.steps.iter().map(BatchStep::name).collect();
+    // A step whose arguments were refused still occupies its place: it fails
+    // at its index, after the steps before it have run, exactly where a solo
+    // call made at that point would have failed.
+    let ops: Vec<Op<CallToolResult>> = a
+        .steps
+        .into_iter()
+        .map(|step| step.prepare().unwrap_or_else(Op::ready))
+        .collect();
+    let bail = a.bail_on_error;
+    let ran = match cua.run_batch(ops, move |r| bail && step_failed(r)) {
+        Ok(ran) => ran,
+        Err(e) => return fail(e.to_string()),
+    };
+    let results: Vec<CallToolResult> = ran
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|e| fail(e.to_string())))
+        .collect();
+    render_batch(&names, results)
+}
+
+fn render_batch(names: &[&'static str], results: Vec<CallToolResult>) -> CallToolResult {
+    let total = names.len();
+    let ran = results.len();
+    let failed = results.iter().filter(|r| r.is_error == Some(true)).count();
+    let mut summary = format!("batch: ran {ran} of {total} step(s), {failed} failed");
+    if ran < total {
+        summary.push_str(&format!(
+            "; stopped at step {} because it failed (bail_on_error=true) — steps {}..={} were NOT run",
+            ran.saturating_sub(1),
+            ran,
+            total - 1
+        ));
+    }
+    let mut content = vec![ContentBlock::text(summary)];
+    for (i, result) in results.into_iter().enumerate() {
+        let status = if result.is_error == Some(true) {
+            "ERROR"
+        } else {
+            "ok"
+        };
+        content.push(ContentBlock::text(format!(
+            "── step {i}: {} — {status}",
+            names[i]
+        )));
+        content.extend(result.content);
+    }
+    for (i, name) in names.iter().enumerate().skip(ran) {
+        content.push(ContentBlock::text(format!("── step {i}: {name} — not run")));
+    }
+    if failed > 0 {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -806,7 +1366,11 @@ impl CuaServer {
     /// Every `Cua` method blocks on the native worker thread's reply. Calling
     /// one directly from an async context would occupy a tokio worker for the
     /// duration of an AX round-trip, so it is moved to the blocking pool.
-    async fn native<T, F>(&self, f: F) -> T
+    ///
+    /// A panic inside `f` is already turned into an error by the worker's own
+    /// `catch_unwind`; a failed join here is reported as a tool error rather
+    /// than unwinding through the MCP service.
+    async fn native<T, F>(&self, f: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&Cua) -> T + Send + 'static,
@@ -814,7 +1378,24 @@ impl CuaServer {
         let cua = self.cua.clone();
         tokio::task::spawn_blocking(move || f(&cua))
             .await
-            .expect("native task panicked")
+            .map_err(|e| format!("native task failed: {e}"))
+    }
+
+    /// Run one prepared tool call: the single path every solo tool takes.
+    ///
+    /// A refusal decided while parsing arguments is answered without touching
+    /// the worker at all; everything else is exactly one `spawn_blocking` and
+    /// one worker job.
+    async fn dispatch(&self, prepared: Prepared) -> CallToolResult {
+        let op = match prepared {
+            Ok(op) => op,
+            Err(refusal) => return refusal,
+        };
+        match self.native(move |c| c.run(op)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => fail(e.to_string()),
+            Err(e) => fail(e),
+        }
     }
 }
 
@@ -824,52 +1405,14 @@ impl CuaServer {
         description = "Report whether this server holds the two macOS grants it needs: Accessibility (to read UI structure and deliver actions) and Screen Recording (to capture window images). Never prompts. Call this first when anything fails with a permission error."
     )]
     async fn check_permissions(&self) -> Result<CallToolResult, McpError> {
-        match self.native(|c| c.permissions()).await {
-            Ok(p) => {
-                let mut lines = vec![
-                    format!("accessibility:    {}", yes_no(p.accessibility)),
-                    format!("screen_recording: {}", yes_no(p.screen_recording)),
-                ];
-                if !p.accessibility {
-                    lines.push(
-                        "\nGrant Accessibility in System Settings > Privacy & Security > Accessibility. Add the app that LAUNCHED this server (your terminal or agent app), not the cua-rs binary: macOS attributes the request to the host process."
-                            .into(),
-                    );
-                }
-                if !p.screen_recording {
-                    lines.push(
-                        "\nGrant Screen Recording in System Settings > Privacy & Security > Screen Recording, same host process. The accessibility tree and AX actions still work without it; screenshots and the custom-control pid-routed click fallback are unavailable because their target window cannot be revalidated."
-                            .into(),
-                    );
-                }
-                Ok(ok(lines.join("\n")))
-            }
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(Ok(prep_check_permissions())).await)
     }
 
     #[tool(
         description = "List running applications, frontmost first. Use this to discover the exact name or bundle identifier to pass as `app`. Apps marked `background` have no windows and usually cannot be driven."
     )]
     async fn list_apps(&self) -> Result<CallToolResult, McpError> {
-        match self.native(|c| c.list_apps()).await {
-            Ok(apps) => {
-                let mut out = String::new();
-                for a in apps {
-                    out.push_str(&format!(
-                        "{}{}  {}  pid={}{}\n",
-                        if a.active { "* " } else { "  " },
-                        a.name,
-                        a.bundle_id.as_deref().unwrap_or("-"),
-                        a.pid,
-                        if a.regular { "" } else { "  (background)" }
-                    ));
-                }
-                out.push_str("\n* = frontmost");
-                Ok(ok(out))
-            }
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(Ok(prep_list_apps())).await)
     }
 
     #[tool(
@@ -879,100 +1422,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<AppArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut opts = StateOptions {
-            include_screenshot: a.include_screenshot,
-            ..Default::default()
-        };
-        if let Some(d) = a.max_image_dim {
-            opts.max_image_dim = d;
-        }
-        if let Some(n) = a.max_elements {
-            opts.limits.max_nodes = n.clamp(1, 20_000);
-        }
-        if a.verbose {
-            opts.render.include_noise = true;
-            opts.render.include_frames = true;
-        }
-        opts.render.skeleton = a.skeleton;
-        if let Some(raw) = &a.scope_element_id {
-            match raw.trim().parse::<usize>() {
-                Ok(i) => opts.scope = Some(i),
-                Err(_) => {
-                    return Ok(fail(format!(
-                        "scope_element_id must be a whole number, got {raw:?}"
-                    )))
-                }
-            }
-        }
-
-        let app = a.app.clone();
-        let state = match self.native(move |c| c.get_app_state(&app, opts)).await {
-            Ok(s) => s,
-            Err(e) => return Ok(fail_core(&e)),
-        };
-
-        let mut header = format!(
-            "{} (pid {})  snapshot_id={}\nelement_token: join this snapshot_id, the [N] in a tree line, and that line's role with dashes — e.g. `{}-12-AXButton` — and pass it as element_token to pin the action to exactly this element\nwindow: {}\nelements: {} total, {} actionable\n",
-            state.app.name,
-            state.app.pid,
-            state.snapshot_id,
-            state.snapshot_id,
-            match state.window_id {
-                // Printed rather than kept internal because it is the only
-                // handle `click_in_window` accepts, and that tool refuses an id
-                // this app's latest read did not produce.
-                Some(id) => format!(
-                    "{}  (window_id={id})",
-                    state.window_title.as_deref().unwrap_or("(untitled)")
-                ),
-                None => format!(
-                    "{}  (no verified window id)",
-                    state.window_title.as_deref().unwrap_or("(untitled)")
-                ),
-            },
-            state.node_count,
-            state.actionable_count,
-        );
-        for w in &state.warnings {
-            header.push_str(&format!("warning: {w}\n"));
-        }
-
-        let popups = render_popups(&state.popups);
-        let mut blocks = vec![ContentBlock::text(format!(
-            "{header}{popups}\n{}",
-            state.tree
-        ))];
-        if let Some(shot) = state.screenshot {
-            // The extent is stated, not assumed. `screencapture -l<id>`
-            // photographs the window group, so with a menu open the image covers
-            // the union of the window and the menu — bigger than the window, and
-            // with the scale to match. A caller converting a pixel back to a
-            // point has to divide by *this* scale and measure from *this*
-            // origin, so both are printed rather than left to be inferred from
-            // the window frame.
-            let grew = shot.frame.size.width > shot.window_frame.size.width
-                || shot.frame.size.height > shot.window_frame.size.height;
-            blocks.push(ContentBlock::text(format!(
-                "screenshot: {}x{} px, {:.2} px per point, covering {:.0},{:.0} {:.0}x{:.0} points{}",
-                shot.width,
-                shot.height,
-                shot.scale,
-                shot.frame.origin.x,
-                shot.frame.origin.y,
-                shot.frame.size.width,
-                shot.frame.size.height,
-                if grew {
-                    "  (LARGER than the window itself: macOS captures a window together with the pop-up UI attached to it, so this one image already contains the menu — there is no separate screenshot to ask for. Subtract the origin above, not the window's, when turning a pixel into a point)"
-                } else {
-                    ""
-                }
-            )));
-            blocks.push(ContentBlock::image(
-                base64::engine::general_purpose::STANDARD.encode(&shot.png),
-                "image/png",
-            ));
-        }
-        Ok(CallToolResult::success(blocks))
+        Ok(self.dispatch(prep_get_app_state(a)).await)
     }
 
     #[tool(
@@ -982,53 +1432,14 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<ClickArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let mouse = match a.mouse.options() {
-            Ok(m) => m,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let mouse = mouse.with_count(a.count.unwrap_or(1).clamp(1, 3));
-        let confirm = a.confirm_destructive;
-        match self
-            .native(move |c| c.click(&app, target, mouse, want_state, confirm))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_click(a)).await)
     }
 
     #[tool(
         description = "Press the mouse down at one point, move through interpolated intermediate points, and release at another — a real drag, delivered to the target process by pid with the cursor, keyboard focus, frontmost app and Space all untouched. Use it to reorder a list row, drag a file onto a folder, draw a selection rectangle on a canvas, move a slider knob, or resize a split. Each end is named independently and the two may be different elements of the same app: pass from_element_token / to_element_token (preferred, from get_app_state), or from_element_index / to_element_index, or from_window_x+from_window_y / to_window_x+to_window_y for an end that is bare canvas with no element behind it. Window coordinates are POINTS from the window's top-left corner (screenshot pixel / the `px per point` scale get_app_state reports), re-anchored to the window's live position just before the events go out. Both ends must be inside the SAME window that the app's most recent get_app_state read — a gesture cannot cross a window boundary and cua-rs refuses rather than guessing. The intermediate moves are interpolated rather than jumped, because a down at A followed by an up at B is not a drag to anything that implements one. `button` and `modifiers` work as they do on click. A success means the events were delivered in order and the mouse-up was sent even if a move failed partway; whether the target implemented a drag at all is what the returned state diff is for."
     )]
     async fn drag(&self, Parameters(a): Parameters<DragArgs>) -> Result<CallToolResult, McpError> {
-        let from = match a.drag_origin() {
-            Ok(l) => l,
-            Err(e) => return Ok(fail(e)),
-        };
-        let to = match a.drag_destination() {
-            Ok(l) => l,
-            Err(e) => return Ok(fail(e)),
-        };
-        let mouse = match a.mouse.options() {
-            Ok(m) => m,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.app.clone();
-        let want_state = a.return_state.unwrap_or(true);
-        let snapshot_id = a.snapshot_id;
-        match self
-            .native(move |c| c.drag(&app, from, to, mouse, snapshot_id, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_drag(a)).await)
     }
 
     #[tool(
@@ -1038,24 +1449,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<HoverArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let at = match a.at.location(a.snapshot_id, "") {
-            Ok(l) => l,
-            Err(e) => return Ok(fail(e)),
-        };
-        let modifiers = match MouseOptions::parse("", a.modifiers.as_deref().unwrap_or("")) {
-            Ok(m) => m.modifiers,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.app.clone();
-        let want_state = a.return_state.unwrap_or(true);
-        let snapshot_id = a.snapshot_id;
-        match self
-            .native(move |c| c.hover(&app, at, modifiers, snapshot_id, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_hover(a)).await)
     }
 
     #[tool(
@@ -1065,25 +1459,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<ClickInWindowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let app = a.app.clone();
-        let at = cua_core::WindowPixel {
-            window_id: a.window_id,
-            x: a.x,
-            y: a.y,
-            snapshot_id: a.snapshot_id,
-        };
-        let want_state = a.return_state.unwrap_or(true);
-        let mouse = match a.mouse.options() {
-            Ok(m) => m.with_count(a.count.unwrap_or(1).clamp(1, 3)),
-            Err(e) => return Ok(fail(e)),
-        };
-        match self
-            .native(move |c| c.click_in_window(&app, at, mouse, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_click_in_window(a)).await)
     }
 
     #[tool(
@@ -1093,20 +1469,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<SetValueArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let value = a.value.clone();
-        match self
-            .native(move |c| c.set_value(&app, target, &value, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_set_value(a)).await)
     }
 
     #[tool(
@@ -1116,36 +1479,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<ScrollArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let dir = match a.direction.to_lowercase().as_str() {
-            "up" => ScrollDir::Up,
-            "down" => ScrollDir::Down,
-            "left" => ScrollDir::Left,
-            "right" => ScrollDir::Right,
-            other => {
-                return Ok(fail(format!(
-                    "direction must be up/down/left/right, got {other:?}"
-                )))
-            }
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        // `pixels` wins when both are given: it is the more specific request,
-        // and it is the only one of the two that can express a distance at all.
-        let amount = match a.pixels {
-            Some(px) => ScrollAmount::Points(px.clamp(1, 20_000)),
-            None => ScrollAmount::Pages(a.pages.unwrap_or(1).clamp(1, 50)),
-        };
-        match self
-            .native(move |c| c.scroll(&app, target, dir, amount, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_scroll(a)).await)
     }
 
     #[tool(
@@ -1155,25 +1489,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<TypeTextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let mechanism = match a.mechanism.as_deref().map(cua_core::Mechanism::parse) {
-            Some(Ok(m)) => m,
-            Some(Err(e)) => return Ok(fail(e)),
-            None => cua_core::Mechanism::default(),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let text = a.text.clone();
-        match self
-            .native(move |c| c.type_text(&app, target, &text, mechanism, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_type_text(a)).await)
     }
 
     #[tool(
@@ -1183,20 +1499,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<SelectTextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let (text, prefix, suffix) = (a.text.clone(), a.prefix.clone(), a.suffix.clone());
-        match self
-            .native(move |c| c.select_text(&app, target, &text, prefix, suffix, want_state))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_select_text(a)).await)
     }
 
     #[tool(
@@ -1206,21 +1509,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<PressKeyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let key = a.key.clone();
-        let confirm = a.confirm_destructive;
-        match self
-            .native(move |c| c.press_key(&app, target, &key, want_state, confirm))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_press_key(a)).await)
     }
 
     #[tool(
@@ -1230,109 +1519,7 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<MenuBarArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let app = a.app.clone();
-        let path = a.path.clone().unwrap_or_default();
-        if a.press {
-            let confirm = a.confirm_destructive;
-            return match self
-                .native(move |c| c.press_menu_bar(&app, &path, false, confirm))
-                .await
-            {
-                Ok(r) => Ok(ok(render_action(&r))),
-                Err(e) => Ok(fail_core(&e)),
-            };
-        }
-        match self.native(move |c| c.menu_bar(&app, &path)).await {
-            Ok(listing) => Ok(ok(render_menu(&listing))),
-            Err(e) => Ok(fail_core(&e)),
-        }
-    }
-
-    #[tool(
-        description = "List macOS notifications: app, title, subtitle, body, the custom actions each one offers, and an `id` to pass to dismiss_notification / notification_action. Notifications are drawn by Notification Center, not by the app that posted them, so `app` is the posting app's display name as Notification Center shows it. The id is Notification Center's own UUID for the notification — stable across reads and from banner to history, so it does not go stale when a neighbour is removed. By default this reads only what is on screen right now: a banner lasts about 5 s and then moves to history. Pass include_history=true to read the history panel too; cua-rs opens it from the menu-bar clock, expands per-app stacks, and closes it again — that presses UI, so it is gated like an action. Verified on macOS 26.2; see DESIGN.md §13 for what is and is not."
-    )]
-    async fn list_notifications(
-        &self,
-        Parameters(a): Parameters<ListNotificationsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let history = a.include_history;
-        match self.native(move |c| c.list_notifications(history)).await {
-            Ok(listing) => Ok(ok(render_notifications(&listing, history))),
-            Err(e) => Ok(fail(e.to_string())),
-        }
-    }
-
-    #[tool(
-        description = "Dismiss one notification by the id list_notifications gave, by pressing the Close action Notification Center advertises on it (there is no separate close button in its accessibility tree). Measured on macOS 26.2: Close removes the notification from history too, not just the banner. Looks at live banners first, then the history panel (opened and closed again around the call) unless include_history=false. The result says whether the notification was verified gone afterwards. SAFETY: gated like any action on Notification Center, and additionally refused when the notification came from an app cua-rs may not act on (password managers, authenticators, Keychain, System Settings) or, under CUA_ALLOWED_APPS, from an app outside the scope or one that cannot be identified."
-    )]
-    async fn dismiss_notification(
-        &self,
-        Parameters(a): Parameters<NotificationIdArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let id = match notification_id(&a.id) {
-            Ok(id) => id,
-            Err(e) => return Ok(fail(e)),
-        };
-        let history = a.include_history;
-        match self
-            .native(move |c| c.dismiss_notification(&id, history))
-            .await
-        {
-            Ok(acted) => Ok(ok(render_acted(&acted))),
-            Err(e) => Ok(fail(e.to_string())),
-        }
-    }
-
-    #[tool(
-        description = "Dismiss every notification, one Close at a time, re-reading Notification Center after each one. Best effort: it STOPS at the first notification it cannot close — including one refused by a safety gate — and reports what it dismissed, what it stopped on and why, and how many remain. Covers the history panel too unless include_history=false. Same gates as dismiss_notification, applied per notification."
-    )]
-    async fn dismiss_all_notifications(
-        &self,
-        Parameters(a): Parameters<DismissAllArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let history = a.include_history;
-        match self
-            .native(move |c| c.dismiss_all_notifications(history))
-            .await
-        {
-            Ok(outcome) => {
-                let text = render_dismiss_all(&outcome);
-                if outcome.stopped_on.is_some() {
-                    Ok(fail(text))
-                } else {
-                    Ok(ok(text))
-                }
-            }
-            Err(e) => Ok(fail(e.to_string())),
-        }
-    }
-
-    #[tool(
-        description = "Press one of the named actions a notification advertises, by its label as list_notifications reports it under `actions` (localized: on a Korean system Show Details is `세부사항 보기`). Only the custom actions Notification Center itself publishes are reachable. Verified on macOS 26.2 for the system ones (Show Details, Close); APP-DEFINED BUTTONS (Reply, Snooze, Mark as Read…) WERE NOT AVAILABLE TO TEST and may not appear here at all — if the action is not advertised the error lists what is. The bare default click (AXPress, which hands off to the posting app) is not offered. SAFETY: a destructive-looking label (Clear All, Delete) needs confirm_destructive=true, and the same source-app gate as dismiss_notification applies — an action on an authenticator's notification is acting on the authenticator."
-    )]
-    async fn notification_action(
-        &self,
-        Parameters(a): Parameters<NotificationActionArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let id = match notification_id(&a.id) {
-            Ok(id) => id,
-            Err(e) => return Ok(fail(e)),
-        };
-        if a.action.trim().is_empty() {
-            return Ok(fail(
-                "`action` is empty; pass one of the labels list_notifications reported",
-            ));
-        }
-        let action = a.action.clone();
-        let history = a.include_history;
-        let confirm = a.confirm_destructive;
-        match self
-            .native(move |c| c.notification_action(&id, &action, history, confirm))
-            .await
-        {
-            Ok(acted) => Ok(ok(render_acted(&acted))),
-            Err(e) => Ok(fail(e.to_string())),
-        }
+        Ok(self.dispatch(prep_menu_bar(a)).await)
     }
 
     #[tool(
@@ -1342,48 +1529,39 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<SecondaryActionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = match a.target.target() {
-            Ok(t) => t,
-            Err(e) => return Ok(fail(e)),
-        };
-        let app = a.target.app.clone();
-        let want_state = a.target.return_state();
-        let action = a.action.clone();
-        let confirm = a.confirm_destructive;
-        match self
-            .native(move |c| c.perform_action(&app, target, &action, want_state, confirm))
-            .await
-        {
-            Ok(r) => Ok(ok(render_action(&r))),
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_perform_secondary_action(a)).await)
     }
 
     #[tool(
         description = "Search the current snapshot for elements whose label, value or role contains a string, case-insensitively. Much cheaper than re-reading a whole tree when you already know what you are looking for. Actionable matches are listed first, and label matches rank above value and role matches. Searches the snapshot you already have so the returned indices stay valid; walks afresh when there is none, or when an action has run since the last read."
     )]
     async fn find(&self, Parameters(a): Parameters<FindArgs>) -> Result<CallToolResult, McpError> {
-        let app = a.app.clone();
-        let text = a.text.clone();
-        let limit = a.limit.unwrap_or(20).clamp(1, 200);
-        match self.native(move |c| c.find(&app, &text, limit)).await {
-            Ok(r) => {
-                if r.lines.is_empty() {
-                    return Ok(ok(format!(
-                        "no element matching {:?} among {} elements (snapshot {})",
-                        a.text, r.searched, r.snapshot_id
-                    )));
-                }
-                Ok(ok(format!(
-                    "{} match(es) for {:?}  snapshot_id={}\n\n{}",
-                    r.total,
-                    a.text,
-                    r.snapshot_id,
-                    r.lines.join("\n")
-                )))
-            }
-            Err(e) => Ok(fail_core(&e)),
-        }
+        Ok(self.dispatch(prep_find(a)).await)
+    }
+
+    #[tool(
+        description = "Poll an app until a string appears in (or disappears from) its accessibility tree, or the timeout expires. Use this instead of guessing a sleep after an action that triggers loading, a dialog, or a navigation. Each poll re-walks the tree, so the interval is floored at 250ms. Returns whether the condition was met plus the snapshot_id of the final read."
+    )]
+    async fn wait_for(
+        &self,
+        Parameters(a): Parameters<WaitForArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(self.dispatch(prep_wait_for(a)).await)
+    }
+
+    #[tool(
+        description = "Run several of this server's other tools in ONE call, in order, and get every step's result back tagged by its index. Each step is {\"tool\": \"<name>\", \"params\": {<exactly the arguments that tool takes on its own>}} — e.g. [{\"tool\":\"set_value\",\"params\":{\"app\":\"TextEdit\",\"element_token\":\"7-3-AXTextArea\",\"value\":\"hi\",\"return_state\":false}},{\"tool\":\"press_key\",\"params\":{\"app\":\"TextEdit\",\"element_token\":\"7-3-AXTextArea\",\"key\":\"cmd+s\"}}]. Every tool except batch itself can be a step; list_apps and check_permissions take no params. A step is the SAME code as the solo call: the same safety gates (app scope, refused apps, confirm_destructive, screen lock, yield-to-human) run for each step, and snapshot_id / element_token staleness is checked against the state the PREVIOUS steps left behind — an action with return_state on, or a get_app_state, replaces the snapshot, so a later step citing the old snapshot_id fails exactly as it would solo. Plan for that: turn return_state off on intermediate steps, or cite only the snapshot you expect to still be current. bail_on_error (default true) stops at the first failing step and reports which steps were not run; pass false to run every step and collect every result. The whole batch runs as one uninterrupted job on the native thread, so no other call can interleave with it — which also means wait_for timeouts add up, so keep long waits out of large batches. At most 50 steps."
+    )]
+    async fn batch(
+        &self,
+        Parameters(a): Parameters<BatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // One spawn_blocking for the whole batch, and inside it one worker job
+        // (`Cua::run_batch`) — not one hop per step.
+        Ok(match self.native(move |c| run_batch_blocking(c, a)).await {
+            Ok(result) => result,
+            Err(e) => fail(e),
+        })
     }
 
     #[tool(
@@ -1395,8 +1573,9 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let max = a.max_chars.unwrap_or(20_000).clamp(1, 200_000);
         match self.native(|c| c.clipboard_get()).await {
-            Ok(r) => Ok(ok(render_clipboard_read(&r, max))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(r)) => Ok(ok(render_clipboard_read(&r, max))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1408,8 +1587,9 @@ impl CuaServer {
         Parameters(a): Parameters<ClipboardSetArgs>,
     ) -> Result<CallToolResult, McpError> {
         match self.native(move |c| c.clipboard_set(&a.text)).await {
-            Ok(w) => Ok(ok(render_clipboard_write(&w))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(w)) => Ok(ok(render_clipboard_write(&w))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1418,54 +1598,9 @@ impl CuaServer {
     )]
     async fn clipboard_clear(&self) -> Result<CallToolResult, McpError> {
         match self.native(|c| c.clipboard_clear()).await {
-            Ok(w) => Ok(ok(render_clipboard_write(&w))),
-            Err(e) => Ok(fail(e.to_string())),
-        }
-    }
-
-    #[tool(
-        description = "Poll an app until a string appears in (or disappears from) its accessibility tree, or the timeout expires. Use this instead of guessing a sleep after an action that triggers loading, a dialog, or a navigation. Each poll re-walks the tree, so the interval is floored at 250ms. Returns whether the condition was met plus the snapshot_id of the final read."
-    )]
-    async fn wait_for(
-        &self,
-        Parameters(a): Parameters<WaitForArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let app = a.app.clone();
-        let text = a.text.clone();
-        let want = if a.gone.unwrap_or(false) {
-            Presence::Disappears
-        } else {
-            Presence::Appears
-        };
-        // Capped: a tool call that can block for minutes will hit the MCP
-        // client's own timeout and strand the poll loop.
-        let timeout_ms = a.timeout_ms.unwrap_or(5_000).clamp(250, 60_000);
-        match self
-            .native(move |c| c.wait_for(&app, &text, want, timeout_ms))
-            .await
-        {
-            Ok(r) => {
-                let verb = if want == Presence::Appears {
-                    "appeared"
-                } else {
-                    "disappeared"
-                };
-                let head = if r.satisfied {
-                    format!("{:?} {verb} after {}ms", a.text, r.elapsed_ms)
-                } else {
-                    format!(
-                        "timed out after {}ms: {:?} never {verb}",
-                        r.elapsed_ms, a.text
-                    )
-                };
-                let body = format!("{head}\npolls: {}\nsnapshot_id: {}", r.polls, r.snapshot_id);
-                if r.satisfied {
-                    Ok(ok(body))
-                } else {
-                    Ok(fail(body))
-                }
-            }
-            Err(e) => Ok(fail_core(&e)),
+            Ok(Ok(w)) => Ok(ok(render_clipboard_write(&w))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1478,8 +1613,9 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
         match self.native(move |c| c.list_windows(&app)).await {
-            Ok(listing) => Ok(ok(render_window_listing(&listing))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(listing)) => Ok(ok(render_window_listing(&listing))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1556,8 +1692,9 @@ impl CuaServer {
     )]
     async fn list_displays(&self) -> Result<CallToolResult, McpError> {
         match self.native(|c| c.list_displays()).await {
-            Ok(displays) => Ok(ok(render_displays(&displays))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(displays)) => Ok(ok(render_displays(&displays))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1571,8 +1708,9 @@ impl CuaServer {
         let app = a.app.clone();
         let activate = a.activate;
         match self.native(move |c| c.launch_app(&app, activate)).await {
-            Ok(r) => Ok(ok(render_launch(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(r)) => Ok(ok(render_launch(&r))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 
@@ -1586,8 +1724,100 @@ impl CuaServer {
         let app = a.app.clone();
         let confirm = a.confirm_destructive;
         match self.native(move |c| c.close_app(&app, confirm)).await {
-            Ok(r) => Ok(ok(render_close(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(r)) => Ok(ok(render_close(&r))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+
+    #[tool(
+        description = "List macOS notifications: app, title, subtitle, body, the custom actions each one offers, and an `id` to pass to dismiss_notification / notification_action. Notifications are drawn by Notification Center, not by the app that posted them, so `app` is the posting app's display name as Notification Center shows it. The id is Notification Center's own UUID for the notification — stable across reads and from banner to history, so it does not go stale when a neighbour is removed. By default this reads only what is on screen right now: a banner lasts about 5 s and then moves to history. Pass include_history=true to read the history panel too; cua-rs opens it from the menu-bar clock, expands per-app stacks, and closes it again — that presses UI, so it is gated like an action. Verified on macOS 26.2; see DESIGN.md §13 for what is and is not."
+    )]
+    async fn list_notifications(
+        &self,
+        Parameters(a): Parameters<ListNotificationsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let history = a.include_history;
+        match self.native(move |c| c.list_notifications(history)).await {
+            Ok(Ok(listing)) => Ok(ok(render_notifications(&listing, history))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+
+    #[tool(
+        description = "Dismiss one notification by the id list_notifications gave, by pressing the Close action Notification Center advertises on it (there is no separate close button in its accessibility tree). Measured on macOS 26.2: Close removes the notification from history too, not just the banner. Looks at live banners first, then the history panel (opened and closed again around the call) unless include_history=false. The result says whether the notification was verified gone afterwards. SAFETY: gated like any action on Notification Center, and additionally refused when the notification came from an app cua-rs may not act on (password managers, authenticators, Keychain, System Settings) or, under CUA_ALLOWED_APPS, from an app outside the scope or one that cannot be identified."
+    )]
+    async fn dismiss_notification(
+        &self,
+        Parameters(a): Parameters<NotificationIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match notification_id(&a.id) {
+            Ok(id) => id,
+            Err(e) => return Ok(fail(e)),
+        };
+        let history = a.include_history;
+        match self
+            .native(move |c| c.dismiss_notification(&id, history))
+            .await
+        {
+            Ok(Ok(acted)) => Ok(ok(render_acted(&acted))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+
+    #[tool(
+        description = "Dismiss every notification, one Close at a time, re-reading Notification Center after each one. Best effort: it STOPS at the first notification it cannot close — including one refused by a safety gate — and reports what it dismissed, what it stopped on and why, and how many remain. Covers the history panel too unless include_history=false. Same gates as dismiss_notification, applied per notification."
+    )]
+    async fn dismiss_all_notifications(
+        &self,
+        Parameters(a): Parameters<DismissAllArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let history = a.include_history;
+        match self
+            .native(move |c| c.dismiss_all_notifications(history))
+            .await
+        {
+            Ok(Ok(outcome)) => {
+                let text = render_dismiss_all(&outcome);
+                if outcome.stopped_on.is_some() {
+                    Ok(fail(text))
+                } else {
+                    Ok(ok(text))
+                }
+            }
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+
+    #[tool(
+        description = "Press one of the named actions a notification advertises, by its label as list_notifications reports it under `actions` (localized: on a Korean system Show Details is `세부사항 보기`). Only the custom actions Notification Center itself publishes are reachable. Verified on macOS 26.2 for the system ones (Show Details, Close); APP-DEFINED BUTTONS (Reply, Snooze, Mark as Read…) WERE NOT AVAILABLE TO TEST and may not appear here at all — if the action is not advertised the error lists what is. The bare default click (AXPress, which hands off to the posting app) is not offered. SAFETY: a destructive-looking label (Clear All, Delete) needs confirm_destructive=true, and the same source-app gate as dismiss_notification applies — an action on an authenticator's notification is acting on the authenticator."
+    )]
+    async fn notification_action(
+        &self,
+        Parameters(a): Parameters<NotificationActionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match notification_id(&a.id) {
+            Ok(id) => id,
+            Err(e) => return Ok(fail(e)),
+        };
+        if a.action.trim().is_empty() {
+            return Ok(fail(
+                "`action` is empty; pass one of the labels list_notifications reported",
+            ));
+        }
+        let action = a.action.clone();
+        let history = a.include_history;
+        let confirm = a.confirm_destructive;
+        match self
+            .native(move |c| c.notification_action(&id, &action, history, confirm))
+            .await
+        {
+            Ok(Ok(acted)) => Ok(ok(render_acted(&acted))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 }
@@ -1602,8 +1832,9 @@ impl CuaServer {
         let app = a.app.clone();
         let sel = a.selector();
         match self.native(move |c| c.window_action(&app, sel, op)).await {
-            Ok(r) => Ok(ok(render_window_outcome(&r))),
-            Err(e) => Ok(fail(e.to_string())),
+            Ok(Ok(r)) => Ok(ok(render_window_outcome(&r))),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(e) => Ok(fail(e)),
         }
     }
 }
@@ -1754,49 +1985,6 @@ fn render_close(r: &cua_core::CloseOutcome) -> String {
     }
 }
 
-/// Render the transient UI an app has up, or nothing at all when it has none.
-///
-/// Printed as its own block rather than folded into the tree, because it is not
-/// part of the tree and saying otherwise would be the lie this feature exists to
-/// stop. A pop-up is a separate window with no accessibility representation:
-/// there are no element indices inside it, `find` will not match its items, and
-/// `click` has nothing to address. What it has is a window id and a frame, and
-/// those are exactly what `click_in_window` takes.
-fn render_popups(popups: &[cua_core::TransientWindow]) -> String {
-    if popups.is_empty() {
-        return String::new();
-    }
-    let mut s = String::from("\ntransient UI open above this app's content (topmost first):\n");
-    for p in popups {
-        s.push_str(&format!(
-            "  window_id={} layer={} at {:.0},{:.0} size {:.0}x{:.0} points{}\n",
-            p.id,
-            p.layer,
-            p.frame.origin.x,
-            p.frame.origin.y,
-            p.frame.size.width,
-            p.frame.size.height,
-            match p.appeared {
-                Some(true) => "  <- OPENED just now",
-                Some(false) => "  (was already open)",
-                None => "",
-            }
-        ));
-    }
-    s.push_str(
-        "  Accessibility cannot see inside these: no elements, no indices, and `find` will not \
-         match their contents. Read them from the screenshot, which already includes them. \
-         TO ACTIVATE AN ITEM, USE press_key WITH THE ITEM'S OWN KEYBOARD SHORTCUT (⌘I, ⌘Y, ⌘B, \
-         ⌘T, ⌥⌘, …) — measured to work on a real menu. click_in_window against the pop-up's \
-         window_id is accepted and the event is delivered, but on a standard macOS menu it was \
-         measured to DISMISS the menu without selecting anything: the menu tracks the real \
-         pointer, which cua-rs will not move. So a coordinate is the fallback for pop-ups that \
-         are not menus, not the way to pick a menu row. An item with no shortcut may not be \
-         reachable at all. press_key `escape` dismisses the menu.\n",
-    );
-    s
-}
-
 /// Render a clipboard read.
 ///
 /// The type list is printed in every branch: for `none` it is the answer to
@@ -1860,6 +2048,173 @@ fn render_clipboard_write(w: &cua_core::ClipboardWrite) -> String {
     )
 }
 
+fn render_notifications(
+    listing: &cua_core::notifications::NotificationListing,
+    history: bool,
+) -> String {
+    use cua_core::notifications::NotificationKind;
+    let mut out = if listing.notifications.is_empty() {
+        if history {
+            "no notifications on screen or in the history panel\n".to_string()
+        } else {
+            "no notification banners on screen right now (banners last about 5 s; pass include_history=true to read the history panel)\n".to_string()
+        }
+    } else {
+        format!("{} notification(s)\n", listing.notifications.len())
+    };
+    for n in &listing.notifications {
+        out.push_str(&format!(
+            "\n- id={}  app={}{}{}\n",
+            n.id,
+            n.app.as_deref().unwrap_or("(unknown)"),
+            if n.in_history {
+                "  [history]"
+            } else {
+                "  [banner]"
+            },
+            if n.kind == NotificationKind::CollapsedStack {
+                "  [collapsed stack: top item only]"
+            } else {
+                ""
+            },
+        ));
+        for (k, v) in [
+            ("title", &n.title),
+            ("subtitle", &n.subtitle),
+            ("body", &n.body),
+            ("time", &n.time),
+        ] {
+            if let Some(v) = v {
+                out.push_str(&format!("  {k}: {v}\n"));
+            }
+        }
+        let actions: Vec<&str> = n
+            .actions
+            .iter()
+            .map(String::as_str)
+            .filter(|a| *a != "AXPress")
+            .collect();
+        if !actions.is_empty() {
+            out.push_str(&format!("  actions: {}\n", actions.join(", ")));
+        }
+    }
+    if listing.opened_panel {
+        out.push_str("\n(opened the history panel to read it, and closed it again)\n");
+    }
+    for w in &listing.warnings {
+        out.push_str(&format!("\nwarning: {w}\n"));
+    }
+    out
+}
+
+/// One pressed notification action.
+///
+/// Not `render_action`: Notification Center draws everything in one
+/// full-screen window, which the generic renderer reports as "transient UI open
+/// above this app's content" with advice about menus that does not apply here,
+/// and its window-fingerprint diff has nothing to compare for this process. The
+/// verification that matters — is the notification still listed — is reported
+/// instead.
+fn render_acted(acted: &cua_core::notifications::NotificationActed) -> String {
+    let n = &acted.notification;
+    let mut out = format!(
+        "pressed `{}` on notification {} from `{}`",
+        acted.label,
+        n.id,
+        n.app.as_deref().unwrap_or("unknown app")
+    );
+    let what: Vec<&str> = [&n.title, &n.subtitle, &n.body]
+        .iter()
+        .filter_map(|p| p.as_deref())
+        .collect();
+    if !what.is_empty() {
+        out.push_str(&format!(" ({})", what.join(" / ")));
+    }
+    out.push_str(&format!(
+        "\ndelivery: {}  (accessibility custom action: cursor, focus and frontmost app untouched)\n",
+        match acted.result.delivery {
+            cua_core::Delivery::Ax => "ax",
+            _ => "other",
+        }
+    ));
+    out.push_str(if acted.gone {
+        "verified: the notification is no longer in Notification Center\n"
+    } else {
+        "the notification is still listed afterwards (expected for actions other than Close)\n"
+    });
+    for w in &acted.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
+fn render_dismiss_all(o: &cua_core::notifications::DismissAllOutcome) -> String {
+    let mut out = format!("dismissed {} notification(s)\n", o.dismissed.len());
+    for n in &o.dismissed {
+        out.push_str(&format!(
+            "  - {} ({}: {})\n",
+            n.id,
+            n.app.as_deref().unwrap_or("unknown app"),
+            n.title.as_deref().unwrap_or("")
+        ));
+    }
+    if let Some((n, why)) = &o.stopped_on {
+        out.push_str(&format!(
+            "STOPPED on {} ({}): {why}\n",
+            n.id,
+            n.app.as_deref().unwrap_or("unknown app")
+        ));
+    }
+    out.push_str(&format!("{} notification(s) remain\n", o.remaining));
+    for w in &o.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
+/// Render the transient UI an app has up, or nothing at all when it has none.
+///
+/// Printed as its own block rather than folded into the tree, because it is not
+/// part of the tree and saying otherwise would be the lie this feature exists to
+/// stop. A pop-up is a separate window with no accessibility representation:
+/// there are no element indices inside it, `find` will not match its items, and
+/// `click` has nothing to address. What it has is a window id and a frame, and
+/// those are exactly what `click_in_window` takes.
+fn render_popups(popups: &[cua_core::TransientWindow]) -> String {
+    if popups.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\ntransient UI open above this app's content (topmost first):\n");
+    for p in popups {
+        s.push_str(&format!(
+            "  window_id={} layer={} at {:.0},{:.0} size {:.0}x{:.0} points{}\n",
+            p.id,
+            p.layer,
+            p.frame.origin.x,
+            p.frame.origin.y,
+            p.frame.size.width,
+            p.frame.size.height,
+            match p.appeared {
+                Some(true) => "  <- OPENED just now",
+                Some(false) => "  (was already open)",
+                None => "",
+            }
+        ));
+    }
+    s.push_str(
+        "  Accessibility cannot see inside these: no elements, no indices, and `find` will not \
+         match their contents. Read them from the screenshot, which already includes them. \
+         TO ACTIVATE AN ITEM, USE press_key WITH THE ITEM'S OWN KEYBOARD SHORTCUT (⌘I, ⌘Y, ⌘B, \
+         ⌘T, ⌥⌘, …) — measured to work on a real menu. click_in_window against the pop-up's \
+         window_id is accepted and the event is delivered, but on a standard macOS menu it was \
+         measured to DISMISS the menu without selecting anything: the menu tracks the real \
+         pointer, which cua-rs will not move. So a coordinate is the fallback for pop-ups that \
+         are not menus, not the way to pick a menu row. An item with no shortcut may not be \
+         reachable at all. press_key `escape` dismisses the menu.\n",
+    );
+    s
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "granted"
@@ -1898,15 +2253,6 @@ fn render_action(r: &cua_core::ActionResult) -> String {
         },
         r.ui_changed.as_str(),
     );
-    // `disposition` restates `delivery` + `ui_changed` as the one thing most
-    // callers actually need before deciding whether to retry: did the input
-    // land, and is that landing confirmed. It is derived, never independent —
-    // see `cua_core::outcome` — so it can never disagree with the two lines
-    // above it; it exists to save a caller from re-deriving the same rule.
-    s.push_str(&format!(
-        "\ndisposition: {}",
-        disposition_of(r.ui_changed).as_str()
-    ));
     // The advice attached to `ui_changed` all ends in "go and look" — which is
     // wrong to print when the section below *is* the result of having looked.
     // Two answers to the same question, one hedged and one measured, read as a
@@ -2083,138 +2429,12 @@ impl rmcp::ServerHandler for CuaServer {
              allowed, minus screenshots), a target whose label reads as destructive — or that answers a dialog which \
              does — needs confirm_destructive=true, nothing is delivered while the session is locked, and — \
              if the operator enabled it — cua-rs stands down on an app the human is using. \
-             Every refusal names what to pass or change. \
-             Notifications are not part of any app's tree: use list_notifications, then \
-             dismiss_notification / notification_action with the id it returns."
+             Every refusal names what to pass or change. To make several calls in one round \
+             trip, use batch: each step is the same call, through the same gates."
                 .to_string(),
         );
         info
     }
-}
-
-/// Notifications, one block each, newest first as Notification Center orders them.
-fn render_notifications(
-    listing: &cua_core::notifications::NotificationListing,
-    history: bool,
-) -> String {
-    use cua_core::notifications::NotificationKind;
-    let mut out = if listing.notifications.is_empty() {
-        if history {
-            "no notifications on screen or in the history panel\n".to_string()
-        } else {
-            "no notification banners on screen right now (banners last about 5 s; pass include_history=true to read the history panel)\n".to_string()
-        }
-    } else {
-        format!("{} notification(s)\n", listing.notifications.len())
-    };
-    for n in &listing.notifications {
-        out.push_str(&format!(
-            "\n- id={}  app={}{}{}\n",
-            n.id,
-            n.app.as_deref().unwrap_or("(unknown)"),
-            if n.in_history {
-                "  [history]"
-            } else {
-                "  [banner]"
-            },
-            if n.kind == NotificationKind::CollapsedStack {
-                "  [collapsed stack: top item only]"
-            } else {
-                ""
-            },
-        ));
-        for (k, v) in [
-            ("title", &n.title),
-            ("subtitle", &n.subtitle),
-            ("body", &n.body),
-            ("time", &n.time),
-        ] {
-            if let Some(v) = v {
-                out.push_str(&format!("  {k}: {v}\n"));
-            }
-        }
-        let actions: Vec<&str> = n
-            .actions
-            .iter()
-            .map(String::as_str)
-            .filter(|a| *a != "AXPress")
-            .collect();
-        if !actions.is_empty() {
-            out.push_str(&format!("  actions: {}\n", actions.join(", ")));
-        }
-    }
-    if listing.opened_panel {
-        out.push_str("\n(opened the history panel to read it, and closed it again)\n");
-    }
-    for w in &listing.warnings {
-        out.push_str(&format!("\nwarning: {w}\n"));
-    }
-    out
-}
-
-/// One pressed notification action.
-///
-/// Not `render_action`: Notification Center draws everything in one
-/// full-screen window, which the generic renderer reports as "transient UI open
-/// above this app's content" with advice about menus that does not apply here,
-/// and its window-fingerprint diff has nothing to compare for this process. The
-/// verification that matters — is the notification still listed — is reported
-/// instead.
-fn render_acted(acted: &cua_core::notifications::NotificationActed) -> String {
-    let n = &acted.notification;
-    let mut out = format!(
-        "pressed `{}` on notification {} from `{}`",
-        acted.label,
-        n.id,
-        n.app.as_deref().unwrap_or("unknown app")
-    );
-    let what: Vec<&str> = [&n.title, &n.subtitle, &n.body]
-        .iter()
-        .filter_map(|p| p.as_deref())
-        .collect();
-    if !what.is_empty() {
-        out.push_str(&format!(" ({})", what.join(" / ")));
-    }
-    out.push_str(&format!(
-        "\ndelivery: {}  (accessibility custom action: cursor, focus and frontmost app untouched)\n",
-        match acted.result.delivery {
-            cua_core::Delivery::Ax => "ax",
-            _ => "other",
-        }
-    ));
-    out.push_str(if acted.gone {
-        "verified: the notification is no longer in Notification Center\n"
-    } else {
-        "the notification is still listed afterwards (expected for actions other than Close)\n"
-    });
-    for w in &acted.warnings {
-        out.push_str(&format!("warning: {w}\n"));
-    }
-    out
-}
-
-fn render_dismiss_all(o: &cua_core::notifications::DismissAllOutcome) -> String {
-    let mut out = format!("dismissed {} notification(s)\n", o.dismissed.len());
-    for n in &o.dismissed {
-        out.push_str(&format!(
-            "  - {} ({}: {})\n",
-            n.id,
-            n.app.as_deref().unwrap_or("unknown app"),
-            n.title.as_deref().unwrap_or("")
-        ));
-    }
-    if let Some((n, why)) = &o.stopped_on {
-        out.push_str(&format!(
-            "STOPPED on {} ({}): {why}\n",
-            n.id,
-            n.app.as_deref().unwrap_or("unknown app")
-        ));
-    }
-    out.push_str(&format!("{} notification(s) remain\n", o.remaining));
-    for w in &o.warnings {
-        out.push_str(&format!("warning: {w}\n"));
-    }
-    out
 }
 
 /// One level of a menu bar, as lines a model reads top to bottom.
@@ -2264,6 +2484,154 @@ fn render_menu(listing: &cua_core::MenuListing) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn args(json: serde_json::Value) -> BatchArgs {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn texts(r: &CallToolResult) -> Vec<String> {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_step_is_the_tool_name_plus_that_tools_own_arguments() {
+        let a = args(serde_json::json!({
+            "steps": [
+                {"tool": "list_apps"},
+                {"tool": "check_permissions", "params": null},
+                {"tool": "list_apps", "params": {}},
+                {"tool": "click", "params": {"app": "Safari", "element_token": "7-12-AXButton", "confirm_destructive": true}},
+                {"tool": "press_key", "params": {"app": "Safari", "element_index": "3", "key": "return"}},
+                {"tool": "menu_bar", "params": {"app": "TextEdit", "path": "Edit"}}
+            ]
+        }));
+        assert!(a.bail_on_error, "bail_on_error defaults to true");
+        let names: Vec<_> = a.steps.iter().map(BatchStep::name).collect();
+        assert_eq!(
+            names,
+            [
+                "list_apps",
+                "check_permissions",
+                "list_apps",
+                "click",
+                "press_key",
+                "menu_bar"
+            ]
+        );
+        match &a.steps[3] {
+            BatchStep::Click(c) => {
+                assert!(c.confirm_destructive);
+                assert_eq!(c.target.element_token.as_deref(), Some("7-12-AXButton"));
+            }
+            other => panic!("expected click, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_or_a_nested_batch_rejects_the_whole_batch() {
+        for bad in ["batch", "not_a_tool"] {
+            let r: Result<BatchArgs, _> = serde_json::from_value(serde_json::json!({
+                "steps": [{"tool": "list_apps"}, {"tool": bad, "params": {}}]
+            }));
+            assert!(r.is_err(), "{bad} must not deserialize as a step");
+        }
+        // A step missing a field its tool requires is refused the same way.
+        let r: Result<BatchArgs, _> = serde_json::from_value(serde_json::json!({
+            "steps": [{"tool": "set_value", "params": {"app": "Safari"}}]
+        }));
+        assert!(r.is_err());
+    }
+
+    /// Three grant-free steps; the middle one is refused by `click`'s own
+    /// argument check (no target at all), which is exactly the refusal a solo
+    /// `click` gives.
+    fn three_steps(bail: bool) -> BatchArgs {
+        args(serde_json::json!({
+            "bail_on_error": bail,
+            "steps": [
+                {"tool": "check_permissions"},
+                {"tool": "click", "params": {"app": "Finder"}},
+                {"tool": "list_apps"}
+            ]
+        }))
+    }
+
+    #[test]
+    fn bail_on_error_stops_at_the_failing_step() {
+        let cua = Cua::new();
+        let r = run_batch_blocking(&cua, three_steps(true));
+        assert_eq!(r.is_error, Some(true));
+        let t = texts(&r);
+        assert!(
+            t[0].starts_with("batch: ran 2 of 3 step(s), 1 failed"),
+            "{t:?}"
+        );
+        assert!(t[0].contains("stopped at step 1"), "{t:?}");
+        assert!(t.iter().any(|l| l == "── step 0: check_permissions — ok"));
+        assert!(t.iter().any(|l| l == "── step 1: click — ERROR"));
+        assert!(t
+            .iter()
+            .any(|l| l.contains("pass element_token (preferred)")));
+        assert!(t.iter().any(|l| l == "── step 2: list_apps — not run"));
+        assert!(
+            !t.iter().any(|l| l.contains("* = frontmost")),
+            "list_apps must not run"
+        );
+    }
+
+    #[test]
+    fn without_bail_every_step_runs_and_reports() {
+        let cua = Cua::new();
+        let r = run_batch_blocking(&cua, three_steps(false));
+        assert_eq!(
+            r.is_error,
+            Some(true),
+            "one step failed, so the batch is an error"
+        );
+        let t = texts(&r);
+        assert!(
+            t[0].starts_with("batch: ran 3 of 3 step(s), 1 failed"),
+            "{t:?}"
+        );
+        assert!(t.iter().any(|l| l == "── step 1: click — ERROR"));
+        assert!(t.iter().any(|l| l == "── step 2: list_apps — ok"));
+        assert!(t.iter().any(|l| l.contains("* = frontmost")));
+    }
+
+    #[test]
+    fn a_solo_call_and_a_batched_step_give_the_same_refusal() {
+        let solo =
+            prep_click(serde_json::from_value(serde_json::json!({"app": "Finder"})).unwrap())
+                .err()
+                .unwrap();
+        let cua = Cua::new();
+        let batched = run_batch_blocking(
+            &cua,
+            args(serde_json::json!({"steps": [{"tool": "click", "params": {"app": "Finder"}}]})),
+        );
+        assert_eq!(texts(&batched)[2], texts(&solo)[0]);
+    }
+
+    #[test]
+    fn an_empty_or_oversized_batch_is_refused_before_anything_runs() {
+        let cua = Cua::new();
+        let r = run_batch_blocking(&cua, args(serde_json::json!({"steps": []})));
+        assert_eq!(r.is_error, Some(true));
+        let many: Vec<_> = (0..=MAX_BATCH_STEPS)
+            .map(|_| serde_json::json!({"tool": "list_apps"}))
+            .collect();
+        let r = run_batch_blocking(&cua, args(serde_json::json!({"steps": many})));
+        assert_eq!(r.is_error, Some(true));
+        assert!(texts(&r)[0].contains("at most"));
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
     use super::*;
     use cua_core::notifications::{
         DismissAllOutcome, Notification, NotificationKind, NotificationListing,

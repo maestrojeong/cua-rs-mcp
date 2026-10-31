@@ -39,8 +39,8 @@ pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite,
     CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState, Mechanism, MouseOptions,
-    Observed, Permissions, PointerLocation, PostActionState, Presence, Screenshot, ScrollAmount,
-    ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome, WindowPixel,
+    Observed, Op, Permissions, PointerLocation, PostActionState, Presence, Screenshot,
+    ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome, WindowPixel,
 };
 pub use session::{
     CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
