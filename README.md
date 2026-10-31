@@ -164,6 +164,8 @@ how to unblock it.
 - **Destructive actions need confirming** — buttons like "Delete", "Erase",
   "Reset" require `confirm_destructive: true`. "Cancel"/"Save" are always
   allowed.
+- **Quitting an app always needs confirming**, and Finder, Dock, the menu
+  bar, loginwindow and WindowServer are never quit.
 - **Nothing reaches a locked screen or screensaver.**
 - **Optional: yield to a human actively using the app** —
   `CUA_YIELD_TO_HUMAN=1` (off by default).
@@ -201,9 +203,57 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `scroll` | scroll a view |
 | `clipboard_get` | read clipboard text; lists the types when there is none |
 | `clipboard_set` / `clipboard_clear` | write plain text to the clipboard, or empty it |
+| `list_windows` / `list_displays` | every window of an app (id, title, frame, level, state); every display |
+| `focus_window` | raise a window — without activating the app or taking your keyboard |
+| `move_window` / `resize_window` | set a window's position or size (refused if it would end up off screen) |
+| `minimize_window` / `maximize_window` / `restore_window` | Dock, zoom, and back |
+| `launch_app` / `close_app` | start an app (in the background unless asked); quit one gracefully (always needs `confirm_destructive`) |
 | `list_apps` / `check_permissions` | list apps; check permission status |
 
 Every action returns what changed, so acting and verifying take one round trip.
+Every action's result also names its `disposition` — `delivered_verified`,
+`delivered_unverified`, or (on a refused/failed call) `not_delivered` — and an
+error carries a second content block with a structured `code`, so an agent can
+decide whether a retry is safe without re-parsing the message. See
+[Errors and disposition](#errors-and-disposition).
+
+## Errors and disposition
+
+Every failed tool call returns two things: the same human-readable message
+this server has always printed, and a second block with a stable JSON shape:
+
+```json
+{"code":"STALE_REF","disposition":"not_delivered","retry_safe":true}
+```
+
+`disposition` is `not_delivered` (nothing was dispatched — always true for a
+refused call, always safe to retry), `delivered_unverified` (an event was sent
+and reported success, but nothing independently confirms its effect — this is
+also what a *successful* action reports when its own `ui_changed` heuristic
+says `no` or `unknown`), or `delivered_verified` (sent, and a re-read confirms
+the target changed). `retry_safe` is `true` only for `not_delivered` — it is
+derived from `disposition`, never set independently, so the two can never
+disagree.
+
+| `code` | meaning |
+|---|:--|
+| `PERM_DENIED` | Accessibility or Screen Recording grant missing |
+| `APP_NOT_FOUND` / `AMBIGUOUS_TARGET` | `app` matches nothing / more than one app |
+| `ELEMENT_NOT_FOUND` / `WINDOW_NOT_FOUND` | no such element, point or menu row / no drivable window |
+| `STALE_REF` | index, token, coordinate or snapshot is out of date — re-read |
+| `ACTION_NOT_SUPPORTED` | the target can't do this (or not right now) |
+| `ACTION_FAILED` | attempted, and the app or platform failed it |
+| `TIMEOUT` | the app (or a `wait_for`) didn't answer in time |
+| `PLATFORM_NOT_SUPPORTED` | this macOS build lacks a needed primitive |
+| `INVALID_ARGS` | malformed arguments |
+| `POLICY_DENIED` | a safety gate refused; `policy_reason` is `scope`, `forbidden_target`, `destructive`, `screen_locked`, `yield_to_human` or `strict_focus` |
+| `INTERNAL` | a bug or unexpected native failure |
+
+The wording of every refusal and error message is unchanged by this — `code`
+and `disposition` are new structure next to the existing prose, not a
+replacement for it. See [DESIGN.md](DESIGN.md) §10a for the full reasoning,
+including why `NativePanic` is the one case reported as unverified rather than
+not-delivered.
 
 ## What works, what doesn't
 
@@ -237,7 +287,7 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 270 tests, no special permissions needed
+cargo test --workspace          # 320 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

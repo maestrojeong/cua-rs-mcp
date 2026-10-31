@@ -15,10 +15,17 @@ thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
+block2 = "0.6"
+# Also for `autoreleasepool`: `clipboard.rs` wraps every pasteboard read in
+# one, since a read returns autoreleased Foundation objects and the native
+# worker thread has no pool of its own.
+objc2 = { workspace = true }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    "NSBundle",
     "NSEnumerator",
+    "NSError",
     "NSObject",
     "NSString",
     "NSURL",
@@ -53,10 +60,8 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "libc",
+    "block2",
     "NSRunningApplication",
     "NSWorkspace",
     "NSPasteboard",
 ] }
-# For `autoreleasepool` alone: the native worker has no pool of its own, and
-# pasteboard reads return autoreleased Foundation objects.
-objc2 = { workspace = true }
