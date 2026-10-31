@@ -517,6 +517,31 @@ impl Element {
 
     // ── actions ──────────────────────────────────────────────────────────
 
+    /// Attribute names this element advertises. Diagnostic: lets a probe read
+    /// what a system surface actually publishes instead of guessing names.
+    pub fn attribute_names(&self) -> Vec<String> {
+        let mut out: *const CFArray = std::ptr::null();
+        let err = unsafe { self.0.copy_attribute_names(NonNull::from(&mut out)) };
+        if err != AXError::Success {
+            return Vec::new();
+        }
+        let Some(ptr) = NonNull::new(out.cast_mut()) else {
+            return Vec::new();
+        };
+        let arr = unsafe { CFRetained::from_raw(ptr) };
+        let n = arr.len();
+        let mut names = Vec::with_capacity(n);
+        for i in 0..n {
+            let raw = unsafe { arr.value_at_index(i as isize) };
+            if raw.is_null() {
+                continue;
+            }
+            let s = unsafe { &*(raw as *const CFString) };
+            names.push(s.to_string());
+        }
+        names
+    }
+
     /// Action names this element advertises.
     pub fn actions(&self) -> Vec<String> {
         let mut out: *const CFArray = std::ptr::null();

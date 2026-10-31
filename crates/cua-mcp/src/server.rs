@@ -554,6 +554,74 @@ struct MenuBarArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ListNotificationsArgs {
+    /// Also read the Notification Center history panel. cua-rs opens it by
+    /// pressing the menu-bar clock, expands collapsed per-app stacks so every
+    /// notification gets its own row, reads, and closes the panel again if it
+    /// opened it. Off by default, because it presses UI; without it this is a
+    /// pure read of whatever banners are on screen right now (a banner lasts
+    /// about 5 s).
+    #[serde(default)]
+    include_history: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NotificationIdArgs {
+    /// The notification's `id` from list_notifications — Notification Center's
+    /// own UUID for it, e.g. `805A1087-89B8-482B-B822-30F2726D4663`.
+    id: String,
+    /// Look in the history panel too when the notification is not on screen as
+    /// a banner. On by default, since a banner expires into history in ~5 s.
+    #[serde(default = "yes")]
+    include_history: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DismissAllArgs {
+    /// Include the history panel, not just live banners. On by default.
+    #[serde(default = "yes")]
+    include_history: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NotificationActionArgs {
+    /// The notification's `id` from list_notifications.
+    id: String,
+    /// The action's label exactly as list_notifications reports it under
+    /// `actions`, e.g. `Show Details` / `세부사항 보기`. Labels are localized.
+    action: String,
+    /// Look in the history panel too. On by default.
+    #[serde(default = "yes")]
+    include_history: bool,
+    /// Set to true to proceed when the action's label reads as destructive
+    /// (`Clear All`, `Delete`, `모두 지우기`…).
+    #[serde(default)]
+    confirm_destructive: bool,
+}
+
+/// Validate a notification id before it reaches the worker.
+///
+/// Notification Center's ids are UUIDs. Requiring that shape catches the two
+/// mistakes worth catching early — passing a title, or passing a list position
+/// — with a message that says what an id looks like, instead of a not-found
+/// that reads as if the notification had gone away.
+fn notification_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err("`id` is empty; pass the id list_notifications reported".into());
+    }
+    let shaped = id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    if !shaped {
+        return Err(format!(
+            "`{id}` is not a notification id. Ids are Notification Center's UUIDs, like \
+             805A1087-89B8-482B-B822-30F2726D4663 — take one from list_notifications rather than \
+             a title or a position"
+        ));
+    }
+    Ok(id.to_string())
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct PressKeyArgs {
     #[serde(flatten)]
     target: ActionArgs,
@@ -1066,6 +1134,93 @@ impl CuaServer {
     }
 
     #[tool(
+        description = "List macOS notifications: app, title, subtitle, body, the custom actions each one offers, and an `id` to pass to dismiss_notification / notification_action. Notifications are drawn by Notification Center, not by the app that posted them, so `app` is the posting app's display name as Notification Center shows it. The id is Notification Center's own UUID for the notification — stable across reads and from banner to history, so it does not go stale when a neighbour is removed. By default this reads only what is on screen right now: a banner lasts about 5 s and then moves to history. Pass include_history=true to read the history panel too; cua-rs opens it from the menu-bar clock, expands per-app stacks, and closes it again — that presses UI, so it is gated like an action. Verified on macOS 26.2; see DESIGN.md §13 for what is and is not."
+    )]
+    async fn list_notifications(
+        &self,
+        Parameters(a): Parameters<ListNotificationsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let history = a.include_history;
+        match self.native(move |c| c.list_notifications(history)).await {
+            Ok(listing) => Ok(ok(render_notifications(&listing, history))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Dismiss one notification by the id list_notifications gave, by pressing the Close action Notification Center advertises on it (there is no separate close button in its accessibility tree). Measured on macOS 26.2: Close removes the notification from history too, not just the banner. Looks at live banners first, then the history panel (opened and closed again around the call) unless include_history=false. The result says whether the notification was verified gone afterwards. SAFETY: gated like any action on Notification Center, and additionally refused when the notification came from an app cua-rs may not act on (password managers, authenticators, Keychain, System Settings) or, under CUA_ALLOWED_APPS, from an app outside the scope or one that cannot be identified."
+    )]
+    async fn dismiss_notification(
+        &self,
+        Parameters(a): Parameters<NotificationIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match notification_id(&a.id) {
+            Ok(id) => id,
+            Err(e) => return Ok(fail(e)),
+        };
+        let history = a.include_history;
+        match self
+            .native(move |c| c.dismiss_notification(&id, history))
+            .await
+        {
+            Ok(acted) => Ok(ok(render_acted(&acted))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Dismiss every notification, one Close at a time, re-reading Notification Center after each one. Best effort: it STOPS at the first notification it cannot close — including one refused by a safety gate — and reports what it dismissed, what it stopped on and why, and how many remain. Covers the history panel too unless include_history=false. Same gates as dismiss_notification, applied per notification."
+    )]
+    async fn dismiss_all_notifications(
+        &self,
+        Parameters(a): Parameters<DismissAllArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let history = a.include_history;
+        match self
+            .native(move |c| c.dismiss_all_notifications(history))
+            .await
+        {
+            Ok(outcome) => {
+                let text = render_dismiss_all(&outcome);
+                if outcome.stopped_on.is_some() {
+                    Ok(fail(text))
+                } else {
+                    Ok(ok(text))
+                }
+            }
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Press one of the named actions a notification advertises, by its label as list_notifications reports it under `actions` (localized: on a Korean system Show Details is `세부사항 보기`). Only the custom actions Notification Center itself publishes are reachable. Verified on macOS 26.2 for the system ones (Show Details, Close); APP-DEFINED BUTTONS (Reply, Snooze, Mark as Read…) WERE NOT AVAILABLE TO TEST and may not appear here at all — if the action is not advertised the error lists what is. The bare default click (AXPress, which hands off to the posting app) is not offered. SAFETY: a destructive-looking label (Clear All, Delete) needs confirm_destructive=true, and the same source-app gate as dismiss_notification applies — an action on an authenticator's notification is acting on the authenticator."
+    )]
+    async fn notification_action(
+        &self,
+        Parameters(a): Parameters<NotificationActionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match notification_id(&a.id) {
+            Ok(id) => id,
+            Err(e) => return Ok(fail(e)),
+        };
+        if a.action.trim().is_empty() {
+            return Ok(fail(
+                "`action` is empty; pass one of the labels list_notifications reported",
+            ));
+        }
+        let action = a.action.clone();
+        let history = a.include_history;
+        let confirm = a.confirm_destructive;
+        match self
+            .native(move |c| c.notification_action(&id, &action, history, confirm))
+            .await
+        {
+            Ok(acted) => Ok(ok(render_acted(&acted))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
         description = "Deliver an arbitrary accessibility action to an element by name, for the verbs the dedicated tools do not cover: AXShowMenu (open a context menu), AXRaise (bring a window forward without activating the app), AXIncrement / AXDecrement (steppers and sliders), AXScrollToVisible, AXCancel. If the element does not advertise the action, the error lists the ones it does — so a wrong guess is fixable in one step. get_app_state also shows each element's actions. SAFETY: as with `click`, a destructive-looking target — or one answering a destructive-looking dialog — needs confirm_destructive=true."
     )]
     async fn perform_secondary_action(
@@ -1420,11 +1575,138 @@ impl rmcp::ServerHandler for CuaServer {
              allowed, minus screenshots), a target whose label reads as destructive — or that answers a dialog which \
              does — needs confirm_destructive=true, nothing is delivered while the session is locked, and — \
              if the operator enabled it — cua-rs stands down on an app the human is using. \
-             Every refusal names what to pass or change."
+             Every refusal names what to pass or change. \
+             Notifications are not part of any app's tree: use list_notifications, then \
+             dismiss_notification / notification_action with the id it returns."
                 .to_string(),
         );
         info
     }
+}
+
+/// Notifications, one block each, newest first as Notification Center orders them.
+fn render_notifications(
+    listing: &cua_core::notifications::NotificationListing,
+    history: bool,
+) -> String {
+    use cua_core::notifications::NotificationKind;
+    let mut out = if listing.notifications.is_empty() {
+        if history {
+            "no notifications on screen or in the history panel\n".to_string()
+        } else {
+            "no notification banners on screen right now (banners last about 5 s; pass include_history=true to read the history panel)\n".to_string()
+        }
+    } else {
+        format!("{} notification(s)\n", listing.notifications.len())
+    };
+    for n in &listing.notifications {
+        out.push_str(&format!(
+            "\n- id={}  app={}{}{}\n",
+            n.id,
+            n.app.as_deref().unwrap_or("(unknown)"),
+            if n.in_history {
+                "  [history]"
+            } else {
+                "  [banner]"
+            },
+            if n.kind == NotificationKind::CollapsedStack {
+                "  [collapsed stack: top item only]"
+            } else {
+                ""
+            },
+        ));
+        for (k, v) in [
+            ("title", &n.title),
+            ("subtitle", &n.subtitle),
+            ("body", &n.body),
+            ("time", &n.time),
+        ] {
+            if let Some(v) = v {
+                out.push_str(&format!("  {k}: {v}\n"));
+            }
+        }
+        let actions: Vec<&str> = n
+            .actions
+            .iter()
+            .map(String::as_str)
+            .filter(|a| *a != "AXPress")
+            .collect();
+        if !actions.is_empty() {
+            out.push_str(&format!("  actions: {}\n", actions.join(", ")));
+        }
+    }
+    if listing.opened_panel {
+        out.push_str("\n(opened the history panel to read it, and closed it again)\n");
+    }
+    for w in &listing.warnings {
+        out.push_str(&format!("\nwarning: {w}\n"));
+    }
+    out
+}
+
+/// One pressed notification action.
+///
+/// Not `render_action`: Notification Center draws everything in one
+/// full-screen window, which the generic renderer reports as "transient UI open
+/// above this app's content" with advice about menus that does not apply here,
+/// and its window-fingerprint diff has nothing to compare for this process. The
+/// verification that matters — is the notification still listed — is reported
+/// instead.
+fn render_acted(acted: &cua_core::notifications::NotificationActed) -> String {
+    let n = &acted.notification;
+    let mut out = format!(
+        "pressed `{}` on notification {} from `{}`",
+        acted.label,
+        n.id,
+        n.app.as_deref().unwrap_or("unknown app")
+    );
+    let what: Vec<&str> = [&n.title, &n.subtitle, &n.body]
+        .iter()
+        .filter_map(|p| p.as_deref())
+        .collect();
+    if !what.is_empty() {
+        out.push_str(&format!(" ({})", what.join(" / ")));
+    }
+    out.push_str(&format!(
+        "\ndelivery: {}  (accessibility custom action: cursor, focus and frontmost app untouched)\n",
+        match acted.result.delivery {
+            cua_core::Delivery::Ax => "ax",
+            _ => "other",
+        }
+    ));
+    out.push_str(if acted.gone {
+        "verified: the notification is no longer in Notification Center\n"
+    } else {
+        "the notification is still listed afterwards (expected for actions other than Close)\n"
+    });
+    for w in &acted.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
+fn render_dismiss_all(o: &cua_core::notifications::DismissAllOutcome) -> String {
+    let mut out = format!("dismissed {} notification(s)\n", o.dismissed.len());
+    for n in &o.dismissed {
+        out.push_str(&format!(
+            "  - {} ({}: {})\n",
+            n.id,
+            n.app.as_deref().unwrap_or("unknown app"),
+            n.title.as_deref().unwrap_or("")
+        ));
+    }
+    if let Some((n, why)) = &o.stopped_on {
+        out.push_str(&format!(
+            "STOPPED on {} ({}): {why}\n",
+            n.id,
+            n.app.as_deref().unwrap_or("unknown app")
+        ));
+    }
+    out.push_str(&format!("{} notification(s) remain\n", o.remaining));
+    for w in &o.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
 }
 
 /// One level of a menu bar, as lines a model reads top to bottom.
@@ -1470,4 +1752,117 @@ fn render_menu(listing: &cua_core::MenuListing) -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cua_core::notifications::{
+        DismissAllOutcome, Notification, NotificationKind, NotificationListing,
+    };
+
+    fn note(id: &str, history: bool, kind: NotificationKind) -> Notification {
+        Notification {
+            id: id.into(),
+            app: Some("스크립트 편집기".into()),
+            title: Some("hist 3".into()),
+            subtitle: None,
+            body: Some("hist body 3".into()),
+            time: None,
+            kind,
+            actions: vec![
+                "AXPress".into(),
+                "세부사항 보기".into(),
+                "보기".into(),
+                "닫기".into(),
+            ],
+            in_history: history,
+        }
+    }
+
+    #[test]
+    fn notification_ids_must_look_like_uuids() {
+        assert_eq!(
+            notification_id("  805A1087-89B8-482B-B822-30F2726D4663 ").unwrap(),
+            "805A1087-89B8-482B-B822-30F2726D4663"
+        );
+        assert!(notification_id("").unwrap_err().contains("empty"));
+        assert!(notification_id("   ").is_err());
+        // A title or a position is the likely mistake, and gets told what an id is.
+        let e = notification_id("probe title").unwrap_err();
+        assert!(e.contains("UUID"), "{e}");
+        assert!(
+            notification_id("3").is_ok(),
+            "a bare hex digit is shaped like an id; the worker reports not-found"
+        );
+        assert!(notification_id("0.0.1").is_err());
+        assert!(notification_id(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn args_default_history_on_for_actions_and_off_for_listing() {
+        let l: ListNotificationsArgs = serde_json::from_str("{}").unwrap();
+        assert!(!l.include_history);
+        let d: NotificationIdArgs = serde_json::from_str(r#"{"id":"AB-12"}"#).unwrap();
+        assert!(d.include_history);
+        let all: DismissAllArgs = serde_json::from_str("{}").unwrap();
+        assert!(all.include_history);
+        let a: NotificationActionArgs =
+            serde_json::from_str(r#"{"id":"AB","action":"Show"}"#).unwrap();
+        assert!(a.include_history);
+        assert!(!a.confirm_destructive);
+        assert!(serde_json::from_str::<NotificationActionArgs>(r#"{"id":"AB"}"#).is_err());
+    }
+
+    #[test]
+    fn listing_renders_ids_sources_and_hides_the_default_click() {
+        let listing = NotificationListing {
+            notifications: vec![
+                note(
+                    "6B5207BF-3B2F-4025-B7FF-46665C40260F",
+                    true,
+                    NotificationKind::Single,
+                ),
+                note("9F7D44F4", false, NotificationKind::CollapsedStack),
+            ],
+            opened_panel: true,
+            warnings: vec!["w1".into()],
+        };
+        let out = render_notifications(&listing, true);
+        assert!(out.starts_with("2 notification(s)"));
+        assert!(
+            out.contains("id=6B5207BF-3B2F-4025-B7FF-46665C40260F  app=스크립트 편집기  [history]")
+        );
+        assert!(out.contains("[banner]  [collapsed stack: top item only]"));
+        assert!(out.contains("actions: 세부사항 보기, 보기, 닫기"));
+        assert!(!out.contains("AXPress"));
+        assert!(out.contains("closed it again"));
+        assert!(out.contains("warning: w1"));
+    }
+
+    #[test]
+    fn empty_listing_says_where_it_looked() {
+        let empty = NotificationListing {
+            notifications: vec![],
+            opened_panel: false,
+            warnings: vec![],
+        };
+        assert!(render_notifications(&empty, false).contains("include_history=true"));
+        assert!(render_notifications(&empty, true).contains("history panel"));
+    }
+
+    #[test]
+    fn dismiss_all_reports_partial_progress() {
+        let o = DismissAllOutcome {
+            dismissed: vec![note("AA", true, NotificationKind::Single)],
+            stopped_on: Some((note("BB", true, NotificationKind::Single), "refused".into())),
+            remaining: 3,
+            warnings: vec![],
+        };
+        let out = render_dismiss_all(&o);
+        assert!(out.contains("dismissed 1 notification(s)"));
+        assert!(out.contains("STOPPED on BB"));
+        assert!(out.contains("refused"));
+        assert!(out.contains("3 notification(s) remain"));
+    }
 }

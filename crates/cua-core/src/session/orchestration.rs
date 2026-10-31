@@ -45,6 +45,24 @@ use delivery::{
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {
+    /// NotificationCenter, or ControlCenter's clock that opens its history, is
+    /// not reachable through accessibility right now.
+    #[error("Notification Center is not reachable: {reason}. Call check_permissions to rule out a missing Accessibility grant")]
+    NotificationCenterUnavailable { reason: String },
+
+    /// No notification with that id is in Notification Center's tree.
+    #[error("no notification with id `{id}` is in Notification Center{}. Ids come from list_notifications and stay valid until the notification itself goes away (expired from a banner into history, dismissed, or cleared); call list_notifications again", if *searched_history { " (banners and the history panel were both searched)" } else { " on screen (pass include_history=true to also search the history panel)" })]
+    NotificationNotFound { id: String, searched_history: bool },
+
+    /// The notification does not offer the action asked for.
+    #[error("notification `{id}` has no `{action}` action cua-rs can press: {why}. It advertises: [{available}]")]
+    NotificationActionUnavailable {
+        id: String,
+        action: String,
+        available: String,
+        why: String,
+    },
+
     #[error(transparent)]
     Resolve(#[from] apps::ResolveError),
 
@@ -1588,6 +1606,8 @@ fn page_points(element_height: Option<f64>) -> i32 {
 mod keyboard_actions;
 #[path = "actions/menu.rs"]
 mod menu_actions;
+#[path = "actions/notifications.rs"]
+mod notification_actions;
 #[path = "observe.rs"]
 mod observe;
 #[path = "actions/pointer.rs"]

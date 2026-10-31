@@ -19,6 +19,7 @@
 
 pub mod apps;
 pub mod menubar;
+pub mod notifications;
 mod overlay;
 pub mod safety;
 pub mod session;

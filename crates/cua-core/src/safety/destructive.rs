@@ -208,6 +208,41 @@ pub enum Refused {
          to the process that launched cua-rs, or unset CUA_YIELD_TO_HUMAN"
     )]
     YieldWatchUnavailable { verb: &'static str, reason: String },
+
+    /// A notification tool aimed at a notification posted by an app cua-rs may
+    /// not act on. See `notification_source.rs` for why dismissing counts.
+    #[error(
+        "refusing to {verb} a notification from `{app}` ({evidence}): cua-rs treats that app as \
+         a forbidden target because it {why}. Pressing a notification's action acts on the app's \
+         behalf, and Close deletes the notification from Notification Center's history, so both \
+         are refused where acting on the app directly would be. list_notifications still reads \
+         it. To act on it anyway, set CUA_ALLOW_FORBIDDEN_TARGETS=1 in the environment of the \
+         process that launches cua-rs and restart the server"
+    )]
+    ForbiddenNotificationSource {
+        verb: &'static str,
+        app: String,
+        evidence: String,
+        why: &'static str,
+    },
+
+    /// A notification tool under `CUA_ALLOWED_APPS`, aimed at a notification
+    /// whose source app is out of scope or could not be identified.
+    #[error(
+        "refusing to {verb} a notification from `{app}` (bundle id: {bundle_id}): this cua-rs run \
+         is scoped to CUA_ALLOWED_APPS={allowed}, and a notification is judged by the app that \
+         posted it as well as by Notification Center. Notification Center publishes only the \
+         app's display name, so a source that is not running, or whose name matches no single \
+         running app, cannot be identified and is refused rather than admitted. Reading still \
+         works. To allow it, the human has to add the posting app's bundle id to \
+         CUA_ALLOWED_APPS and restart"
+    )]
+    NotificationSourceOutOfScope {
+        verb: &'static str,
+        app: String,
+        bundle_id: String,
+        allowed: String,
+    },
 }
 
 #[path = "apps.rs"]
@@ -913,6 +948,10 @@ pub use runtime::*;
 #[path = "gate.rs"]
 mod gate;
 pub use gate::*;
+
+#[path = "notification_source.rs"]
+mod notification_source;
+pub use notification_source::*;
 
 #[cfg(test)]
 include!("tests.rs");

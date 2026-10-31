@@ -2575,3 +2575,198 @@ the per-frame `list_windows` saves 28 ms, skipping `sips` saves 10–40, keeping
 one temp directory saves a few — call it 60 ms off a 163 ms frame, landing at
 ~10 fps and still a third of a core. Optimizing toward a target that is a
 factor of two away is how a slideshow gets shipped.
+
+---
+
+## 13. Notification Center
+
+`list_notifications`, `dismiss_notification`, `dismiss_all_notifications` and
+`notification_action` exist because a notification is the one piece of UI an
+agent most often needs to clear out of its own way, and it is not part of any
+app cua-rs can name. Everything in this section was measured before the code was
+written, with `crates/cua-core/examples/notification_probe.rs`, and every claim
+below is either a measurement or marked as not one.
+
+### Where this was measured, and how the grant was obtained
+
+**macOS 26.2 (25C56), Mac mini, Korean system locale**, one display at
+1920×1080. The work was driven over SSH, and that matters before anything else:
+
+```console
+$ ssh host "cua-rs permissions"                 # an sshd-spawned shell
+accessibility:    false
+screen_recording: false
+$ (same binary, spawned by the user's pm2 daemon)
+accessibility:    false
+screen_recording: false
+$ open -a Terminal job.command                   # runs `cua-rs permissions` inside Terminal.app
+accessibility:    true
+screen_recording: true
+```
+
+§7's rule held exactly: the grant belongs to the responsible process, and neither
+sshd nor a launchd-reparented daemon is one the user approved. Every AX result
+below was therefore produced by a `.command` file opened in Terminal.app, which
+lives in the console user's GUI session and holds both grants. A reader
+repeating this over SSH and getting an empty tree is seeing the grant, not
+Notification Center.
+
+Test notifications were posted with `osascript -e 'display notification …'`,
+which Notification Center attributes to `com.apple.ScriptEditor2` and displays
+as 스크립트 편집기 (Script Editor). That is also the limit of the test corpus —
+see "What was not verified".
+
+### What the tree looks like
+
+Banners and history are both drawn by `NotificationCenter.app`
+(`com.apple.notificationcenterui`, pid stable for the whole session), **not** by
+the posting app. Idle, its tree is only the desktop widgets (`AXWindow:AXUnknown`,
+one per widget) and its own app menu bar. With a banner up:
+
+```text
+AXWindow:AXSystemDialog title="Notification Center" frame=(0,0 1920x1080)
+  AXGroup:AXHostingView
+    AXGroup
+      AXScrollArea
+        AXGroup:AXNotificationCenterBanner id="805A1087-89B8-482B-B822-30F2726D4663"
+            desc="스크립트 편집기 probe title, probe sub, probe body one"
+            actions=["AXPress", "Name:세부사항 보기\nTarget:0x0\nSelector:(null)",
+                     "Name:보기\n…", "Name:닫기\n…"]
+          AXStaticText id="title"    value="probe title"
+          AXStaticText id="subtitle" value="probe sub"
+          AXStaticText id="body"     value="probe body one"
+```
+
+Five things here are load-bearing:
+
+- **Transient banners are enumerable.** Seen in every dump at +0.3 s, +0.7 s and
+  +1.5 s after posting. One dump at +1.0 s after the *first* notification of the
+  session saw nothing; the window had not been created yet. usernoted's log puts
+  a banner on screen for 5.0 s (`displaying as banner` → `Clearing banner after
+  expiration`) before it moves to history.
+- **The identifier is the notification's own UUID.** usernoted logs the record as
+  `com.apple.ScriptEditor2:2FB87D7E` and the group's `AXIdentifier` was
+  `2FB87D7E-4E65-…`. The same UUID was read from a banner, and hours later from
+  the history panel. That is why the tools hand out that id instead of a
+  position: one Close in the history panel shifted every later row up by one
+  index (`hist 1` moved from child 5 to child 4), which is exactly the stale-index
+  failure §3 exists to prevent.
+- **There is no close button.** Close, Show and Show Details are *custom
+  actions* on the group, advertised as `Name:<label>\nTarget:0x0\nSelector:(null)`
+  and performed by passing that whole string to `AXUIElementPerformAction`. The
+  labels are localized — `닫기` is Close on this machine — and nothing in the
+  attribute list identifies one locale-independently.
+- **The source app is a display name, never a bundle id.** A banner's full
+  attribute list is `AXParent AXCustomActions AXRoleDescription AXAutoInteractable
+  AXChildren AXIdentifier AXPath AXAttributedDescription AXEnabled
+  AXTopLevelUIElement AXSubrole AXWindow AXRole AXActivationPoint
+  AXChildrenInNavigationOrder AXFrame AXSize AXPosition`. The app appears only as
+  the prefix of `AXDescription`: `"<app> <title>, <subtitle>, <body>"` for a single
+  notification, `"<app>, <title>, <body>, 스택"` for a stack.
+- **History is the same shape, plus stacks.** The history panel opens from the
+  menu-bar clock, which is `com.apple.menuextra.clock` in **ControlCenter**'s
+  `AXExtrasMenuBar` — a third process — and `AXPress` on it opens and closes the
+  panel. Inside, notifications sit under an `AXGroup id="AXNotificationListItems"`,
+  rows add an unidentified time-stamp text (`오전 1:03`, `11분 전`), and several
+  from one app collapse into an `AXNotificationCenterBannerStack` that shows only
+  the newest and offers `모두 지우기` (Clear All) instead of Close. Its identifier
+  is the newest notification's UUID. `AXPress` on the stack expands it into
+  individual `AXNotificationCenterBanner` rows plus a header, a Show Less and a
+  Clear button.
+
+### What was pressed, and what happened
+
+| action | on | result |
+|---|:--|:--|
+| custom `닫기` (Close) | live banner | `Ok` in 8 ms; gone from the tree at the next read (800 ms); NotificationCenter logged `Removing notification from storage` |
+| custom `닫기` (Close) | history row | `Ok` in 5 ms; row gone, the rest reflowed |
+| custom `세부사항 보기` (Show Details) | live banner | `Ok` in 12 ms; banner grew 57→99 pt, exposed `AXButton "보기"` and a chevron, and the action renamed itself `세부사항 가리기` (Hide Details) |
+| `AXPress` | history stack | expanded it |
+| `AXPress` | ControlCenter clock | toggles the history panel; verified both directions |
+
+Two observations that were not looked for. **Close deletes, it does not hide**:
+after closing a banner, the notification is not in history either, so dismissal
+is not a reversible cosmetic act — that fed the gating decision below. And **an
+expanded banner did not expire**: the Show Details banner above was still on
+screen, expanded, at the next run several minutes later, and two notifications
+posted while it was up were not listed as banners 0.8 s later — they were in
+history. One occurrence, not characterized further.
+
+Then end to end, through the real MCP server, on the same machine: listing a
+live banner; dismissing it (verified gone); a title passed as an id refused
+before reaching the worker; an all-zero UUID reported not found after searching
+banners and history; `include_history` listing seven history rows and restoring
+the closed panel; dismissing a history row; Show Details through
+`notification_action`; `AXPress` and an unadvertised `Reply` both refused with
+the advertised list; and `dismiss_all_notifications` closing eleven notifications
+one at a time (about 1 s each, dominated by the wait-for-gone check) with zero
+remaining.
+
+Under `CUA_ALLOWED_APPS=com.apple.mail`, dismissal was refused at the
+NotificationCenter scope check. Under
+`CUA_ALLOWED_APPS=com.apple.notificationcenterui,com.apple.controlcenter`, it was
+refused at the source check, because Script Editor was not running and so
+could not be identified — the fail-closed branch below, observed live.
+
+### The gating decision
+
+Every press goes through `Inner::acting`, which is the only door — the clock
+(gated as an action on ControlCenter), stack expansion, and the action itself
+(gated on NotificationCenter, with the action's label as the destructive
+classifier's candidate). So a locked screen stops all of it, a scope must name
+NotificationCenter (and ControlCenter, for anything that opens history), and
+`Clear All`/`Delete`-shaped actions need `confirm_destructive` while Close does
+not; a test pins that `Close`/`닫기` do not classify as destructive and that
+`Clear All`/`모두 지우기` do.
+
+That alone would judge every notification by NotificationCenter, which is not
+what any of them is about. **So a second gate judges the posting app, and it
+refuses dismissal as well as actions.** An action on a notification can act on
+the app's behalf — approving an authenticator's sign-in push is the case that
+settles it. Dismissal was the harder call, and the measurement decided it: Close
+deletes the record, so dismissing a password manager's "vault opened on a new
+device" alert removes the one trace the human would have seen. That is acting on
+that app's state, and the floor exists to refuse exactly that.
+
+The gate has only a display name to go on. It resolves it to a running app by
+**exact** (case-insensitive) name, deliberately not through `resolve_app`'s fuzzy
+tiers, which would let a short name land on a different app; more than one match
+is no match. Then:
+
+1. a resolved bundle id on the forbidden list → refused;
+2. a display name containing the credential substrings the bundle-id floor uses
+   (`password`, `authenticator`, `keychain`, `1password`…) → refused, identified
+   or not — a name is weaker evidence than a bundle id, not none;
+3. under `CUA_ALLOWED_APPS`, a source that did not resolve, or resolved outside
+   the scope → refused. Unscoped, an unresolved source is allowed, the same
+   precedent `guard` sets for an unbundled process.
+
+The honest weakness is (3)'s premise: a source app that is not running cannot be
+identified, so under a scope its notifications cannot be dismissed at all, and
+without a scope a forbidden app that is not running is caught only by its name.
+Notification Center gives nothing better, short of reading usernoted's private
+database, which this project does not do.
+
+### What was not verified
+
+- **App-defined action buttons** (Reply, Snooze, Mark as Read, Accept). Only
+  osascript notifications were available, and they carry none. Whether they
+  appear as custom actions — `notification_action` presses only those — or only
+  as the `AXButton`s Show Details exposes, is unknown. The tool says so in its
+  description and in its error.
+- **Close in other locales.** Only `닫기` was pressed. `Close` and the other
+  labels in `CLOSE_LABELS` are expected translations, not measurements; on a
+  mismatch `dismiss_notification` refuses and lists the labels it found, so the
+  caller can press the right one with `notification_action`.
+- **Alert-style notifications** (`AXNotificationCenterAlert`), which persist on
+  screen with their own buttons. Treated as notifications on the strength of
+  the subrole name; never seen.
+- **`AXPress` on a banner** — the default click, which hands off to the posting
+  app. Not pressed, so not offered.
+- **Focus modes, multiple displays, a locked screen with notifications on it,
+  and very long histories** (the walk is bounded at 4 000 nodes and depth 12).
+- **"Is the panel open" with an empty history.** The empty panel draws only
+  `최근 알림 없음` and no list container, so it is indistinguishable in the tree
+  from a panel that did not open. The tools never rely on that read to restore
+  state — they press the clock again only if they pressed it themselves — but a
+  read in that case waits its full 1.5 s and says "empty, or did not open".
