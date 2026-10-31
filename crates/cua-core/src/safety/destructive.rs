@@ -208,6 +208,24 @@ pub enum Refused {
          to the process that launched cua-rs, or unset CUA_YIELD_TO_HUMAN"
     )]
     YieldWatchUnavailable { verb: &'static str, reason: String },
+
+    /// The session-wide form of [`Refused::HumanTookOver`], for a write that
+    /// lands in no app — the clipboard.
+    ///
+    /// No frontmost-app test here, unlike the app form: the clipboard is shared
+    /// by every app, so real input anywhere may be the human in the middle of a
+    /// copy and paste that this write would clobber.
+    #[error(
+        "refusing to {verb}: real input arrived {ago_ms}ms ago and the clipboard is shared with \
+         the human, who may be in the middle of their own copy and paste. CUA_YIELD_TO_HUMAN=1 \
+         tells cua-rs not to overwrite it while they are active. Retry once they have been idle \
+         for {idle_ms}ms, or unset CUA_YIELD_TO_HUMAN"
+    )]
+    HumanActive {
+        verb: &'static str,
+        ago_ms: u64,
+        idle_ms: u64,
+    },
 }
 
 #[path = "apps.rs"]
@@ -913,6 +931,10 @@ pub use runtime::*;
 #[path = "gate.rs"]
 mod gate;
 pub use gate::*;
+
+#[path = "clipboard.rs"]
+mod clipboard_policy;
+pub(crate) use clipboard_policy::*;
 
 #[cfg(test)]
 include!("tests.rs");

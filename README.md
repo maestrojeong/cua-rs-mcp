@@ -167,6 +167,11 @@ how to unblock it.
 - **Nothing reaches a locked screen or screensaver.**
 - **Optional: yield to a human actively using the app** —
   `CUA_YIELD_TO_HUMAN=1` (off by default).
+- **Clipboard secrets stay hidden.** `clipboard_get` withholds the text (and
+  returns only its types) when a password manager marked it concealed, when a
+  credential app wrote it, or when one is frontmost. Clipboard writes are
+  refused while the screen is locked, and — with `CUA_YIELD_TO_HUMAN=1` —
+  while the human is active.
 
 `CUA_ALLOWED_APPS` is the strongest guarantee: once set, the agent can never
 widen it itself. Full criteria in [DESIGN.md §7a](DESIGN.md).
@@ -194,6 +199,8 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `press_key` | press a key or shortcut |
 | `menu_bar` | read the menu bar and click an item |
 | `scroll` | scroll a view |
+| `clipboard_get` | read clipboard text; lists the types when there is none |
+| `clipboard_set` / `clipboard_clear` | write plain text to the clipboard, or empty it |
 | `list_apps` / `check_permissions` | list apps; check permission status |
 
 Every action returns what changed, so acting and verifying take one round trip.
@@ -230,14 +237,14 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 249 tests, no special permissions needed
+cargo test --workspace          # 270 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ```text
 cua-ax        safe wrapper over the macOS Accessibility (AXUIElement) API
 cua-capture   finds windows, takes screenshots
-cua-core      snapshots, app resolution, safety gates
+cua-core      snapshots, app resolution, safety gates, the clipboard
 cua-hid       delivers clicks/keys to a specific process
 cua-mcp       the MCP server itself, binary `cua-rs`
 cua-overlay   the on-screen cursor

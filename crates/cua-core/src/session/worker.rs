@@ -473,6 +473,29 @@ impl Cua {
         })
     }
 
+    /// Read the clipboard's plain text.
+    ///
+    /// Not an action and not app-scoped: it resolves no app and passes no app
+    /// gate. It has a gate of its own — text that may be a secret is withheld
+    /// and only the type list comes back. See `safety::clipboard_read_refusal`.
+    pub fn clipboard_get(&self) -> Result<ClipboardRead> {
+        self.exec(|inner| inner.clipboard_get())?
+    }
+
+    /// Replace the clipboard with `text`.
+    ///
+    /// Passes the session-wide gates only (screen lock, yield-to-human); the
+    /// clipboard belongs to no app, so the app gates have nothing to judge.
+    pub fn clipboard_set(&self, text: &str) -> Result<ClipboardWrite> {
+        let text = text.to_string();
+        self.exec(move |inner| inner.clipboard_set(&text))?
+    }
+
+    /// Empty the clipboard. Gated like [`Cua::clipboard_set`].
+    pub fn clipboard_clear(&self) -> Result<ClipboardWrite> {
+        self.exec(|inner| inner.clipboard_clear())?
+    }
+
     /// Elements whose label, value or role contains `needle`.
     ///
     /// Reads the existing snapshot when there is one, and takes a fresh one

@@ -708,10 +708,11 @@ with it.
 | gate | default | flag | what it refuses |
 |---|:--|:--|:--|
 | session scope | **off** | `CUA_ALLOWED_APPS=id,id` | actions on any app outside the scope the launcher named |
-| forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots |
+| forbidden target | **on** | `CUA_ALLOW_FORBIDDEN_TARGETS=1` | actions on credential and security apps, plus their screenshots, plus clipboard text they wrote or that was read while one was frontmost |
+| concealed clipboard | **on** | — | `clipboard_get` text a writer marked `org.nspasteboard.ConcealedType` |
 | destructive label | **on** | per-call `confirm_destructive` | `click`, `press_key`, `perform_secondary_action` on a target that reads as removing something — or that answers a sheet or dialog which does, unless the answer is a Cancel |
-| screen lock | **on** | — | every action while the session is locked or the saver is up |
-| yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using |
+| screen lock | **on** | — | every action, and every clipboard write, while the session is locked or the saver is up |
+| yield to human | **off** | `CUA_YIELD_TO_HUMAN=1` | actions on an app the human is currently using; clipboard writes while the human is active anywhere |
 | HTTP bearer token | **on** | `CUA_HTTP_TOKEN` sets it | any `/mcp` request without `Authorization: Bearer` |
 
 Every action gate is checked once, in `Inner::acting`, which every action
@@ -811,6 +812,134 @@ one read that reproduces the secret rather than describing the UI around it, so
 `get_app_state` on a forbidden target returns the tree, drops the image, and
 says so in a warning. That keeps the app observable enough to reason about and
 closes the most direct exfiltration path.
+
+### The clipboard: a read that is a screenshot, writes that belong to no app
+
+Three tools — `clipboard_get`, `clipboard_set`, `clipboard_clear` — and two
+questions the existing gates were not shaped for: is a clipboard read a tree
+read or a screenshot, and which of the app-shaped gates mean anything for a
+buffer no app owns.
+
+**Where the code lives.** `cua-core/src/clipboard.rs` is the one file that
+names `NSPasteboard`, and `cua-core/Cargo.toml` is the one manifest that turns
+on objc2-app-kit's `NSPasteboard` feature — `cua-core` already linked AppKit
+for `NSWorkspace`, so no crate gained a dependency. The module is private to
+the crate, so the only way in from `cua-mcp` is a `Cua` method, which runs it
+on the `cua-native` worker (§4) like every AX call: a `clipboard_set` cannot
+interleave with the `press_key cmd+v` meant to paste it. Mechanism there,
+policy in `safety/clipboard.rs`, the same split as the yield tap.
+
+#### Reading: withheld like a screenshot, and earlier than one
+
+The split above was by what a read *reproduces*. A tree read describes the UI
+around a secret — a secure text field publishes no value to accessibility at
+all. A screenshot reproduces the secret, so it is withheld. The clipboard is the
+screenshot case with nothing to blur: if it holds a password, a read *is* the
+password, as text, in the transcript. So `clipboard_get` falls on the
+photographing side of the line, and the conservative reading wins where the
+evidence is ambiguous. Text is withheld — the call still succeeds, with the
+type list and the reason — when any of these holds, checked in this order:
+
+1. **The writer marked it concealed.** The [nspasteboard.org](http://nspasteboard.org)
+   convention: a password manager that puts a password on the clipboard also
+   puts an `org.nspasteboard.ConcealedType` entry beside it, so that clipboard
+   history tools do not display or record it. 1Password, KeePassXC and others
+   write it. cua-rs reading the clipboard on an agent's behalf is precisely the
+   kind of tool the marker addresses, so honouring it is in scope and costs one
+   string comparison over the type list. Matching is on the whole UTI.
+   **Not lifted by `CUA_ALLOW_FORBIDDEN_TARGETS`**: that flag corrects
+   cua-rs's own classification of *apps*, which the substring rule above can
+   get wrong. The marker is not a cua-rs classification; it is the data's owner
+   saying what the data is, so there is nothing of ours to override.
+2. **A forbidden app wrote it**, per the companion `org.nspasteboard.source`
+   marker (a bundle id), judged by the same `forbidden_bundle` as everything
+   else.
+3. **A forbidden app is frontmost.** The human may have copied a secret out of
+   Keychain Access a second ago. This over-refuses — the clipboard may hold a
+   URL from an hour earlier — and the cost of that is "switch apps and retry",
+   which is the trade §7a makes everywhere.
+
+Rules 2 and 3 are lifted by `CUA_ALLOW_FORBIDDEN_TARGETS=1`, which was always
+"I accept credential exposure from these apps".
+
+Two properties of the order matter. Everything decidable from metadata is
+decided **before any content is read**, so a withheld secret never enters the
+process — the type list and change count are format names and a counter, not
+contents. The source marker is read only when it is present. And the change
+count is compared before and after the text read: if anybody wrote in between,
+the text is something the checks never judged — a password copied in the gap —
+so it is discarded and the call fails with "retry" rather than returning it.
+
+The refusal points at the safe alternative. To move a secret into a field the
+agent does not need to *see* it: `press_key cmd+v` pastes from the clipboard
+into the app without the text passing through the transcript, and that paste is
+an action under all the usual gates.
+
+**What this does not catch, stated plainly.** A secret copied *without* the
+concealed marker, by an app that does not declare a source, after which the
+human switched to an ordinary app — the frontmost test no longer fires and the
+text is returned. Keychain Access is an example of a writer whose markers have
+not been checked. Closing that fully would mean tracking which app was frontmost
+at every change-count bump, which is an observer, and §7a's screen-lock section
+already explains why cua-rs prefers a direct read to an observer. The marker is
+the convention that exists for exactly this case; apps that do not write it are
+not protected by any clipboard tool.
+
+**macOS 26 pasteboard privacy.** A programmatic read of another app's contents
+may now raise a system alert, and the user can set the process (really, the
+responsible host app) to always allow or deny. `clipboard_get` reports
+`NSPasteboard.accessBehavior` (after a `respondsToSelector:` check, since older
+systems lack it) in every answer, so `text: none` under *always deny* is
+labelled as not evidence of an empty clipboard. `clipboard_set` verifies its
+write from the change count and type list rather than reading the text back,
+because that read-back is the one that could prompt.
+
+#### Writing: the session gates only
+
+A write lands in no app. Text reaches an app only through a paste, and when
+cua-rs does the paste it is a `press_key` under every gate. So the app-shaped
+gates have nothing to judge, and each was considered rather than dropped:
+
+- **Scope (`CUA_ALLOWED_APPS`)** — not applied. The scope answers what a run
+  may *drive*; the clipboard is not driven, and refusing every write in a
+  scoped run would make the common "set, then paste into the scoped app" flow
+  impossible in exactly the runs that are most careful.
+- **Forbidden floor** — not applied to writes. Writing or clearing the
+  clipboard while a password manager is frontmost does not act on the password
+  manager; clearing is, if anything, the hygienic move after a secret was
+  copied.
+- **Destructive confirmation** — not applied. Every `clipboard_set` overwrites
+  what was there and every `clipboard_clear` empties it, so a gate would fire
+  on every call. That is the "required parameter, not a gate" failure the
+  destructive section warns about. ⌘C overwrites the clipboard without asking,
+  too; the clipboard is a transient buffer by platform convention.
+- **Screen lock** — applied. Nobody is watching a locked session, and a write
+  is still a change the human did not see happen.
+- **Yield to human** — applied, and *wider* than for actions. The app form
+  fires only when the driven app is frontmost; the clipboard has no app, and it
+  is the one piece of state the human and cua-rs genuinely share, so any real
+  input inside the idle window refuses the write (`Refused::HumanActive`) — the
+  human may be halfway through a copy and paste of their own. Off by default,
+  like the rest of the yield gate; a broken tap fails closed here too.
+
+The residual risk of writes is the agent itself: a prompt-injected agent can put
+a command on the clipboard hoping the human pastes it into a terminal. No gate
+here can tell an honest write from that one; the tool description says the
+write overwrites what the user copied, and the transcript records exactly what
+was written.
+
+#### What was verified on a real machine
+
+macOS 26.2, through the real `cua-rs` binary over stdio, cross-checked with
+`pbpaste`: set (Korean and emoji text, change count bumped, `verified: yes`),
+get, `max_chars` truncation on a character boundary, clear, an image-only
+clipboard (`text: none` with `public.png`, `public.tiff` listed), a string
+written beside `org.nspasteboard.ConcealedType` (withheld), a string whose
+`org.nspasteboard.source` was `com.1password.1password` (withheld) or
+`com.apple.TextEdit` (returned), and Keychain Access frontmost (withheld,
+matched on bundle id although its localized name was 키체인 접근). Access
+behavior read as *always allow* for that host. The screen-lock and yield
+refusals for writes are unit-tested only.
 
 ### Bundle identifiers, not names
 

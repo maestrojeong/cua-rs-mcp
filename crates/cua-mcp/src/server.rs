@@ -602,6 +602,20 @@ struct WaitForArgs {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClipboardGetArgs {
+    /// Return at most this many characters of text; the total is always
+    /// reported. Defaults to 20000, capped at 200000.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClipboardSetArgs {
+    /// Plain text to put on the clipboard. Replaces everything on it.
+    text: String,
+}
+
 // ── server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1117,6 +1131,43 @@ impl CuaServer {
     }
 
     #[tool(
+        description = "Read the clipboard's plain text. Not tied to any app and changes nothing. When the clipboard holds no text (an image, a file list, nothing at all) this succeeds with `text: none` and lists `available_types` instead of failing. SAFETY: text that may be a secret is withheld and only the type list is returned — when the writer marked it concealed (org.nspasteboard.ConcealedType, which password managers set), when it was written by a credential or security app, or when such an app is frontmost. To move withheld text into a field, paste it with press_key cmd+v instead of reading it. On macOS 26 the system may ask the user before letting this process read the clipboard; `access` reports that setting."
+    )]
+    async fn clipboard_get(
+        &self,
+        Parameters(a): Parameters<ClipboardGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let max = a.max_chars.unwrap_or(20_000).clamp(1, 200_000);
+        match self.native(|c| c.clipboard_get()).await {
+            Ok(r) => Ok(ok(render_clipboard_read(&r, max))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Replace the clipboard with plain text. Typical use: clipboard_set, then press_key cmd+v on the target field to paste it — the paste is the action, and it is gated like any other. Not tied to any app, so the per-app gates do not apply; nothing is written while the session is locked, and with CUA_YIELD_TO_HUMAN=1 nothing is written while the human is actively using the machine. Overwrites whatever the user had copied."
+    )]
+    async fn clipboard_set(
+        &self,
+        Parameters(a): Parameters<ClipboardSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.native(move |c| c.clipboard_set(&a.text)).await {
+            Ok(w) => Ok(ok(render_clipboard_write(&w))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "Empty the clipboard. Gated like clipboard_set: refused while the session is locked, and with CUA_YIELD_TO_HUMAN=1 while the human is active."
+    )]
+    async fn clipboard_clear(&self) -> Result<CallToolResult, McpError> {
+        match self.native(|c| c.clipboard_clear()).await {
+            Ok(w) => Ok(ok(render_clipboard_write(&w))),
+            Err(e) => Ok(fail(e.to_string())),
+        }
+    }
+
+    #[tool(
         description = "Poll an app until a string appears in (or disappears from) its accessibility tree, or the timeout expires. Use this instead of guessing a sleep after an action that triggers loading, a dialog, or a navigation. Each poll re-walks the tree, so the interval is floored at 250ms. Returns whether the condition was met plus the snapshot_id of the final read."
     )]
     async fn wait_for(
@@ -1204,6 +1255,69 @@ fn render_popups(popups: &[cua_core::TransientWindow]) -> String {
          reachable at all. press_key `escape` dismisses the menu.\n",
     );
     s
+}
+
+/// Render a clipboard read.
+///
+/// The type list is printed in every branch: for `none` it is the answer to
+/// "what is there instead", and for a withheld read it is what makes the
+/// refusal checkable.
+fn render_clipboard_read(r: &cua_core::ClipboardRead, max_chars: usize) -> String {
+    let mut s = String::new();
+    match &r.contents {
+        cua_core::ClipboardContents::Text(text) => {
+            let total = text.chars().count();
+            if total > max_chars {
+                let cut: String = text.chars().take(max_chars).collect();
+                s.push_str(&format!(
+                    "text: {total} chars, showing the first {max_chars} (raise max_chars for more)\n{cut}\n"
+                ));
+            } else {
+                s.push_str(&format!("text: {total} chars\n{text}\n"));
+            }
+        }
+        cua_core::ClipboardContents::NoText => {
+            s.push_str("text: none (the clipboard holds no plain text)\n");
+            if r.access == cua_core::ClipboardAccess::AlwaysDeny {
+                s.push_str(
+                    "  macOS is set to DENY this process clipboard access, so this does not mean the clipboard is empty. The user can change it in System Settings > Privacy & Security > Paste from Other Apps\n",
+                );
+            }
+        }
+        cua_core::ClipboardContents::Withheld(reason) => {
+            s.push_str(&format!("text: withheld\n  {reason}\n"));
+        }
+    }
+    s.push_str(&format!("available_types: {}\n", render_types(&r.types)));
+    s.push_str(&format!("change_count: {}\n", r.change_count));
+    s.push_str(&format!("access: {}", r.access.as_str()));
+    s
+}
+
+fn render_types(types: &[String]) -> String {
+    if types.is_empty() {
+        "(none — the clipboard is empty)".to_string()
+    } else {
+        types.join(", ")
+    }
+}
+
+fn render_clipboard_write(w: &cua_core::ClipboardWrite) -> String {
+    let what = if w.verb == "clipboard_clear" {
+        "cleared the clipboard".to_string()
+    } else {
+        format!("wrote {} chars of plain text to the clipboard", w.chars)
+    };
+    format!(
+        "{}: {what}\nchange_count: {}\nverified: {}",
+        w.verb,
+        w.change_count,
+        if w.verified {
+            "yes (metadata re-read matches: no other writer in between)"
+        } else {
+            "NO (the clipboard's metadata does not match the write — another app may have written in between; call clipboard_get to see what is there)"
+        }
+    )
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -1470,4 +1584,78 @@ fn render_menu(listing: &cua_core::MenuListing) -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod clipboard_render_tests {
+    use super::*;
+    use cua_core::{ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite};
+
+    fn read(contents: ClipboardContents, types: &[&str], access: ClipboardAccess) -> ClipboardRead {
+        ClipboardRead {
+            contents,
+            types: types.iter().map(|t| t.to_string()).collect(),
+            change_count: 7,
+            access,
+        }
+    }
+
+    #[test]
+    fn no_text_is_a_success_that_lists_the_types() {
+        let r = read(
+            ClipboardContents::NoText,
+            &["public.png", "public.tiff"],
+            ClipboardAccess::AlwaysAllow,
+        );
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("text: none"));
+        assert!(s.contains("available_types: public.png, public.tiff"));
+        assert!(!s.contains("DENY"));
+    }
+
+    #[test]
+    fn no_text_under_always_deny_says_it_is_not_evidence_of_empty() {
+        let r = read(ClipboardContents::NoText, &[], ClipboardAccess::AlwaysDeny);
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("does not mean the clipboard is empty"));
+        assert!(s.contains("(none — the clipboard is empty)"));
+    }
+
+    #[test]
+    fn long_text_is_cut_on_a_character_boundary_and_the_total_reported() {
+        let r = read(
+            ClipboardContents::Text("안녕하세요 world".to_string()),
+            &["public.utf8-plain-text"],
+            ClipboardAccess::NotApplicable,
+        );
+        let s = render_clipboard_read(&r, 3);
+        assert!(s.contains("text: 11 chars, showing the first 3"));
+        assert!(s.contains("\n안녕하\n"));
+    }
+
+    #[test]
+    fn a_withheld_read_prints_the_reason_and_never_the_text() {
+        let r = read(
+            ClipboardContents::Withheld("marked as a secret".to_string()),
+            &["org.nspasteboard.ConcealedType", "public.utf8-plain-text"],
+            ClipboardAccess::Default,
+        );
+        let s = render_clipboard_read(&r, 100);
+        assert!(s.contains("text: withheld"));
+        assert!(s.contains("marked as a secret"));
+        assert!(s.contains("org.nspasteboard.ConcealedType"));
+    }
+
+    #[test]
+    fn an_unverified_write_says_so() {
+        let w = ClipboardWrite {
+            verb: "clipboard_set",
+            change_count: 9,
+            chars: 5,
+            verified: false,
+        };
+        let s = render_clipboard_write(&w);
+        assert!(s.contains("wrote 5 chars"));
+        assert!(s.contains("verified: NO"));
+    }
 }
