@@ -11,6 +11,9 @@
 //! - [`session::Cua`] owns the one thread that may touch native handles, and
 //!   holds the latest snapshot per app.
 //! - [`snapshot::render_tree`] spends tokens only on elements worth seeing.
+//! - [`outcome::ErrorOutcome`] gives every `CoreError` a stable `code` and a
+//!   `disposition` next to its existing prose, so a caller can decide whether
+//!   a retry is safe without re-parsing English.
 //!
 //! The unit that ties it together is the *snapshot*: one tree walk plus one
 //! screenshot of one window, taken together and numbered. Every action refers
@@ -19,6 +22,7 @@
 
 pub mod apps;
 pub mod menubar;
+pub mod outcome;
 mod overlay;
 pub mod safety;
 pub mod session;
@@ -26,6 +30,7 @@ pub mod snapshot;
 
 pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
 pub use menubar::{menu_path_steps, menu_shortcut, MenuItem, MenuListing, MenuWalkError};
+pub use outcome::{disposition_of, Disposition, ErrorCode, ErrorOutcome, PolicyReason};
 pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState,

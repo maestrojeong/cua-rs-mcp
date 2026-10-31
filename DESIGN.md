@@ -1788,6 +1788,98 @@ needed it.
 
 ---
 
+## 10a. A structured error code and delivery disposition, next to the prose
+
+Every `CoreError` and `Refused` variant already carries a careful,
+specific message — that is most of what §1a, §7a and this section's own
+measurements exist to earn. None of that prose is machine-checkable, though,
+and a caller deciding *whether to retry* was left to grep the message for
+words like "stale" or "locked", which breaks the moment the wording improves.
+
+`cua-core::outcome` adds a second, structural axis next to the prose rather
+than replacing it: a closed `ErrorCode` every variant maps to exactly once
+(`ErrorOutcome::classify` has no wildcard arm, so a new `CoreError` variant
+fails to compile here until it is given a code), and a `disposition` saying
+whether the action's input ever reached the target at all.
+
+| `code` | covers |
+|---|:--|
+| `PERM_DENIED` | — (reserved; no `CoreError` variant maps here yet. Permission state is read through `check_permissions`, which reports booleans rather than failing a call) |
+| `APP_NOT_FOUND` | `ResolveError` via `CoreError::Resolve` |
+| `AMBIGUOUS_TARGET` | — (reserved; `resolve_app` and its `ResolveError` do not yet distinguish "found nothing" from "found more than one" at the type level) |
+| `ELEMENT_NOT_FOUND` | `NoElementAtPoint` |
+| `WINDOW_NOT_FOUND` | `NoWindow` |
+| `STALE_REF` | `StaleSnapshot`, `NoSnapshot`, `ProcessReplaced`, `BadIndex`, `TargetChanged`, `TokenRoleMismatch`, `StalePointGeometry`, `StaleCoordinate` |
+| `ACTION_NOT_SUPPORTED` | `KeyNoAccessibilityEquivalent`, `KeyVerbUnsupported` |
+| `ACTION_FAILED` | `PidKeyUnavailable`, `PidClickUnavailable`, `PidClickFailed`, `WindowClickRefused`, `DragRefused`, `PointerEventRefused`, `MenuPath` |
+| `TIMEOUT` | `WindowQueryTimedOut` |
+| `PLATFORM_NOT_SUPPORTED` | — (reserved; nothing in the current enum distinguishes "this macOS version lacks the primitive" from `ACTION_FAILED`'s broader "the platform failed it". A future `cua-hid` capability probe is the natural source) |
+| `INVALID_ARGS` | `KeyChordUnparseable` |
+| `POLICY_DENIED` | every `Refused` variant, plus `FocusMismatch` (a `CUA_KEY_STRICT_FOCUS` refusal, which is a policy choice rather than a platform failure even though it is not one of `safety::Refused`'s own variants) |
+| `INTERNAL` | `Ax`, `Capture`, `WorkerGone`, `NativePanic` |
+
+`PolicyReason` subdivides `POLICY_DENIED` the same way §7a's own table already
+divides the gates — `scope`, `forbidden_target`, `destructive`,
+`screen_locked`, `yield_to_human` — plus `strict_focus` for `FocusMismatch`,
+which the gates table in `safety::destructive` does not list because it is
+not one of the five gates `Refused` enumerates; it is still a refusal reached
+before delivery, so it shares the same code.
+
+### Disposition is derived, not chosen per call site
+
+`retry_safe` is `true` for exactly one `Disposition`: `NotDelivered`. It is
+computed from `disposition`, never set independently, which is the whole
+point — a hand-set `retry_safe` next to a hand-set `disposition` is two facts
+that can quietly drift apart the first time someone edits one and not the
+other.
+
+For an **error**, the classification follows directly from how this project
+already builds its delivery paths (§1a: one mechanism per action, chosen
+once, never "try A and fall back to B"). Every `CoreError` variant above is
+reached either before an event is built at all — a gate, a stale reference,
+an app or window that never resolved — or *as* the delivery mechanism's own
+failure report, which under the one-mechanism rule means nothing reached the
+target. So every error is `NotDelivered` with one deliberate exception:
+`NativePanic`. A panic recovered by the native worker can land on either side
+of the call it interrupted, and this project has no way to ask which — so it
+is reported as `DeliveredUnverified` rather than `NotDelivered`. The direction
+of that choice matters: assuming a panic *might* have landed costs a caller
+nothing extra to find out (re-read the element), while assuming it *never*
+landed and being wrong risks a duplicated action, which is the more expensive
+mistake in this system.
+
+For a **success**, disposition restates `ActionResult::ui_changed` — already
+documented in §10 as a fingerprint heuristic that can false-negative on a real
+change (two untitled sibling text fields, a menu opening as its own window) —
+as the one question a caller actually asks before deciding whether to repeat
+a call: `Observed::Changed` is `DeliveredVerified`; `Unchanged` and `Unknown`
+are both `DeliveredUnverified`, because from the caller's side "looked and saw
+nothing" and "nobody looked" carry the identical practical answer — nothing
+independently confirms the effect, so treat this like any other unconfirmed
+send. Nothing about `ui_changed`'s own heuristic changes; this only gives its
+existing three-way answer a name that lines up with the error side's.
+
+### What is additive, and what deliberately is not
+
+The JSON block carrying `code`/`disposition`/`retry_safe` rides as a *second*
+content block next to every error's original message, and `disposition` rides
+as one more line in `render_action`'s existing text — neither replaces a word
+of the prose DESIGN.md and §7a spent so much care tuning. An agent that only
+ever read the message text continues to get exactly what it got before.
+
+Two codes are reserved rather than wired to anything yet, named in the table
+above rather than left silently absent: `AMBIGUOUS_TARGET` and
+`PLATFORM_NOT_SUPPORTED`. Both describe a real distinction this codebase does
+not currently make at the type level (resolve-found-many vs. resolve-found-
+none; a capability genuinely missing on this macOS version vs. a platform call
+that simply failed). Inventing a `CoreError` variant to populate them now
+would be guessing at a shape before a caller that needs the distinction shows
+up. Leaving the code reserved and undocumented-as-unmapped would be worse: a
+caller matching exhaustively on `ErrorCode` should be able to trust that every
+variant named here is real, even if nothing produces it yet.
+
+---
+
 ## 11. Widening the pid tier, never the shared tier
 
 The gaps in §1's capability table — no chords, no drag, no canvas, one button,

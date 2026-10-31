@@ -197,6 +197,49 @@ Numbered elements (`[3]`, `[7]`, `[21]`) can be clicked or filled in.
 | `list_apps` / `check_permissions` | list apps; check permission status |
 
 Every action returns what changed, so acting and verifying take one round trip.
+Every action's result also names its `disposition` — `delivered_verified`,
+`delivered_unverified`, or (on a refused/failed call) `not_delivered` — and an
+error carries a second content block with a structured `code`, so an agent can
+decide whether a retry is safe without re-parsing the message. See
+[Errors and disposition](#errors-and-disposition).
+
+## Errors and disposition
+
+Every failed tool call returns two things: the same human-readable message
+this server has always printed, and a second block with a stable JSON shape:
+
+```json
+{"code":"STALE_REF","disposition":"not_delivered","retry_safe":true}
+```
+
+`disposition` is `not_delivered` (nothing was dispatched — always true for a
+refused call, always safe to retry), `delivered_unverified` (an event was sent
+and reported success, but nothing independently confirms its effect — this is
+also what a *successful* action reports when its own `ui_changed` heuristic
+says `no` or `unknown`), or `delivered_verified` (sent, and a re-read confirms
+the target changed). `retry_safe` is `true` only for `not_delivered` — it is
+derived from `disposition`, never set independently, so the two can never
+disagree.
+
+| `code` | meaning |
+|---|:--|
+| `PERM_DENIED` | Accessibility or Screen Recording grant missing |
+| `APP_NOT_FOUND` / `AMBIGUOUS_TARGET` | `app` matches nothing / more than one app |
+| `ELEMENT_NOT_FOUND` / `WINDOW_NOT_FOUND` | no such element, point or menu row / no drivable window |
+| `STALE_REF` | index, token, coordinate or snapshot is out of date — re-read |
+| `ACTION_NOT_SUPPORTED` | the target can't do this (or not right now) |
+| `ACTION_FAILED` | attempted, and the app or platform failed it |
+| `TIMEOUT` | the app (or a `wait_for`) didn't answer in time |
+| `PLATFORM_NOT_SUPPORTED` | this macOS build lacks a needed primitive |
+| `INVALID_ARGS` | malformed arguments |
+| `POLICY_DENIED` | a safety gate refused; `policy_reason` is `scope`, `forbidden_target`, `destructive`, `screen_locked`, `yield_to_human` or `strict_focus` |
+| `INTERNAL` | a bug or unexpected native failure |
+
+The wording of every refusal and error message is unchanged by this — `code`
+and `disposition` are new structure next to the existing prose, not a
+replacement for it. See [DESIGN.md](DESIGN.md) §10a for the full reasoning,
+including why `NativePanic` is the one case reported as unverified rather than
+not-delivered.
 
 ## What works, what doesn't
 
