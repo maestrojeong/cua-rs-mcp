@@ -281,7 +281,9 @@ impl WindowInfo {
 }
 
 mod capture;
+mod displays;
 mod window_catalog;
 
 pub use capture::capture_window;
+pub use displays::{list_displays, DisplayInfo};
 pub use window_catalog::list_windows;

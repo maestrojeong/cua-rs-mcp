@@ -45,6 +45,24 @@ use delivery::{
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {
+    /// NotificationCenter, or ControlCenter's clock that opens its history, is
+    /// not reachable through accessibility right now.
+    #[error("Notification Center is not reachable: {reason}. Call check_permissions to rule out a missing Accessibility grant")]
+    NotificationCenterUnavailable { reason: String },
+
+    /// No notification with that id is in Notification Center's tree.
+    #[error("no notification with id `{id}` is in Notification Center{}. Ids come from list_notifications and stay valid until the notification itself goes away (expired from a banner into history, dismissed, or cleared); call list_notifications again", if *searched_history { " (banners and the history panel were both searched)" } else { " on screen (pass include_history=true to also search the history panel)" })]
+    NotificationNotFound { id: String, searched_history: bool },
+
+    /// The notification does not offer the action asked for.
+    #[error("notification `{id}` has no `{action}` action cua-rs can press: {why}. It advertises: [{available}]")]
+    NotificationActionUnavailable {
+        id: String,
+        action: String,
+        available: String,
+        why: String,
+    },
+
     #[error(transparent)]
     Resolve(#[from] apps::ResolveError),
 
@@ -248,6 +266,21 @@ pub enum CoreError {
     /// A menu bar path did not lead anywhere pressable.
     #[error("in `{app}`: {reason}")]
     MenuPath { app: String, reason: String },
+
+    /// A pasteboard call failed, or a read raced a write and was discarded.
+    #[error("{verb}: {reason}")]
+    Clipboard { verb: &'static str, reason: String },
+    /// A window tool could not select or change the window it was given.
+    ///
+    /// One variant with a reason rather than one per failure, for the same
+    /// reason as [`CoreError::DragRefused`]: what the caller needs is which
+    /// window and what to do instead, and that is all in `reason`.
+    #[error("window of `{app}`: {reason}")]
+    Window { app: String, reason: String },
+
+    /// `launch_app` or `close_app` reached the system and the system declined.
+    #[error("`{app}`: {reason}")]
+    Lifecycle { app: String, reason: String },
 
     /// The native worker thread died. Unrecoverable for the process.
     #[error("the native worker thread is gone")]
@@ -1584,10 +1617,15 @@ fn page_points(element_height: Option<f64>) -> i32 {
 
 // ── worker-side implementation ───────────────────────────────────────────────
 
+#[path = "actions/clipboard.rs"]
+mod clipboard_actions;
+pub use clipboard_actions::{ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite};
 #[path = "actions/keyboard.rs"]
 mod keyboard_actions;
 #[path = "actions/menu.rs"]
 mod menu_actions;
+#[path = "actions/notifications.rs"]
+mod notification_actions;
 #[path = "observe.rs"]
 mod observe;
 #[path = "actions/pointer.rs"]
@@ -1598,6 +1636,13 @@ mod scroll_actions;
 mod targeting;
 #[path = "actions/text.rs"]
 mod text_actions;
+#[path = "actions/window.rs"]
+mod window_actions;
+
+pub use window_actions::{
+    CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
+    WindowSummary,
+};
 
 /// Window ids of the transient UI one process currently has up.
 fn popup_ids(windows: &[WindowInfo], pid: libc::pid_t) -> Vec<u32> {

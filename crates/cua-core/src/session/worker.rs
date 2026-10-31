@@ -34,6 +34,10 @@ pub(super) struct Inner {
     /// [`Cua`] so the tap is torn down when the last handle goes away rather
     /// than leaking for the life of the process. Inert unless the flag is set.
     pub(super) human: std::sync::Arc<crate::safety::HumanWatch>,
+    /// Frames from before `maximize_window`, so `restore_window` can put a
+    /// window back. Keyed by the AX window itself (`CFEqual`), not by window
+    /// id, so it works without Screen Recording; bounded, oldest dropped.
+    pub(super) pre_maximize: Vec<(Element, CGRect)>,
 }
 
 /// Identifies a process incarnation, not just a pid slot.
@@ -558,6 +562,116 @@ impl Cua {
             return_state,
             confirm_destructive,
         ))
+    }
+
+    /// Notifications Notification Center is showing: live banners, and with
+    /// `include_history` the history panel too (opened from the menu-bar clock
+    /// and closed again). Without history this is a pure read.
+    pub fn list_notifications(
+        &self,
+        include_history: bool,
+    ) -> Result<crate::notifications::NotificationListing> {
+        self.exec(move |inner| inner.list_notifications(include_history))?
+    }
+
+    /// Press a notification's Close action, through every gate an action takes
+    /// plus the notification-source gate.
+    pub fn dismiss_notification(
+        &self,
+        id: &str,
+        include_history: bool,
+    ) -> Result<crate::notifications::NotificationActed> {
+        let id = id.to_string();
+        self.exec(move |inner| inner.dismiss_notification(&id, include_history))?
+    }
+
+    /// Close notifications one at a time until none are left or one fails.
+    pub fn dismiss_all_notifications(
+        &self,
+        include_history: bool,
+    ) -> Result<crate::notifications::DismissAllOutcome> {
+        self.exec(move |inner| inner.dismiss_all_notifications(include_history))?
+    }
+
+    /// Press a named custom action Notification Center advertises on a
+    /// notification.
+    pub fn notification_action(
+        &self,
+        id: &str,
+        action: &str,
+        include_history: bool,
+        confirm_destructive: bool,
+    ) -> Result<crate::notifications::NotificationActed> {
+        let id = id.to_string();
+        let action = action.to_string();
+        self.exec(move |inner| {
+            inner.notification_action(&id, &action, include_history, confirm_destructive)
+        })?
+    }
+
+    /// Read the clipboard's plain text.
+    ///
+    /// Not an action and not app-scoped: it resolves no app and passes no app
+    /// gate. It has a gate of its own — text that may be a secret is withheld
+    /// and only the type list comes back. See `safety::clipboard_read_refusal`.
+    pub fn clipboard_get(&self) -> Result<ClipboardRead> {
+        self.exec(|inner| inner.clipboard_get())?
+    }
+
+    /// Replace the clipboard with `text`.
+    ///
+    /// Passes the session-wide gates only (screen lock, yield-to-human); the
+    /// clipboard belongs to no app, so the app gates have nothing to judge.
+    pub fn clipboard_set(&self, text: &str) -> Result<ClipboardWrite> {
+        let text = text.to_string();
+        self.exec(move |inner| inner.clipboard_set(&text))?
+    }
+
+    /// Empty the clipboard. Gated like [`Cua::clipboard_set`].
+    pub fn clipboard_clear(&self) -> Result<ClipboardWrite> {
+        self.exec(|inner| inner.clipboard_clear())?
+    }
+
+    /// Every window of one app, with ids, frames and state.
+    ///
+    /// A read, so it is not gated: like `get_app_state`, it is what makes a
+    /// later refusal diagnosable.
+    pub fn list_windows(&self, app: &str) -> Result<WindowListing> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.list_windows(&app))?
+    }
+
+    /// Raise, move, resize, minimize, maximize or restore one window.
+    ///
+    /// Goes through the same [`Inner::acting`] gate as `click`: scope,
+    /// forbidden target, screen lock and yield-to-human all apply. There is no
+    /// destructive-label check because there is no label: no window operation
+    /// here removes anything, and every one is undone by another.
+    pub fn window_action(
+        &self,
+        app: &str,
+        window: WindowSelector,
+        op: WindowOp,
+    ) -> Result<WindowOutcome> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.window_action(&app, window, op))?
+    }
+
+    /// Every active display. Needs no grant.
+    pub fn list_displays(&self) -> Result<Vec<cua_capture::DisplayInfo>> {
+        self.exec(|_| cua_capture::list_displays().map_err(CoreError::from))?
+    }
+
+    /// Launch an app that is not running, without activating it unless asked.
+    pub fn launch_app(&self, spec: &str, activate: bool) -> Result<LaunchOutcome> {
+        let spec = spec.to_string();
+        self.exec(move |inner| inner.launch_app(&spec, activate))?
+    }
+
+    /// Ask an app to quit gracefully. Needs `confirm_destructive`, always.
+    pub fn close_app(&self, app: &str, confirm_destructive: bool) -> Result<CloseOutcome> {
+        let app = app.to_string();
+        self.exec(move |inner| inner.close_app(&app, confirm_destructive))?
     }
 
     /// Elements whose label, value or role contains `needle`.
