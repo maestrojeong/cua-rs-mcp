@@ -23,43 +23,46 @@
 pub mod apps;
 // Private on purpose: the only way to reach the pasteboard from outside this
 // crate is through `Cua`, which runs it on the native worker behind the gates.
+#[cfg(target_os = "macos")]
 mod clipboard;
 pub mod menubar;
 pub mod notifications;
 pub mod outcome;
+#[cfg(target_os = "macos")]
 mod overlay;
+pub mod platform;
 pub mod safety;
 pub mod session;
 pub mod snapshot;
 
-pub use apps::{activate, frontmost_pid, list_apps, resolve_app, AppInfo, ResolveError};
+#[cfg(target_os = "macos")]
+pub use apps::{activate, frontmost_pid, list_apps, resolve_app};
+pub use apps::{AppInfo, ResolveError};
 pub use menubar::{menu_path_steps, menu_shortcut, MenuItem, MenuListing, MenuWalkError};
 pub use outcome::{disposition_of, Disposition, ErrorCode, ErrorOutcome, PolicyReason};
 pub use safety::Refused;
 pub use session::{
     ActionResult, AppState, ClipboardAccess, ClipboardContents, ClipboardRead, ClipboardWrite,
-    CoreError, Cua, Delivery, FindResult, FocusCheck, FocusState, Mechanism, MouseOptions,
-    Observed, Op, Permissions, PointerLocation, PostActionState, Presence, Screenshot,
-    ScrollAmount, ScrollDir, StateOptions, Target, TransientWindow, WaitOutcome, WindowPixel,
+    CoreError, Delivery, FindResult, FocusCheck, FocusState, Mechanism, MouseOptions, Observed,
+    Permissions, PointerLocation, PostActionState, Presence, Screenshot, ScrollAmount, ScrollDir,
+    StateOptions, Target, TransientWindow, WaitOutcome, WindowPixel,
 };
 pub use session::{
     CloseOutcome, LaunchOutcome, WindowListing, WindowOp, WindowOutcome, WindowSelector,
     WindowSummary,
 };
+/// The macOS backend: the native worker handle and its prepared operations.
+/// `Cua` implements [`PlatformAdapter`]; see `platform::macos`.
+#[cfg(target_os = "macos")]
+pub use session::{Cua, Op};
 
-/// Re-exported so the MCP layer can render a display without depending on
-/// `cua-capture` directly.
-pub use cua_capture::DisplayInfo;
-/// Re-exported so frames in public results can be named by callers.
-pub use objc2_core_foundation::CGRect;
-
-/// Re-exported so a caller can name a mouse button or a modifier set without
-/// depending on `cua-hid` directly. `cua-hid` is the only crate that
-/// synthesizes input, and that boundary is worth keeping visible in the
-/// dependency graph rather than spreading across every consumer.
-pub use cua_hid::{Modifiers, MouseButton};
+/// Re-exported so the MCP layer can render a display, name a frame, a mouse
+/// button, a modifier set or tree limits without depending on a platform crate
+/// directly. On macOS these are exactly `cua_capture::DisplayInfo`,
+/// `objc2_core_foundation::CGRect`, `cua_hid::{Modifiers, MouseButton}` and
+/// `cua_ax::Limits`, as they always were — `cua-hid` stays the only crate that
+/// synthesizes input, and that boundary stays visible in the dependency graph.
+/// Elsewhere they are [`platform::portable`]'s stand-ins.
+pub use platform::leaf::{CGRect, DisplayInfo, Limits, Modifiers, MouseButton};
+pub use platform::{PlatformAdapter, PLATFORM};
 pub use snapshot::{diff_trees, render_tree, RenderOptions, TreeDiff};
-
-/// Re-exported so callers can tune tree limits without depending on `cua-ax`
-/// directly.
-pub use cua_ax::Limits;

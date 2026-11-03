@@ -1,13 +1,18 @@
 //! Finding the app the agent asked for.
 
+#[cfg(target_os = "macos")]
 use std::sync::mpsc;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication,
     NSWorkspace, NSWorkspaceOpenConfiguration,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSBundle, NSError, NSString, NSURL};
 
 /// A running application, as an agent should see it.
@@ -24,6 +29,7 @@ pub struct AppInfo {
     pub regular: bool,
 }
 
+#[cfg(target_os = "macos")]
 /// Every running application with a GUI presence.
 ///
 /// Ordered so the frontmost app comes first: when a user says "the browser" or
@@ -43,6 +49,7 @@ pub fn list_apps() -> Vec<AppInfo> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn app_info(app: &NSRunningApplication) -> AppInfo {
     AppInfo {
         name: app
@@ -56,10 +63,11 @@ fn app_info(app: &NSRunningApplication) -> AppInfo {
     }
 }
 
-fn sort_apps(apps: &mut [AppInfo]) {
+pub fn sort_apps(apps: &mut [AppInfo]) {
     apps.sort_by_key(|a| (!a.active, !a.regular, a.name.to_lowercase()));
 }
 
+#[cfg(target_os = "macos")]
 /// [`list_apps`], corrected for apps that started or exited since this process
 /// first asked.
 ///
@@ -95,6 +103,7 @@ pub fn list_apps_fresh() -> Vec<AppInfo> {
     apps
 }
 
+#[cfg(target_os = "macos")]
 /// Every pid on the system, via `proc_listallpids`. Empty on failure.
 fn all_pids() -> Vec<libc::pid_t> {
     // Ask for the count first, then leave headroom for processes started in
@@ -126,6 +135,7 @@ pub fn pid_alive(pid: libc::pid_t) -> bool {
     signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(target_os = "macos")]
 /// One running app by pid, read directly rather than from the cached list.
 pub fn app_for_pid(pid: libc::pid_t) -> Option<AppInfo> {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid).map(|a| app_info(&a))
@@ -144,6 +154,7 @@ pub enum ResolveError {
     Ambiguous { query: String, matches: String },
 }
 
+#[cfg(target_os = "macos")]
 /// Resolve an app name, bundle identifier, or bundle path to one running app.
 ///
 /// Accepts what a model will actually produce. Matching runs from most to least
@@ -165,7 +176,7 @@ pub fn resolve_app(query: &str) -> Result<AppInfo, ResolveError> {
     }
 }
 
-fn resolve_in(query: &str, apps: &[AppInfo]) -> Result<AppInfo, ResolveError> {
+pub fn resolve_in(query: &str, apps: &[AppInfo]) -> Result<AppInfo, ResolveError> {
     let q = query.trim();
 
     // A bundle path is the one form that needs normalizing before comparison.
@@ -240,6 +251,7 @@ fn describe(apps: &[AppInfo]) -> String {
         .join(", ")
 }
 
+#[cfg(target_os = "macos")]
 /// The pid the workspace currently considers frontmost.
 ///
 /// `NSWorkspace.frontmostApplication` rather than scanning [`list_apps`] for
@@ -253,6 +265,7 @@ pub fn frontmost_pid() -> Option<libc::pid_t> {
         .map(|a| a.processIdentifier())
 }
 
+#[cfg(target_os = "macos")]
 /// Bring an app to the front, the way clicking its Dock icon would.
 ///
 /// This is `NSRunningApplication.activate`, not an event: no cursor moves and
@@ -315,6 +328,7 @@ impl LaunchSpec {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// An installed app, located but not launched.
 pub struct LaunchTarget {
     pub url: Retained<NSURL>,
@@ -323,6 +337,7 @@ pub struct LaunchTarget {
     pub bundle_id: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
 /// Folders a bare app name is looked up in, in order.
 fn application_folders() -> Vec<std::path::PathBuf> {
     let mut dirs = vec![
@@ -337,6 +352,7 @@ fn application_folders() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(target_os = "macos")]
 /// Turn a `launch_app` argument into one installed app bundle, or say why not.
 pub fn locate_app(spec: &str) -> Result<LaunchTarget, String> {
     let parsed = LaunchSpec::parse(spec)
@@ -393,12 +409,14 @@ pub fn locate_app(spec: &str) -> Result<LaunchTarget, String> {
     })
 }
 
+#[cfg(target_os = "macos")]
 /// How long to wait for LaunchServices to report a launch.
 ///
 /// Generous: a cold launch of a large app is seconds, and the completion
 /// handler fires once the process exists, not once it has drawn anything.
 pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(target_os = "macos")]
 /// Launch an app through `NSWorkspace`, returning its pid.
 ///
 /// `openApplicationAtURL:configuration:completionHandler:`, the public
@@ -447,6 +465,7 @@ pub fn launch(target: &LaunchTarget, activate: bool) -> Result<libc::pid_t, Stri
     }
 }
 
+#[cfg(target_os = "macos")]
 /// A running app with exactly this bundle identifier, preferring a regular one.
 pub fn running_with_bundle_id(bundle_id: &str) -> Option<AppInfo> {
     let hits: Vec<AppInfo> = list_apps_fresh()
@@ -459,6 +478,7 @@ pub fn running_with_bundle_id(bundle_id: &str) -> Option<AppInfo> {
         .cloned()
 }
 
+#[cfg(target_os = "macos")]
 /// Ask an app to quit, the way its own Quit menu item would.
 ///
 /// `NSRunningApplication.terminate` sends the quit Apple event, so the app runs

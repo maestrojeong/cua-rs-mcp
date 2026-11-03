@@ -98,15 +98,66 @@ impl Gate {
 /// checked. Refusing a click on "Delete" because it is destructive, when the
 /// real problem is that the screen has been locked for an hour, sends the agent
 /// down the wrong path.
+#[cfg(target_os = "macos")]
 pub(crate) fn guard(
     app: &AppInfo,
     watch: &HumanWatch,
     gate: &Gate,
     candidate: Option<&Candidate>,
 ) -> std::result::Result<(), Refused> {
+    guard_with(app, &MacProbe { watch }, gate, candidate)
+}
+
+/// The facts about the login session that only the platform can read, and
+/// that [`guard_with`] needs to apply the session-wide gates.
+///
+/// Everything else `guard_with` decides from the app, the gate and the
+/// candidate alone, so it is the same policy — same gates, same order, same
+/// refusals — on every platform. Each method is called at most once per
+/// `guard_with`, at the point in the order where the macOS gate always read
+/// it, so a probe with a side effect or a cost sees the same call pattern a
+/// direct read would have.
+pub trait SessionProbe {
+    /// Locked, or showing a screen saver. Fail *open* when unknowable — see
+    /// the macOS `session_locked` for why a headless session must not read as
+    /// permanently locked.
+    fn session_locked(&self) -> bool;
+    /// What the yield-to-human watch reports right now.
+    fn yield_reading(&self) -> YieldReading<'_>;
+    /// The pid the platform considers frontmost, for the yield gate.
+    fn frontmost_pid(&self) -> Option<libc::pid_t>;
+}
+
+/// The macOS probe: exactly the reads `guard` always made.
+#[cfg(target_os = "macos")]
+struct MacProbe<'a> {
+    watch: &'a HumanWatch,
+}
+
+#[cfg(target_os = "macos")]
+impl SessionProbe for MacProbe<'_> {
+    fn session_locked(&self) -> bool {
+        session_locked()
+    }
+    fn yield_reading(&self) -> YieldReading<'_> {
+        self.watch.reading()
+    }
+    fn frontmost_pid(&self) -> Option<libc::pid_t> {
+        crate::apps::frontmost_pid()
+    }
+}
+
+/// [`guard`] with the platform's session facts supplied by `probe`. The one
+/// copy of the gate order, shared by every backend.
+pub fn guard_with(
+    app: &AppInfo,
+    probe: &dyn SessionProbe,
+    gate: &Gate,
+    candidate: Option<&Candidate>,
+) -> std::result::Result<(), Refused> {
     let verb = gate.verb;
 
-    if session_locked() {
+    if probe.session_locked() {
         return Err(Refused::SessionLocked { verb });
     }
 
@@ -149,17 +200,17 @@ pub(crate) fn guard(
         }
     }
 
-    match &watch.watch {
-        Watch::Off => {}
-        Watch::Broken { reason } => {
+    match probe.yield_reading() {
+        YieldReading::Off => {}
+        YieldReading::Broken(reason) => {
             return Err(Refused::YieldWatchUnavailable {
                 verb,
-                reason: reason.clone(),
+                reason: reason.to_string(),
             })
         }
-        Watch::On { .. } => {
+        YieldReading::Watching { since_input_ms } => {
             let idle_ms = yield_idle_ms();
-            if let Some(ago_ms) = watch.since_human_input_ms() {
+            if let Some(ago_ms) = since_input_ms {
                 // The pid test is what keeps this from firing on the whole
                 // point of the project. cua-rs never activates an app, so an
                 // app it is driving is frontmost only because the human put it
@@ -167,7 +218,7 @@ pub(crate) fn guard(
                 // input arriving while some other app is frontmost is the human
                 // working somewhere else, which is exactly the case cua-rs
                 // exists to run alongside.
-                if ago_ms < idle_ms && crate::apps::frontmost_pid() == Some(app.pid) {
+                if ago_ms < idle_ms && probe.frontmost_pid() == Some(app.pid) {
                     return Err(Refused::HumanTookOver {
                         verb,
                         app: app.name.clone(),

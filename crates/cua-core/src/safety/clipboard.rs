@@ -27,6 +27,7 @@
 
 use super::*;
 
+#[cfg(target_os = "macos")]
 /// Why `clipboard_get` must not return the text, or `None` when it may.
 ///
 /// Checked in the order a reader wants reported: the writer's own word first,
@@ -92,12 +93,13 @@ pub(crate) fn clipboard_read_refusal(
 
 /// The yield watch, reduced to what the session gate needs to know.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum YieldReading<'a> {
+pub enum YieldReading<'a> {
     Off,
     Broken(&'a str),
     Watching { since_input_ms: Option<u64> },
 }
 
+#[cfg(target_os = "macos")]
 impl HumanWatch {
     pub(crate) fn reading(&self) -> YieldReading<'_> {
         match &self.watch {
@@ -110,13 +112,14 @@ impl HumanWatch {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// The gates a clipboard write passes: screen lock, then yield.
 pub(crate) fn guard_session(verb: &'static str, watch: &HumanWatch) -> Result<(), Refused> {
     session_gate(verb, session_locked(), watch.reading(), yield_idle_ms())
 }
 
 /// [`guard_session`] with every input passed in, for tests.
-pub(crate) fn session_gate(
+pub fn session_gate(
     verb: &'static str,
     locked: bool,
     watch: YieldReading<'_>,

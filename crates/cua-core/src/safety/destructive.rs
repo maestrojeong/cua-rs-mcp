@@ -992,8 +992,10 @@ pub fn key_activates_default_button(key: &str) -> bool {
 mod lifecycle;
 pub use lifecycle::*;
 
+#[cfg(target_os = "macos")]
 #[path = "runtime.rs"]
 mod runtime;
+#[cfg(target_os = "macos")]
 pub use runtime::*;
 
 #[path = "gate.rs"]
@@ -1005,7 +1007,7 @@ mod notification_source;
 pub use notification_source::*;
 #[path = "clipboard.rs"]
 mod clipboard_policy;
-pub(crate) use clipboard_policy::*;
+pub use clipboard_policy::*;
 
 #[cfg(test)]
 include!("tests.rs");

@@ -8,13 +8,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-cua-ax.workspace = true
-cua-capture.workspace = true
-cua-hid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
+
+# Everything below is the macOS backend (`platform::macos`, and the modules it
+# drives), and is a target-specific dependency on purpose: a non-macOS build of
+# this crate compiles the platform-neutral contract — `PlatformAdapter`, the
+# result types, `outcome`, the safety policy, tree rendering — and never even
+# resolves objc2. See DESIGN.md §15.
+[target.'cfg(target_os = "macos")'.dependencies]
+cua-ax.workspace = true
+cua-capture.workspace = true
+cua-hid.workspace = true
 block2 = "0.6"
 # Also for `autoreleasepool`: `clipboard.rs` wraps every pasteboard read in
 # one, since a read returns autoreleased Foundation objects and the native
