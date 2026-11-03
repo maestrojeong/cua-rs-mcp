@@ -3224,3 +3224,307 @@ database, which this project does not do.
   from a panel that did not open. The tools never rely on that read to restore
   state — they press the clock again only if they pressed it themselves — but a
   read in that case waits its full 1.5 s and says "empty, or did not open".
+
+## 15. `PlatformAdapter`, and the first second platform
+
+0.11.0 splits cua-rs into two parts. One part is the same on every OS. The
+other is one OS's accessibility stack. It also adds a Linux backend that uses
+AT-SPI2. This section covers four things: where the boundary was drawn, why it
+has the shape it has, what that cost, and what Linux can and cannot do today.
+Linux statements are marked either *measured* (run live) or *implemented*
+(compiles, unit-tested, never run against a real desktop).
+
+### Where the line is
+
+`cua_core::PlatformAdapter` (`crates/cua-core/src/platform/mod.rs`) is everything
+`cua-mcp` asks of a platform. Its methods match the tools one-for-one.
+`server.rs` calls no backend method directly: every call goes through the
+trait. The only per-platform line in the MCP layer is the `Platform` type
+alias in `crates/cua-mcp/src/platform.rs`. It is chosen by
+`cfg(target_os)` at compile time.
+
+These stay above the line and are shared:
+
+- **The result types.** `AppState`, `ActionResult`, `CoreError` and the rest
+  moved verbatim from `orchestration.rs` to `session/types.rs`, which compiles
+  everywhere.
+- **Rendering.** `snapshot::render_tree` and `match_nodes` are generic over a
+  `TreeNode` trait, and `cua_ax::AxNode` implements it.
+- **`outcome.rs` and the safety policy.**
+- **Gate order.** `safety::guard` became `guard_with(app, &dyn SessionProbe, …)`.
+  A backend supplies the three facts only it can read: is the session locked,
+  what does the yield watch say, and which pid is frontmost. There is one copy
+  of the gate order, and every backend runs it.
+
+Below the line is everything that touches a native handle.
+
+### Why prepared operations, not just methods
+
+A trait with one blocking method per tool would have been simpler. It would
+also have broken `batch`. A batch has to run as one job on the native thread,
+so that nothing else interleaves between its steps (§4). That only works if a
+step can be built on the calling thread and executed later on the native
+thread. So the trait has a generic associated type, `type Op<T>`, plus `op_*`
+constructors, `map`, `ready`, `run` and `run_batch`.
+
+Each backend picks its own representation. On macOS it is exactly the closure
+over the worker's `Inner` that `session::Op` already was. Linux uses the same
+shape over its own state. The cost is that `server.rs` now spells
+`Platform::op_click(..).map_outcome(..)` where it used to spell
+`Op::click(..).map(..)`.
+
+`map_outcome` is deliberately not named `map`. On macOS the concrete op type
+has an inherent `map`. An extension method with the same name would silently
+lose to it, and the call would bypass the trait.
+
+Calls that are never batched (clipboard, windows, lifecycle, notifications,
+displays) stay as plain blocking methods.
+
+### Why the macOS backend stayed inside `cua-core`
+
+The alternative was moving it into its own crate. That move is invasive in
+ways a refactor that promises zero behavior change should not be:
+
+- It is ~10k lines that rely on inherent `impl`s of the result types, which
+  are impossible on a foreign type.
+- They also rely on `pub(crate)` fields such as `ActionResult::point`.
+- They call crate-internal safety APIs.
+
+So the macOS backend stays where it was, behind `#[cfg(target_os = "macos")]`.
+Its objc2, `cua-ax`, `cua-hid` and `cua-capture` dependencies became
+`[target.'cfg(target_os = "macos")'.dependencies]`. A Linux build of
+`cua-core` never resolves objc2.
+
+The leaf types that every signature names are re-exported from
+`platform::leaf`: `CGRect`, `Modifiers`, `MouseButton`, `Limits`,
+`DisplayInfo`.
+
+- **On macOS** these are the real CoreGraphics / `cua-hid` / `cua-ax` /
+  `cua-capture` types, unchanged.
+- **Elsewhere** they are plain-Rust stand-ins in `platform::portable`, with the
+  same field names and parse vocabulary.
+
+Tests on macOS check each stand-in against the real type: bit values, defaults,
+and parse results including error text.
+
+Three `CoreError` variants carry macOS types: `Ax`, `Capture` and
+`PidClickUnavailable`. They are `cfg(macos)`, and `outcome.rs` gives them a
+`cfg`'d arm, so the match stays exhaustive on both targets.
+
+How "zero behavior change" was checked:
+
+- `tools/list` from the 0.10.0 binary and from this branch is byte-identical,
+  diffed directly.
+- Every pre-existing test still passes.
+- The full CI gate (fmt, crate list, per-crate isolated builds, clippy, test,
+  release build, binary smoke) passed on a macOS host for the refactor commit
+  alone and again for the final state.
+
+What this does *not* prove is live UI behavior. As always, that is the §8
+checklist, by hand.
+
+### What was added to the shared surface, and why each is not a duplicate
+
+**`CoreError::PlatformUnsupported { feature, platform, why }`** →
+`PLATFORM_NOT_SUPPORTED`. This is the rule that a backend never silently
+no-ops. Linux returns it for:
+
+- notifications;
+- `close_app`;
+- shared-input tools without the opt-in;
+- X11-only features on Wayland.
+
+**`CoreError::ElementUnsupported { verb, element, why }`** →
+`ACTION_NOT_SUPPORTED`. AT-SPI lists an element's interfaces up front, so a
+`set_value` on something with neither `EditableText` nor `Value` can be refused
+before anything is sent. macOS reaches the same situation later, through
+`Ax(Unsupported)` → `INTERNAL`.
+
+**`CoreError::Accessibility { reason }`** → `INTERNAL`. This is the Linux
+counterpart of `Ax(_)`, which cannot be shared because its payload is
+`cua-ax`'s type.
+
+Where an existing variant already fit, Linux reuses it, and the classification
+is therefore identical:
+
+- Stale or recycled references give `StaleSnapshot`, `TargetChanged` or
+  `TokenRoleMismatch`.
+- A refused delivery gives `PointerEventRefused`.
+- A key with no element-addressed meaning gives `KeyNoAccessibilityEquivalent`,
+  whose wording ("does not synthesize shared HID keyboard input because it
+  would steal keyboard focus") is exactly as true on Linux.
+
+**`Delivery::SharedInput`** (`xtest (shared input)`) and
+**`Delivery::WindowManager`** (`wm`) exist so that a result can never claim the
+macOS guarantee for something that does not have it. The macOS backend never
+produces either one.
+
+**`ClipboardAccess::NoPrivacyLayer`** exists because X11 has no clipboard
+privacy at all. Reporting macOS's `NotApplicable` would have described the
+platform wrongly.
+
+### Linux: the stack
+
+| Concern | Mechanism | Display server |
+|---|---|---|
+| Tree, element actions, text, values | AT-SPI2 over D-Bus (`atspi` 0.30 on zbus 5) | both |
+| Pixels, displays, window-manager requests, clipboard, idle time | X11 (`x11rb`, pure Rust) | X11 only |
+| Pointer and keyboard synthesis | XTEST, **opt-in** (`CUA_LINUX_XTEST=1`) | X11 only |
+
+The native thread works the same way as on macOS. There is one thread, jobs
+are closures sent over a channel, and each job is wrapped in `catch_unwind`.
+The difference is that this thread owns a current-thread tokio runtime and
+`block_on`s each D-Bus call. Every call is capped at 2 s. That matches
+`cua_ax::DEFAULT_TIMEOUT_SECS`, and it stops one hung app from stalling the
+queue for zbus's default 25 s.
+
+**Roles are mapped onto the AX vocabulary** at the one place they are read
+(`tree::ax_role`). For example, `push button` becomes `AXButton`, `entry`
+becomes `AXTextField`, and `password text` becomes
+`AXTextField:AXSecureTextField`. This keeps several things working unchanged:
+the renderer's structural-role filter, `element_token`, and the destructive
+and decision-context heuristics (which look for `AXSheet` and
+`AXWindow:AXDialog`). It also means an agent's learned vocabulary carries over.
+
+A password field's text is never read.
+
+**App identity.** `bundle_id` on Linux is the executable's file name, read from
+`/proc/<pid>/exe`. It comes from the kernel, so an app cannot rename itself out
+of the forbidden list. The pid comes from the bus daemon
+(`GetConnectionUnixProcessID`), not from the app.
+
+The forbidden-target table gained Linux entries in a separate table that is
+empty on macOS (`PLATFORM_FORBIDDEN`). The same goes for the substring
+backstop (`pinentry`, `askpass`, `polkit`, `keyring`, `wallet`). The macOS
+classification is therefore exactly what it was.
+
+**Process replacement.** A pid is paired with its start time from
+`/proc/<pid>/stat`, and with its bus name. An app that was relaunched gives
+`ProcessReplaced`, the same error as on macOS.
+
+### Linux: the shared-input decision
+
+macOS's pid-routed tier (§1, §11) delivers synthesized events to one process,
+without moving the cursor or changing focus. Linux has no equivalent.
+
+- **XTEST** injects on the *shared* devices. The human's pointer moves, and key
+  events go to whichever window holds X focus.
+- **AT-SPI's `GenerateKeyboardEvent`** is the same thing one layer up.
+
+The choice was between three options:
+
+1. silently downgrading the project's central guarantee;
+2. not offering pointer and keystroke tools on Linux at all;
+3. offering them only when the operator explicitly accepts the trade.
+
+It is (3). Without `CUA_LINUX_XTEST=1`, every tool that needs a pointer or
+keystrokes answers `PlatformUnsupported`, and the message says why and what
+the flag does. With it, results are labelled `xtest (shared input)`, and the
+server text says plainly that the real pointer moved.
+
+Before keystrokes, the backend calls `Component.GrabFocus` on the target and
+reads `Focused` back into the existing `FocusCheck`. `CUA_KEY_STRICT_FOCUS`
+works as on macOS.
+
+Without the flag, `press_key` still handles `return`, `enter` and `space`, by
+pressing the element's activation action.
+
+### Linux: what else is deliberately missing
+
+- **Notifications.** freedesktop notifications go to the notification daemon
+  and to nobody else. No interface lets a third party list them or act on
+  them, and the daemons do not publish their history through AT-SPI
+  consistently.
+- **`close_app`.** macOS sends a quit event that the app can answer with "save
+  changes?". Linux has no app-answerable quit request, and `SIGTERM` loses
+  unsaved work in most GTK and Qt apps. The error points at `press_menu_bar`
+  instead.
+- **Wayland.** AT-SPI works there, so the tree and element actions work. But
+  Wayland deliberately removes everything in the X11 column from ordinary
+  clients. What replaces each piece is compositor-specific:
+  xdg-desktop-portal sessions that prompt the user, `wlr-*` protocols that
+  GNOME does not implement, `libei`. None of it is implemented yet. Each of
+  those tools says so instead of half-working.
+- **Transient-window reporting** (`popups`). AT-SPI puts pop-up menus inside
+  the app's own tree, so §10's separate-window problem does not arise in the
+  same form. `popups` is always empty on Linux.
+- **The drawn cursor.** `cua-overlay` is AppKit.
+
+### Linux: other semantics that differ
+
+- **Screenshots** read the window's rectangle off the root window. X11 cannot
+  reliably capture a window on its own while it is covered, and a compositor
+  redirects windows off-screen. So the image includes whatever is on top, and
+  `get_app_state` attaches a warning saying so. The scale is 1.0: X has no
+  points.
+- **Clipboard.** X11 has no clipboard store, only whichever client owns the
+  `CLIPBOARD` selection.
+  - A read asks for `TARGETS` first and applies `safety::clipboard_withheld`
+    (the macOS policy, factored out). Only then does it request the text.
+  - `x-kde-passwordManagerHint` plays the role of
+    `org.nspasteboard.ConcealedType`.
+  - A write hands ownership to a small thread that answers paste requests
+    until another client takes the selection.
+  - There is no change counter, so `change_count` is `-1`. `verified` comes
+    from `GetSelectionOwner`.
+  - Transfers large enough to use `INCR` are refused rather than half-read.
+- **Window tools** send EWMH client messages:
+  - focus is `_NET_RESTACK_WINDOW`, which raises the window without
+    activating it;
+  - move and resize use `_NET_MOVERESIZE_WINDOW`;
+  - minimize uses `WM_CHANGE_STATE`;
+  - maximize and restore use `_NET_WM_STATE`.
+
+  The window manager decides, and the result re-reads before/after. Restoring a
+  *minimized* window needs `_NET_ACTIVE_WINDOW`, which activates it. The result
+  says so.
+
+  An AT-SPI window is paired with an X window by `_NET_WM_PID` plus geometry,
+  the same public-data route §6 uses on macOS. An unpaired window is listed but
+  not manageable.
+- **Screen lock** is `GetActive` on `org.gnome.ScreenSaver` or
+  `org.freedesktop.ScreenSaver`. It fails open, like macOS, so that a session
+  with neither service (Xvfb, CI) is not permanently "locked".
+- **`CUA_YIELD_TO_HUMAN`** reads `ms_since_user_input` from
+  MIT-SCREEN-SAVER: a timestamp, as on macOS, never content. Where that
+  reading is unavailable it fails closed, again like macOS. One caveat: the X
+  server cannot tell XTEST input from human input, so with both flags on,
+  cua-rs's own keystrokes reset the idle clock.
+
+### Linux: what was measured
+
+All of this ran under Docker on Debian: `xvfb-run`, `dbus-run-session`,
+`at-spi-bus-launcher`, the GTK3 `zenity --entry` dialog, and the release
+binary over stdio.
+
+- `check_permissions` reported both readings true.
+- `list_apps` found zenity.
+- `get_app_state` produced a 17-node tree. The dialog came out as
+  `AXWindow:Dialog`, with `AXStaticText`, `AXTextField (focused, editable)` and
+  the `AXButton`s OK/Cancel. It also returned a 310×257 PNG.
+- `find` returned the text field.
+- `set_value` wrote the field, and the post-action diff showed the new value.
+- `click` on OK went through `DoAction` and closed the dialog. zenity exited 0
+  and printed exactly the text cua-rs had set.
+- `clipboard_set` followed by `clipboard_get` round-tripped, with the type list
+  reported.
+- `list_notifications` refused with its reason.
+- `press_key ctrl+a` without the flag was refused with
+  `KeyNoAccessibilityEquivalent`.
+- With `CUA_LINUX_XTEST=1`: keystroke `type_text` landed in the field
+  (`focus: verified`), and `ctrl+a` followed by typing replaced the field's
+  text.
+- `list_displays` reported the Xvfb screen.
+
+**Not measured:**
+
+- the menu bar on a real GTK or Qt app;
+- every EWMH window operation (Xvfb runs no window manager, so the zenity
+  window was correctly reported as unpaired);
+- Qt and Electron apps;
+- a real GNOME or KDE session;
+- multi-monitor setups;
+- HiDPI scaling;
+- any Wayland session.
+
+Those are the next checklist.

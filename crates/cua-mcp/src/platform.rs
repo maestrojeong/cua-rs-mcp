@@ -12,6 +12,11 @@ use cua_core::PlatformAdapter;
 #[cfg(target_os = "macos")]
 pub type Platform = cua_core::Cua;
 
+/// The Linux backend: AT-SPI2 over D-Bus for the tree and semantic actions,
+/// X11 for pixels and (opt-in) synthesized input. See `cua-ax-linux`.
+#[cfg(target_os = "linux")]
+pub type Platform = cua_ax_linux::LinuxCua;
+
 /// One prepared operation for this build's backend.
 pub type Op<T> = <Platform as PlatformAdapter>::Op<T>;
 
@@ -37,5 +42,5 @@ impl<T: Send + 'static> MapOutcome<T> for Op<T> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("cua-rs has no PlatformAdapter backend for this target");

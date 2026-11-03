@@ -327,8 +327,22 @@ const SUSPICIOUS: &[&str] = &[
 /// The suspicious fragment `bundle_id` contains, if any.
 pub(super) fn suspicious_token(bundle_id: &str) -> Option<&'static str> {
     let lower = bundle_id.to_lowercase();
-    SUSPICIOUS.iter().copied().find(|t| lower.contains(t))
+    SUSPICIOUS
+        .iter()
+        .chain(PLATFORM_SUSPICIOUS)
+        .copied()
+        .find(|t| lower.contains(t))
 }
+
+/// Linux executable names that describe themselves as a secret store or an
+/// authorization prompt: every `pinentry-*` flavour, every `*-askpass`,
+/// `polkit` agents a desktop names its own way. Empty on macOS, for the same
+/// reason as [`PLATFORM_FORBIDDEN`].
+#[cfg(target_os = "macos")]
+const PLATFORM_SUSPICIOUS: &[&str] = &[];
+
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_SUSPICIOUS: &[&str] = &["askpass", "keyring", "pinentry", "polkit", "wallet"];
 
 /// Why this bundle identifier may not be acted on, or `None`.
 ///
@@ -341,7 +355,7 @@ pub fn forbidden_bundle(bundle_id: &str) -> Option<&'static str> {
         return None;
     }
     let lower = id.to_lowercase();
-    for entry in FORBIDDEN {
+    for entry in FORBIDDEN.iter().chain(PLATFORM_FORBIDDEN) {
         let prefix = entry.prefix.to_lowercase();
         if lower == prefix || lower.starts_with(&format!("{prefix}.")) {
             return Some(entry.why);
@@ -349,6 +363,92 @@ pub fn forbidden_bundle(bundle_id: &str) -> Option<&'static str> {
     }
     suspicious_token(id).map(|_| CREDENTIALS)
 }
+
+/// Extra entries for platforms whose apps are not named by bundle identifier.
+///
+/// Empty on macOS, so the macOS classification is exactly [`FORBIDDEN`] and
+/// nothing else. On Linux the Linux backend reports an app's *executable file
+/// name* in `bundle_id` (there is no bundle identifier; see DESIGN.md §15), and
+/// this table names the credential stores, settings panels, authorization
+/// agents and lockers a desktop ships under those names. The same prefix rule
+/// applies — `gnome-control-center` also covers `gnome-control-center.real`.
+#[cfg(target_os = "macos")]
+const PLATFORM_FORBIDDEN: &[Forbidden] = &[];
+
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_FORBIDDEN: &[Forbidden] = &[
+    // Credential stores.
+    Forbidden {
+        prefix: "seahorse",
+        why: CREDENTIALS,
+    },
+    Forbidden {
+        prefix: "kwalletmanager5",
+        why: CREDENTIALS,
+    },
+    Forbidden {
+        prefix: "kwalletmanager6",
+        why: CREDENTIALS,
+    },
+    Forbidden {
+        prefix: "gnome-keyring-daemon",
+        why: CREDENTIALS,
+    },
+    // Settings and privacy panels.
+    Forbidden {
+        prefix: "gnome-control-center",
+        why: SECURITY_SURFACE,
+    },
+    Forbidden {
+        prefix: "systemsettings",
+        why: SECURITY_SURFACE,
+    },
+    Forbidden {
+        prefix: "systemsettings5",
+        why: SECURITY_SURFACE,
+    },
+    Forbidden {
+        prefix: "xfce4-settings-manager",
+        why: SECURITY_SURFACE,
+    },
+    // Authorization prompts and lockers.
+    Forbidden {
+        prefix: "gcr-prompter",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "polkit-gnome-authentication-agent-1",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "polkit-kde-authentication-agent-1",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "lxpolkit",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "gnome-screensaver",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "xscreensaver",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "light-locker",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "kscreenlocker_greet",
+        why: AUTH_PROMPT,
+    },
+    Forbidden {
+        prefix: "i3lock",
+        why: AUTH_PROMPT,
+    },
+];
 
 /// The warning `get_app_state` attaches when it drops a forbidden app's image.
 ///

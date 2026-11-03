@@ -5,7 +5,7 @@
 [![ci](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/maestrojeong/cua-rs-mcp/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/maestrojeong/cua-rs-mcp)](https://github.com/maestrojeong/cua-rs-mcp/releases)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-![platforms](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
+![platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20(partial)-lightgrey)
 
 ## What is this?
 
@@ -303,6 +303,56 @@ call.
 
 Full experiment notes in [DESIGN.md](DESIGN.md).
 
+## OS support
+
+macOS is the primary platform. Linux support is new in 0.11 and partial. Every
+tool exists on both, with the same names and schemas. Where Linux cannot do
+something, the tool returns an error that says `… is not supported on linux: <why>`
+(code `PLATFORM_NOT_SUPPORTED`). It never fakes success.
+
+| Capability | macOS | Linux (X11) | Linux (Wayland) |
+|---|---|---|---|
+| Accessibility tree: `get_app_state`, `find`, `wait_for` | Yes | Yes (AT-SPI2) | Yes (AT-SPI2) |
+| Element actions: `click`, `set_value`, `type_text`, `select_text`, `perform_secondary_action` | Yes | Yes (AT-SPI actions, EditableText, Text, Value) | Yes |
+| `press_key` | Yes (sent to the app's process only) | `return`/`enter`/`space` via AT-SPI. Any chord with `CUA_LINUX_XTEST=1`, which uses the **shared** keyboard | `return`/`enter`/`space` only |
+| Mouse input: right/middle/double click, modifiers, `hover`, `drag`, `click_in_window`, `scroll` | Yes (cursor never moves) | Only with `CUA_LINUX_XTEST=1`, which **moves your real pointer** | No |
+| Screenshot | Yes (just the window) | Yes, reads the window's area of the screen, so anything on top of it is included | No |
+| Clipboard | Yes | Yes (`CLIPBOARD` selection) | No (Wayland-native) |
+| Menu bar: `menu_bar`, `press_menu_bar` | Yes | Implemented (GTK/Qt menu bars), not yet tested on a real app | Same |
+| Window management | Yes | `list_windows` via AT-SPI. Focus/move/resize/minimize/maximize/restore go to the window manager as EWMH requests; not yet tested under a real window manager | `list_windows` only |
+| `list_displays` | Yes | Yes (RandR) | No |
+| `launch_app` / `close_app` | Yes / Yes | Yes (an executable on `PATH`) / No | Yes / No |
+| Notifications | Yes | No | No |
+| Drawn cursor overlay | Yes | No | No |
+
+Linux keeps the same safety rules:
+
+- **Forbidden targets.** Matched on the executable name: seahorse, KWallet,
+  gnome-control-center, polkit agents, `pinentry*`, screen lockers, …
+- **`CUA_ALLOWED_APPS`** works as on macOS.
+- **`confirm_destructive`** applies to the same labels and dialogs.
+- **Locked screen.** Read from the GNOME or freedesktop ScreenSaver service.
+  If neither service exists, the check assumes the screen is unlocked.
+- **`CUA_YIELD_TO_HUMAN`.** Uses X11 idle time. Where that reading isn't
+  available, every action is refused rather than allowed.
+
+Clipboard text that KeePassXC or Klipper marks as a secret
+(`x-kde-passwordManagerHint`) is always withheld.
+
+What a Linux session needs:
+
+- `at-spi2-core`, with toolkit accessibility enabled:
+  `gsettings set org.gnome.desktop.interface toolkit-accessibility true`.
+  Qt apps also need `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`.
+- An X display, for the X11 column above.
+
+Run `check_permissions` to see which of these is missing.
+
+Coordinates on Linux are X pixels (1 px per point). Roles use the macOS names
+(`AXButton`, `AXTextField`, …), so `element_token`s look the same on both
+platforms. Tool descriptions still describe the macOS behaviour; this table and
+[DESIGN.md §15](DESIGN.md) cover the Linux differences.
+
 ## The on-screen cursor
 
 The Accessibility path leaves no visible trace, so a companion binary,
@@ -320,17 +370,25 @@ one warning and keeps working without the indicator. The installer and the
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # 353 tests, no special permissions needed
+cargo test --workspace          # 362 tests, no special permissions needed
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+On Linux, build only the crates that target it. The others are macOS FFI.
+
+```bash
+cargo test -p cua-core -p cua-ax-linux -p cua-mcp --lib --bins --tests
+```
+
 ```text
+cua-core      the PlatformAdapter trait, result types, safety policy, tree rendering
+              (all platforms), plus the macOS backend (cfg(target_os = "macos"))
 cua-ax        safe wrapper over the macOS Accessibility (AXUIElement) API
-cua-capture   finds windows, takes screenshots
-cua-core      snapshots, app resolution, safety gates, the clipboard
-cua-hid       delivers clicks/keys to a specific process
-cua-mcp       the MCP server itself, binary `cua-rs`
-cua-overlay   the on-screen cursor
+cua-capture   finds windows, takes screenshots (macOS)
+cua-hid       delivers clicks/keys to a specific process (macOS)
+cua-ax-linux  the Linux backend: AT-SPI2 over D-Bus, X11 for pixels and opt-in input
+cua-mcp       the MCP server itself, binary `cua-rs`; picks a backend at compile time
+cua-overlay   the on-screen cursor (macOS)
 ```
 
 Design rationale and constraints: [DESIGN.md](DESIGN.md).

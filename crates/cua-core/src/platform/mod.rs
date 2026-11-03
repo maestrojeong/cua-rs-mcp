@@ -62,7 +62,6 @@ use crate::session::{
 };
 
 pub mod leaf;
-#[cfg(any(not(target_os = "macos"), test))]
 pub mod portable;
 
 #[cfg(target_os = "macos")]

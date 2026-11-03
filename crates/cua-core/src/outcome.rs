@@ -178,6 +178,7 @@ impl ErrorOutcome {
 
             KeyNoAccessibilityEquivalent { .. }
             | KeyVerbUnsupported { .. }
+            | ElementUnsupported { .. }
             | NotificationActionUnavailable { .. } => (ErrorCode::ActionNotSupported, None),
 
             // Notification Center itself (or ControlCenter's clock) is not

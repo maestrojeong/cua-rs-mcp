@@ -1,0 +1,21 @@
+[package]
+name = "cua-ax-linux"
+description = "Linux backend for cua-rs: AT-SPI2 accessibility over D-Bus, X11 for pixels and opt-in synthesized input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cua-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio", "zbus"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { workspace = true }
+x11rb = { version = "0.14", default-features = false, features = ["randr", "xtest", "screensaver"] }
+png = "0.18"

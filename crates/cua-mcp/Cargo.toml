@@ -23,3 +23,8 @@ base64.workspace = true
 axum.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars.workspace = true
+
+# The Linux backend. On macOS the backend is cua-core itself (`cua_core::Cua`),
+# so nothing else is linked there.
+[target.'cfg(target_os = "linux")'.dependencies]
+cua-ax-linux.workspace = true

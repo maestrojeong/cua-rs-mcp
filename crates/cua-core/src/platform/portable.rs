@@ -8,10 +8,12 @@
 //! vocabulary, so the platform-neutral half of the crate — and every consumer
 //! of it — compiles unchanged against either.
 //!
-//! Compiled on macOS too under `cfg(test)`, so `tests` below can hold each
-//! stand-in against the real type it replaces. Drift between the two would
-//! otherwise surface only as "the same argument means something different on
-//! Linux", which nothing else here would catch.
+//! Compiled on macOS too, for two reasons: `tests` below holds each stand-in
+//! against the real type it replaces — drift between the two would otherwise
+//! surface only as "the same argument means something different on Linux",
+//! which nothing else here would catch — and a backend's pure helpers (the
+//! Linux chord parser reuses [`chord_tokens`]) stay testable on every CI
+//! runner.
 
 use std::fmt;
 

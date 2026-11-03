@@ -60,6 +60,20 @@ pub enum CoreError {
         why: String,
     },
 
+    /// The element exists and is current, but does not implement what the
+    /// call needs — a `set_value` on something with neither editable text nor
+    /// a numeric value, a `perform_secondary_action` naming an action it does
+    /// not advertise. Raised by backends whose accessibility layer reports
+    /// capabilities up front (AT-SPI's interface list), so the call can be
+    /// refused before anything is sent; the macOS backend reaches the same
+    /// situation through `Ax(Unsupported)`. Never constructed on macOS.
+    #[error("cannot {verb} {element}: {why}")]
+    ElementUnsupported {
+        verb: &'static str,
+        element: String,
+        why: String,
+    },
+
     /// A platform accessibility call failed for a reason none of the variants
     /// above names. The non-macOS counterpart of [`CoreError::Ax`], which is
     /// typed by `cua-ax` and so cannot be shared: on Linux it carries the
@@ -673,6 +687,32 @@ pub struct ActionResult {
 /// heuristic reports `Unchanged` while the app has plainly done something. The
 /// only way to be sure is to look — so this makes looking part of the action
 /// rather than a second round trip the agent has to remember to make.
+impl ActionResult {
+    /// A result for a backend outside this crate.
+    ///
+    /// The two crate-private fields feed the macOS drawn-cursor overlay only,
+    /// so they are left empty here; `state` and `focus` are public and can be
+    /// filled in afterwards.
+    pub fn new(
+        verb: impl Into<String>,
+        target: String,
+        ui_changed: Observed,
+        delivery: Delivery,
+    ) -> Self {
+        Self {
+            verb: verb.into(),
+            target,
+            ui_changed,
+            popups: Vec::new(),
+            delivery,
+            point: None,
+            overlay_target: None,
+            state: None,
+            focus: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostActionState {
     /// Id of the snapshot taken after the action. Element indices in `diff` or
@@ -758,6 +798,21 @@ pub enum Delivery {
     /// text should re-read the element afterward rather than trust the
     /// delivery label alone.
     PidKey,
+    /// Real input synthesized on the *shared* X11 input devices through the
+    /// XTEST extension (Linux only, and only when the operator opted in with
+    /// `CUA_LINUX_XTEST=1`). Unlike every variant above it is not addressed to
+    /// an element or a process: pointer events move the human's real pointer,
+    /// and key events go to whichever window holds the X keyboard focus, which
+    /// the backend sets to the target first. Reported as its own delivery so
+    /// that a caller can never mistake it for the macOS guarantee that nothing
+    /// shared was touched. Never produced by the macOS backend.
+    SharedInput,
+    /// A request to the window manager (Linux EWMH client messages: raise,
+    /// move/resize, iconify, maximize). No input was synthesized and nothing
+    /// was addressed to the app; the window manager decided, and the result's
+    /// before/after frames say what it decided. Never produced on macOS, where
+    /// window tools go through accessibility and report `ax`.
+    WindowManager,
 }
 
 impl Delivery {
@@ -767,6 +822,8 @@ impl Delivery {
             Delivery::Pid => "pid",
             Delivery::PidNoElement => "pid (no element)",
             Delivery::PidKey => "pid (keyboard)",
+            Delivery::SharedInput => "xtest (shared input)",
+            Delivery::WindowManager => "wm (window-manager request)",
         }
     }
 }
@@ -995,6 +1052,10 @@ pub enum ClipboardAccess {
     Other(isize),
     /// The OS predates the setting (before macOS 26): reads are unrestricted.
     NotApplicable,
+    /// A platform with no clipboard privacy layer at all (X11): any client
+    /// may read the selection, so reads are unrestricted. Never reported by
+    /// the macOS backend.
+    NoPrivacyLayer,
 }
 
 impl ClipboardAccess {
@@ -1008,6 +1069,9 @@ impl ClipboardAccess {
             }
             ClipboardAccess::Other(_) => "unrecognized",
             ClipboardAccess::NotApplicable => "unrestricted (this macOS has no pasteboard privacy setting)",
+            ClipboardAccess::NoPrivacyLayer => {
+                "unrestricted (this platform has no clipboard privacy layer: any client may read it)"
+            }
         }
     }
 }

@@ -63,7 +63,8 @@ fn app_info(app: &NSRunningApplication) -> AppInfo {
     }
 }
 
-pub fn sort_apps(apps: &mut [AppInfo]) {
+#[cfg(target_os = "macos")]
+fn sort_apps(apps: &mut [AppInfo]) {
     apps.sort_by_key(|a| (!a.active, !a.regular, a.name.to_lowercase()));
 }
 
@@ -176,6 +177,11 @@ pub fn resolve_app(query: &str) -> Result<AppInfo, ResolveError> {
     }
 }
 
+/// [`resolve_app`]'s matching tiers over an already-listed set of apps.
+///
+/// Public so a backend with its own app listing (Linux reads AT-SPI's registry
+/// rather than `NSWorkspace`) resolves a name with exactly the same tiers and
+/// the same refusal to guess.
 pub fn resolve_in(query: &str, apps: &[AppInfo]) -> Result<AppInfo, ResolveError> {
     let q = query.trim();
 

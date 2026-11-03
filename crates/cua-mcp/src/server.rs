@@ -791,6 +791,24 @@ fn prep_check_permissions() -> Op<CallToolResult> {
                 format!("accessibility:    {}", yes_no(p.accessibility)),
                 format!("screen_recording: {}", yes_no(p.screen_recording)),
             ];
+            // Linux has no grants to hand out; what can be missing is a
+            // service or a display server, and the remedy says which. The
+            // macOS wording below is untouched.
+            if cua_core::PLATFORM == "linux" {
+                if !p.accessibility {
+                    lines.push(
+                        "\nThe AT-SPI accessibility bus is not reachable. Install at-spi2-core, make sure this server runs inside the user's desktop session (DBUS_SESSION_BUS_ADDRESS set), and enable toolkit accessibility (GNOME: gsettings set org.gnome.desktop.interface toolkit-accessibility true; Qt apps: QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1)."
+                            .into(),
+                    );
+                }
+                if !p.screen_recording {
+                    lines.push(
+                        "\nNo X11 display is reachable (DISPLAY unset, or a Wayland session without Xwayland access). The accessibility tree and AT-SPI actions still work; screenshots, list_displays, the clipboard and opt-in XTEST input need X11. See the README's OS support table."
+                            .into(),
+                    );
+                }
+                return ok(lines.join("\n"));
+            }
             if !p.accessibility {
                 lines.push(
                     "\nGrant Accessibility in System Settings > Privacy & Security > Accessibility. Add the app that LAUNCHED this server (your terminal or agent app), not the cua-rs binary: macOS attributes the request to the host process."
@@ -2278,6 +2296,12 @@ fn render_action(r: &cua_core::ActionResult) -> String {
             }
             cua_core::Delivery::PidKey => {
                 "  (real key events routed to the target process via the private SkyLight SPI, not through the shared keyboard tap: they land wherever that process's own first responder currently is, which cua-rs best-effort-focuses first but cannot guarantee)"
+            }
+            cua_core::Delivery::WindowManager => {
+                "  (a request to the window manager: no input synthesized, nothing addressed to the app; the before/after frames below are what the window manager actually did)"
+            }
+            cua_core::Delivery::SharedInput => {
+                "  (Linux XTEST, opted into with CUA_LINUX_XTEST=1: real X11 input on the SHARED devices. Pointer events moved the human's real pointer, and key events went to whichever window holds X keyboard focus, which cua-rs set to the target first. Nothing about this is isolated from the human)"
             }
         },
         r.ui_changed.as_str(),

@@ -63,6 +63,6 @@ pub use session::{Cua, Op};
 /// `cua_ax::Limits`, as they always were — `cua-hid` stays the only crate that
 /// synthesizes input, and that boundary stays visible in the dependency graph.
 /// Elsewhere they are [`platform::portable`]'s stand-ins.
-pub use platform::leaf::{CGRect, DisplayInfo, Limits, Modifiers, MouseButton};
+pub use platform::leaf::{CGPoint, CGRect, CGSize, DisplayInfo, Limits, Modifiers, MouseButton};
 pub use platform::{PlatformAdapter, PLATFORM};
 pub use snapshot::{diff_trees, render_tree, RenderOptions, TreeDiff};

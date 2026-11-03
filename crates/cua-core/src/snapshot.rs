@@ -357,6 +357,75 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+// ── find ─────────────────────────────────────────────────────────────────────
+
+/// Case-insensitive substring search over a snapshot's nodes.
+///
+/// Searches label, value and role, in that priority order — a query like
+/// "Send" should find the button labeled Send before it finds an `AXSendButton`
+/// role — and returns rendered lines rather than raw nodes so the output format
+/// matches what `get_app_state` already showed the agent.
+///
+/// Actionable matches are listed first: a search is almost always the prelude to
+/// an action, and a non-actionable static-text hit is context at best.
+pub fn match_nodes<N: TreeNode>(nodes: &[N], needle: &str, limit: usize) -> Vec<String> {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(u8, &N)> = Vec::new();
+    for node in nodes {
+        let rank = if node
+            .label()
+            .is_some_and(|l| l.to_lowercase().contains(&needle))
+        {
+            0
+        } else if node
+            .value()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        {
+            1
+        } else if node.role().to_lowercase().contains(&needle) {
+            2
+        } else {
+            continue;
+        };
+        // Actionable-first, then match quality, then document order.
+        scored.push((rank + if node.is_actionable() { 0 } else { 3 }, node));
+    }
+
+    scored.sort_by_key(|(rank, node)| (*rank, node.index()));
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|(_, node)| render_match(node))
+        .collect()
+}
+
+pub fn render_match<N: TreeNode>(node: &N) -> String {
+    let mut s = String::new();
+    if node.is_actionable() {
+        s.push_str(&format!("[{}] ", node.index()));
+    } else {
+        s.push_str("(not actionable) ");
+    }
+    s.push_str(node.role());
+    if let Some(l) = node.label() {
+        s.push_str(&format!(" {l:?}"));
+    }
+    if let Some(v) = node.value() {
+        if node.label() != Some(v) {
+            let short: String = v.chars().take(80).collect();
+            s.push_str(&format!(" = {short:?}"));
+        }
+    }
+    if !node.enabled() {
+        s.push_str(" (disabled)");
+    }
+    s
+}
+
 /// A textual delta between two rendered trees — **not** a verification that the
 /// UI did or did not change.
 ///
