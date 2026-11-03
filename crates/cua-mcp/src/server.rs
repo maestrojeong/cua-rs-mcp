@@ -21,8 +21,11 @@ use std::sync::Arc;
 
 use base64::Engine;
 use cua_core::{
-    Cua, MouseOptions, Op, PointerLocation, Presence, ScrollAmount, ScrollDir, StateOptions, Target,
+    MouseOptions, PlatformAdapter, PointerLocation, Presence, ScrollAmount, ScrollDir,
+    StateOptions, Target,
 };
+
+use crate::platform::{MapOutcome, Op, Platform};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -775,19 +778,37 @@ struct CloseAppArgs {
 type Prepared = Result<Op<CallToolResult>, CallToolResult>;
 
 fn rendered_action(op: Op<cua_core::ActionResult>) -> Op<CallToolResult> {
-    op.map(|r| match r {
+    op.map_outcome(|r| match r {
         Ok(r) => ok(render_action(&r)),
         Err(e) => fail(e.to_string()),
     })
 }
 
 fn prep_check_permissions() -> Op<CallToolResult> {
-    Op::permissions().map(|r| match r {
+    Platform::op_permissions().map_outcome(|r| match r {
         Ok(p) => {
             let mut lines = vec![
                 format!("accessibility:    {}", yes_no(p.accessibility)),
                 format!("screen_recording: {}", yes_no(p.screen_recording)),
             ];
+            // Linux has no grants to hand out; what can be missing is a
+            // service or a display server, and the remedy says which. The
+            // macOS wording below is untouched.
+            if cua_core::PLATFORM == "linux" {
+                if !p.accessibility {
+                    lines.push(
+                        "\nThe AT-SPI accessibility bus is not reachable. Install at-spi2-core, make sure this server runs inside the user's desktop session (DBUS_SESSION_BUS_ADDRESS set), and enable toolkit accessibility (GNOME: gsettings set org.gnome.desktop.interface toolkit-accessibility true; Qt apps: QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1)."
+                            .into(),
+                    );
+                }
+                if !p.screen_recording {
+                    lines.push(
+                        "\nNo X11 display is reachable (DISPLAY unset, or a Wayland session without Xwayland access). The accessibility tree and AT-SPI actions still work; screenshots, list_displays, the clipboard and opt-in XTEST input need X11. See the README's OS support table."
+                            .into(),
+                    );
+                }
+                return ok(lines.join("\n"));
+            }
             if !p.accessibility {
                 lines.push(
                     "\nGrant Accessibility in System Settings > Privacy & Security > Accessibility. Add the app that LAUNCHED this server (your terminal or agent app), not the cua-rs binary: macOS attributes the request to the host process."
@@ -807,7 +828,7 @@ fn prep_check_permissions() -> Op<CallToolResult> {
 }
 
 fn prep_list_apps() -> Op<CallToolResult> {
-    Op::list_apps().map(|r| match r {
+    Platform::op_list_apps().map_outcome(|r| match r {
         Ok(apps) => {
             let mut out = String::new();
             for a in apps {
@@ -853,10 +874,12 @@ fn prep_get_app_state(a: AppArgs) -> Prepared {
             }
         }
     }
-    Ok(Op::get_app_state(&a.app, opts).map(|r| match r {
-        Ok(state) => render_app_state(state),
-        Err(e) => fail(e.to_string()),
-    }))
+    Ok(
+        Platform::op_get_app_state(&a.app, opts).map_outcome(|r| match r {
+            Ok(state) => render_app_state(state),
+            Err(e) => fail(e.to_string()),
+        }),
+    )
 }
 
 fn render_app_state(state: cua_core::AppState) -> CallToolResult {
@@ -929,7 +952,7 @@ fn prep_click(a: ClickArgs) -> Prepared {
     let mouse = a.mouse.options().map_err(fail)?;
     let want_state = a.target.return_state();
     let mouse = mouse.with_count(a.count.unwrap_or(1).clamp(1, 3));
-    Ok(rendered_action(Op::click(
+    Ok(rendered_action(Platform::op_click(
         &a.target.app,
         target,
         mouse,
@@ -943,7 +966,7 @@ fn prep_drag(a: DragArgs) -> Prepared {
     let to = a.drag_destination().map_err(fail)?;
     let mouse = a.mouse.options().map_err(fail)?;
     let want_state = a.return_state.unwrap_or(true);
-    Ok(rendered_action(Op::drag(
+    Ok(rendered_action(Platform::op_drag(
         &a.app,
         from,
         to,
@@ -959,7 +982,7 @@ fn prep_hover(a: HoverArgs) -> Prepared {
         .map_err(fail)?
         .modifiers;
     let want_state = a.return_state.unwrap_or(true);
-    Ok(rendered_action(Op::hover(
+    Ok(rendered_action(Platform::op_hover(
         &a.app,
         at,
         modifiers,
@@ -981,7 +1004,7 @@ fn prep_click_in_window(a: ClickInWindowArgs) -> Prepared {
         .options()
         .map_err(fail)?
         .with_count(a.count.unwrap_or(1).clamp(1, 3));
-    Ok(rendered_action(Op::click_in_window(
+    Ok(rendered_action(Platform::op_click_in_window(
         &a.app, at, mouse, want_state,
     )))
 }
@@ -989,7 +1012,7 @@ fn prep_click_in_window(a: ClickInWindowArgs) -> Prepared {
 fn prep_set_value(a: SetValueArgs) -> Prepared {
     let target = a.target.target().map_err(fail)?;
     let want_state = a.target.return_state();
-    Ok(rendered_action(Op::set_value(
+    Ok(rendered_action(Platform::op_set_value(
         &a.target.app,
         target,
         &a.value,
@@ -1017,7 +1040,7 @@ fn prep_scroll(a: ScrollArgs) -> Prepared {
         Some(px) => ScrollAmount::Points(px.clamp(1, 20_000)),
         None => ScrollAmount::Pages(a.pages.unwrap_or(1).clamp(1, 50)),
     };
-    Ok(rendered_action(Op::scroll(
+    Ok(rendered_action(Platform::op_scroll(
         &a.target.app,
         target,
         dir,
@@ -1034,7 +1057,7 @@ fn prep_type_text(a: TypeTextArgs) -> Prepared {
         None => cua_core::Mechanism::default(),
     };
     let want_state = a.target.return_state();
-    Ok(rendered_action(Op::type_text(
+    Ok(rendered_action(Platform::op_type_text(
         &a.target.app,
         target,
         &a.text,
@@ -1046,7 +1069,7 @@ fn prep_type_text(a: TypeTextArgs) -> Prepared {
 fn prep_select_text(a: SelectTextArgs) -> Prepared {
     let target = a.target.target().map_err(fail)?;
     let want_state = a.target.return_state();
-    Ok(rendered_action(Op::select_text(
+    Ok(rendered_action(Platform::op_select_text(
         &a.target.app,
         target,
         &a.text,
@@ -1059,7 +1082,7 @@ fn prep_select_text(a: SelectTextArgs) -> Prepared {
 fn prep_press_key(a: PressKeyArgs) -> Prepared {
     let target = a.target.target().map_err(fail)?;
     let want_state = a.target.return_state();
-    Ok(rendered_action(Op::press_key(
+    Ok(rendered_action(Platform::op_press_key(
         &a.target.app,
         target,
         &a.key,
@@ -1071,23 +1094,25 @@ fn prep_press_key(a: PressKeyArgs) -> Prepared {
 fn prep_menu_bar(a: MenuBarArgs) -> Prepared {
     let path = a.path.unwrap_or_default();
     if a.press {
-        return Ok(rendered_action(Op::press_menu_bar(
+        return Ok(rendered_action(Platform::op_press_menu_bar(
             &a.app,
             &path,
             false,
             a.confirm_destructive,
         )));
     }
-    Ok(Op::menu_bar(&a.app, &path).map(|r| match r {
-        Ok(listing) => ok(render_menu(&listing)),
-        Err(e) => fail(e.to_string()),
-    }))
+    Ok(
+        Platform::op_menu_bar(&a.app, &path).map_outcome(|r| match r {
+            Ok(listing) => ok(render_menu(&listing)),
+            Err(e) => fail(e.to_string()),
+        }),
+    )
 }
 
 fn prep_perform_secondary_action(a: SecondaryActionArgs) -> Prepared {
     let target = a.target.target().map_err(fail)?;
     let want_state = a.target.return_state();
-    Ok(rendered_action(Op::perform_action(
+    Ok(rendered_action(Platform::op_perform_action(
         &a.target.app,
         target,
         &a.action,
@@ -1099,24 +1124,26 @@ fn prep_perform_secondary_action(a: SecondaryActionArgs) -> Prepared {
 fn prep_find(a: FindArgs) -> Prepared {
     let limit = a.limit.unwrap_or(20).clamp(1, 200);
     let text = a.text;
-    Ok(Op::find(&a.app, &text, limit).map(move |r| match r {
-        Ok(r) => {
-            if r.lines.is_empty() {
-                return ok(format!(
-                    "no element matching {:?} among {} elements (snapshot {})",
-                    text, r.searched, r.snapshot_id
-                ));
+    Ok(
+        Platform::op_find(&a.app, &text, limit).map_outcome(move |r| match r {
+            Ok(r) => {
+                if r.lines.is_empty() {
+                    return ok(format!(
+                        "no element matching {:?} among {} elements (snapshot {})",
+                        text, r.searched, r.snapshot_id
+                    ));
+                }
+                ok(format!(
+                    "{} match(es) for {:?}  snapshot_id={}\n\n{}",
+                    r.total,
+                    text,
+                    r.snapshot_id,
+                    r.lines.join("\n")
+                ))
             }
-            ok(format!(
-                "{} match(es) for {:?}  snapshot_id={}\n\n{}",
-                r.total,
-                text,
-                r.snapshot_id,
-                r.lines.join("\n")
-            ))
-        }
-        Err(e) => fail(e.to_string()),
-    }))
+            Err(e) => fail(e.to_string()),
+        }),
+    )
 }
 
 fn prep_wait_for(a: WaitForArgs) -> Prepared {
@@ -1130,7 +1157,7 @@ fn prep_wait_for(a: WaitForArgs) -> Prepared {
     let timeout_ms = a.timeout_ms.unwrap_or(5_000).clamp(250, 60_000);
     let text = a.text;
     Ok(
-        Op::wait_for(&a.app, &text, want, timeout_ms).map(move |r| match r {
+        Platform::op_wait_for(&a.app, &text, want, timeout_ms).map_outcome(move |r| match r {
             Ok(r) => {
                 let verb = if want == Presence::Appears {
                     "appeared"
@@ -1278,7 +1305,7 @@ fn step_failed(r: &cua_core::session::Result<CallToolResult>) -> bool {
 
 /// Run a whole batch. Called once, inside one `spawn_blocking`, and itself
 /// issues one worker job for all the steps (`Cua::run_batch`).
-fn run_batch_blocking(cua: &Cua, a: BatchArgs) -> CallToolResult {
+fn run_batch_blocking(cua: &Platform, a: BatchArgs) -> CallToolResult {
     let total = a.steps.len();
     if total == 0 {
         return fail("steps is empty: pass at least one {\"tool\": \"<name>\", \"params\": {...}}");
@@ -1295,10 +1322,10 @@ fn run_batch_blocking(cua: &Cua, a: BatchArgs) -> CallToolResult {
     let ops: Vec<Op<CallToolResult>> = a
         .steps
         .into_iter()
-        .map(|step| step.prepare().unwrap_or_else(Op::ready))
+        .map(|step| step.prepare().unwrap_or_else(Platform::ready))
         .collect();
     let bail = a.bail_on_error;
-    let ran = match cua.run_batch(ops, move |r| bail && step_failed(r)) {
+    let ran = match PlatformAdapter::run_batch(cua, ops, move |r| bail && step_failed(r)) {
         Ok(ran) => ran,
         Err(e) => return fail(e.to_string()),
     };
@@ -1349,12 +1376,12 @@ fn render_batch(names: &[&'static str], results: Vec<CallToolResult>) -> CallToo
 
 #[derive(Clone)]
 pub struct CuaServer {
-    cua: Arc<Cua>,
+    cua: Arc<Platform>,
     tool_router: ToolRouter<Self>,
 }
 
 impl CuaServer {
-    pub fn new(cua: Arc<Cua>) -> Self {
+    pub fn new(cua: Arc<Platform>) -> Self {
         Self {
             cua,
             tool_router: Self::tool_router(),
@@ -1373,7 +1400,7 @@ impl CuaServer {
     async fn native<T, F>(&self, f: F) -> Result<T, String>
     where
         T: Send + 'static,
-        F: FnOnce(&Cua) -> T + Send + 'static,
+        F: FnOnce(&Platform) -> T + Send + 'static,
     {
         let cua = self.cua.clone();
         tokio::task::spawn_blocking(move || f(&cua))
@@ -1391,7 +1418,7 @@ impl CuaServer {
             Ok(op) => op,
             Err(refusal) => return refusal,
         };
-        match self.native(move |c| c.run(op)).await {
+        match self.native(move |c| PlatformAdapter::run(c, op)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => fail(e.to_string()),
             Err(e) => fail(e),
@@ -1572,7 +1599,7 @@ impl CuaServer {
         Parameters(a): Parameters<ClipboardGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let max = a.max_chars.unwrap_or(20_000).clamp(1, 200_000);
-        match self.native(|c| c.clipboard_get()).await {
+        match self.native(PlatformAdapter::clipboard_get).await {
             Ok(Ok(r)) => Ok(ok(render_clipboard_read(&r, max))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1586,7 +1613,10 @@ impl CuaServer {
         &self,
         Parameters(a): Parameters<ClipboardSetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.native(move |c| c.clipboard_set(&a.text)).await {
+        match self
+            .native(move |c| PlatformAdapter::clipboard_set(c, &a.text))
+            .await
+        {
             Ok(Ok(w)) => Ok(ok(render_clipboard_write(&w))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1597,7 +1627,7 @@ impl CuaServer {
         description = "Empty the clipboard. Gated like clipboard_set: refused while the session is locked, and with CUA_YIELD_TO_HUMAN=1 while the human is active."
     )]
     async fn clipboard_clear(&self) -> Result<CallToolResult, McpError> {
-        match self.native(|c| c.clipboard_clear()).await {
+        match self.native(PlatformAdapter::clipboard_clear).await {
             Ok(Ok(w)) => Ok(ok(render_clipboard_write(&w))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1612,7 +1642,10 @@ impl CuaServer {
         Parameters(a): Parameters<ListWindowsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
-        match self.native(move |c| c.list_windows(&app)).await {
+        match self
+            .native(move |c| PlatformAdapter::list_windows(c, &app))
+            .await
+        {
             Ok(Ok(listing)) => Ok(ok(render_window_listing(&listing))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1691,7 +1724,7 @@ impl CuaServer {
         description = "List the active displays: display id, bounds in global screen POINTS (the coordinate space move_window and list_windows use; the main display's top-left is 0,0), pixels per point, and which one is main. Needs no permission."
     )]
     async fn list_displays(&self) -> Result<CallToolResult, McpError> {
-        match self.native(|c| c.list_displays()).await {
+        match self.native(PlatformAdapter::list_displays).await {
             Ok(Ok(displays)) => Ok(ok(render_displays(&displays))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1707,7 +1740,10 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
         let activate = a.activate;
-        match self.native(move |c| c.launch_app(&app, activate)).await {
+        match self
+            .native(move |c| PlatformAdapter::launch_app(c, &app, activate))
+            .await
+        {
             Ok(Ok(r)) => Ok(ok(render_launch(&r))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1723,7 +1759,10 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
         let confirm = a.confirm_destructive;
-        match self.native(move |c| c.close_app(&app, confirm)).await {
+        match self
+            .native(move |c| PlatformAdapter::close_app(c, &app, confirm))
+            .await
+        {
             Ok(Ok(r)) => Ok(ok(render_close(&r))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1738,7 +1777,10 @@ impl CuaServer {
         Parameters(a): Parameters<ListNotificationsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let history = a.include_history;
-        match self.native(move |c| c.list_notifications(history)).await {
+        match self
+            .native(move |c| PlatformAdapter::list_notifications(c, history))
+            .await
+        {
             Ok(Ok(listing)) => Ok(ok(render_notifications(&listing, history))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -1758,7 +1800,7 @@ impl CuaServer {
         };
         let history = a.include_history;
         match self
-            .native(move |c| c.dismiss_notification(&id, history))
+            .native(move |c| PlatformAdapter::dismiss_notification(c, &id, history))
             .await
         {
             Ok(Ok(acted)) => Ok(ok(render_acted(&acted))),
@@ -1776,7 +1818,7 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let history = a.include_history;
         match self
-            .native(move |c| c.dismiss_all_notifications(history))
+            .native(move |c| PlatformAdapter::dismiss_all_notifications(c, history))
             .await
         {
             Ok(Ok(outcome)) => {
@@ -1812,7 +1854,9 @@ impl CuaServer {
         let history = a.include_history;
         let confirm = a.confirm_destructive;
         match self
-            .native(move |c| c.notification_action(&id, &action, history, confirm))
+            .native(move |c| {
+                PlatformAdapter::notification_action(c, &id, &action, history, confirm)
+            })
             .await
         {
             Ok(Ok(acted)) => Ok(ok(render_acted(&acted))),
@@ -1831,7 +1875,10 @@ impl CuaServer {
     ) -> Result<CallToolResult, McpError> {
         let app = a.app.clone();
         let sel = a.selector();
-        match self.native(move |c| c.window_action(&app, sel, op)).await {
+        match self
+            .native(move |c| PlatformAdapter::window_action(c, &app, sel, op))
+            .await
+        {
             Ok(Ok(r)) => Ok(ok(render_window_outcome(&r))),
             Ok(Err(e)) => Ok(fail(e.to_string())),
             Err(e) => Ok(fail(e)),
@@ -2250,6 +2297,12 @@ fn render_action(r: &cua_core::ActionResult) -> String {
             cua_core::Delivery::PidKey => {
                 "  (real key events routed to the target process via the private SkyLight SPI, not through the shared keyboard tap: they land wherever that process's own first responder currently is, which cua-rs best-effort-focuses first but cannot guarantee)"
             }
+            cua_core::Delivery::WindowManager => {
+                "  (a request to the window manager: no input synthesized, nothing addressed to the app; the before/after frames below are what the window manager actually did)"
+            }
+            cua_core::Delivery::SharedInput => {
+                "  (Linux XTEST, opted into with CUA_LINUX_XTEST=1: real X11 input on the SHARED devices. Pointer events moved the human's real pointer, and key events went to whichever window holds X keyboard focus, which cua-rs set to the target first. Nothing about this is isolated from the human)"
+            }
         },
         r.ui_changed.as_str(),
     );
@@ -2562,7 +2615,7 @@ mod tests {
 
     #[test]
     fn bail_on_error_stops_at_the_failing_step() {
-        let cua = Cua::new();
+        let cua = <Platform as PlatformAdapter>::new();
         let r = run_batch_blocking(&cua, three_steps(true));
         assert_eq!(r.is_error, Some(true));
         let t = texts(&r);
@@ -2585,7 +2638,7 @@ mod tests {
 
     #[test]
     fn without_bail_every_step_runs_and_reports() {
-        let cua = Cua::new();
+        let cua = <Platform as PlatformAdapter>::new();
         let r = run_batch_blocking(&cua, three_steps(false));
         assert_eq!(
             r.is_error,
@@ -2608,7 +2661,7 @@ mod tests {
             prep_click(serde_json::from_value(serde_json::json!({"app": "Finder"})).unwrap())
                 .err()
                 .unwrap();
-        let cua = Cua::new();
+        let cua = <Platform as PlatformAdapter>::new();
         let batched = run_batch_blocking(
             &cua,
             args(serde_json::json!({"steps": [{"tool": "click", "params": {"app": "Finder"}}]})),
@@ -2618,7 +2671,7 @@ mod tests {
 
     #[test]
     fn an_empty_or_oversized_batch_is_refused_before_anything_runs() {
-        let cua = Cua::new();
+        let cua = <Platform as PlatformAdapter>::new();
         let r = run_batch_blocking(&cua, args(serde_json::json!({"steps": []})));
         assert_eq!(r.is_error, Some(true));
         let many: Vec<_> = (0..=MAX_BATCH_STEPS)

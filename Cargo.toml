@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cua-ax",
+    "crates/cua-ax-linux",
     "crates/cua-capture",
     "crates/cua-core",
     "crates/cua-hid",
@@ -10,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -18,10 +19,11 @@ repository = "https://github.com/maestrojeong/cua-rs-mcp"
 authors = ["Yeonwoo Jeong <maestrojeong@gmail.com>"]
 
 [workspace.dependencies]
-cua-ax = { version = "0.10.0", path = "crates/cua-ax" }
-cua-capture = { version = "0.10.0", path = "crates/cua-capture" }
-cua-core = { version = "0.10.0", path = "crates/cua-core" }
-cua-hid = { version = "0.10.0", path = "crates/cua-hid" }
+cua-ax = { version = "0.11.0", path = "crates/cua-ax" }
+cua-ax-linux = { version = "0.11.0", path = "crates/cua-ax-linux" }
+cua-capture = { version = "0.11.0", path = "crates/cua-capture" }
+cua-core = { version = "0.11.0", path = "crates/cua-core" }
+cua-hid = { version = "0.11.0", path = "crates/cua-hid" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "process", "signal", "fs"] }
 futures = "0.3"

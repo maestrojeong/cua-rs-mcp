@@ -84,3 +84,66 @@ jobs:
         run: |
           ./target/release/cua-rs --version
           ./target/release/cua-rs permissions
+
+  # The Linux backend (crates/cua-ax-linux), DESIGN.md §15. The job above is
+  # macOS-only because cua-ax, cua-capture, cua-hid and cua-overlay are macOS FFI
+  # crates; they are not built here. Only the crates that target Linux are:
+  # cua-core (the platform-neutral half), cua-ax-linux, and cua-mcp, which picks
+  # the Linux backend at compile time. `--lib --bins --tests` skips cua-core's
+  # examples, which are macOS probes.
+  #
+  # The tests run inside a real D-Bus session with the AT-SPI bus up and an
+  # Xvfb display, so mcp_surface.rs drives the actual binary against a live
+  # registry: check_permissions must find both, list_apps must succeed, and the
+  # unsupported tools must refuse with PLATFORM_NOT_SUPPORTED wording rather
+  # than no-op. No app is driven here; DESIGN.md §15 lists what was measured by
+  # hand.
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CRATES: -p cua-core -p cua-ax-linux -p cua-mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y at-spi2-core dbus dbus-x11 xvfb xauth
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: Each Linux crate builds on its own features
+        run: |
+          for crate in cua-core cua-ax-linux cua-mcp; do
+            echo "::group::$crate"
+            CARGO_TARGET_DIR="target/isolated/$crate" cargo build -p "$crate"
+            echo "::endgroup::"
+          done
+
+      - name: clippy
+        run: cargo clippy $CRATES --lib --bins --tests -- -D warnings
+
+      - name: Build
+        run: cargo build --release -p cua-mcp
+
+      - name: Test (D-Bus session + AT-SPI bus + Xvfb)
+        run: |
+          xvfb-run -a dbus-run-session -- bash -c '
+            /usr/libexec/at-spi-bus-launcher --launch-immediately &
+            sleep 1
+            cargo test $CRATES --lib --bins --tests
+          '
+
+      - name: Release binary runs
+        run: |
+          xvfb-run -a dbus-run-session -- bash -c '
+            /usr/libexec/at-spi-bus-launcher --launch-immediately &
+            sleep 1
+            ./target/release/cua-rs --version
+            ./target/release/cua-rs permissions
+          '

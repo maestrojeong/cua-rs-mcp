@@ -974,6 +974,7 @@ mod tests {
         assert!(text.contains("CUA_YIELD_TO_HUMAN"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_watch_that_was_never_started_never_refuses() {
         let watch = HumanWatch::default();
@@ -1182,10 +1183,12 @@ mod tests {
 
     // ── clipboard ────────────────────────────────────────────────────────
 
+    #[cfg(target_os = "macos")]
     fn types(list: &[&str]) -> Vec<String> {
         list.iter().map(|t| t.to_string()).collect()
     }
 
+    #[cfg(target_os = "macos")]
     fn running(name: &str, bundle: &str) -> AppInfo {
         AppInfo {
             name: name.to_string(),
@@ -1196,6 +1199,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ordinary_clipboard_text_is_returned() {
         let t = types(&[crate::clipboard::STRING_TYPE]);
@@ -1204,6 +1208,7 @@ mod tests {
         assert!(clipboard_read_refusal(&t, Some("com.apple.TextEdit"), None, false).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_concealed_marker_withholds_the_text() {
         let t = types(&[crate::clipboard::STRING_TYPE, crate::clipboard::CONCEALED_TYPE]);
@@ -1211,6 +1216,7 @@ mod tests {
         assert!(why.is_some_and(|w| w.contains("org.nspasteboard.ConcealedType")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_forbidden_override_does_not_lift_a_concealed_marker() {
         // The override corrects cua-rs's classification of apps. The marker is
@@ -1220,12 +1226,14 @@ mod tests {
         assert!(clipboard_read_refusal(&t, None, None, true).is_some());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_concealed_marker_matches_the_whole_type_only() {
         let t = types(&["org.nspasteboard.ConcealedTypeX", "x.org.nspasteboard.ConcealedType"]);
         assert!(clipboard_read_refusal(&t, None, None, false).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn text_from_a_forbidden_writer_is_withheld() {
         let t = types(&[crate::clipboard::STRING_TYPE, crate::clipboard::SOURCE_TYPE]);
@@ -1233,6 +1241,7 @@ mod tests {
         assert!(why.is_some_and(|w| w.contains("com.1password.1password")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_forbidden_frontmost_app_withholds_the_text() {
         // The human may have just copied a password out of it.
@@ -1242,6 +1251,7 @@ mod tests {
         assert!(why.is_some_and(|w| w.contains("frontmost")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_forbidden_override_lifts_the_app_based_clipboard_checks() {
         let t = types(&[crate::clipboard::STRING_TYPE]);
@@ -1250,6 +1260,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_concealed_marker_is_reported_before_the_frontmost_app() {
         let t = types(&[crate::clipboard::CONCEALED_TYPE]);

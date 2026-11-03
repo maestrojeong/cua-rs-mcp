@@ -5,12 +5,14 @@
 //! client spawns), an address means Streamable HTTP.
 
 mod auth;
+mod platform;
 mod server;
 
 use std::sync::Arc;
 
 use auth::{Token, TokenSource};
-use cua_core::Cua;
+use cua_core::PlatformAdapter;
+use platform::Platform;
 use server::CuaServer;
 
 fn bind_address_is_loopback(bind: &str) -> bool {
@@ -29,8 +31,8 @@ fn bind_address_is_loopback(bind: &str) -> bool {
 /// Worth doing even though every tool reports its own permission errors: an MCP
 /// client shows tool errors to the model, not to the human, and the human is the
 /// only one who can actually open System Settings.
-fn warn_about_permissions(cua: &Cua) {
-    match cua.permissions() {
+fn warn_about_permissions(cua: &Platform) {
+    match PlatformAdapter::permissions(cua) {
         Ok(p) => {
             if !p.accessibility {
                 tracing::warn!(
@@ -50,7 +52,7 @@ fn warn_about_permissions(cua: &Cua) {
     }
 }
 
-async fn serve_stdio(cua: Arc<Cua>) -> anyhow::Result<()> {
+async fn serve_stdio(cua: Arc<Platform>) -> anyhow::Result<()> {
     use rmcp::ServiceExt;
     let service = CuaServer::new(cua).serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
@@ -89,7 +91,7 @@ async fn require_bearer(
         .into_response()
 }
 
-async fn serve_http(cua: Arc<Cua>, addr: &str) -> anyhow::Result<()> {
+async fn serve_http(cua: Arc<Platform>, addr: &str) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
@@ -211,8 +213,8 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "permissions" => {
-                let cua = Cua::new();
-                let p = cua.permissions()?;
+                let cua = <Platform as PlatformAdapter>::new();
+                let p = PlatformAdapter::permissions(&cua)?;
                 println!("accessibility:    {}", p.accessibility);
                 println!("screen_recording: {}", p.screen_recording);
                 return Ok(());
@@ -248,7 +250,7 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cua = Arc::new(Cua::new());
+    let cua = Arc::new(<Platform as PlatformAdapter>::new());
     warn_about_permissions(&cua);
 
     let bind = bind.filter(|a| a != "stdio");

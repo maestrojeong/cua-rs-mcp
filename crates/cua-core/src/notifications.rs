@@ -26,6 +26,7 @@
 //! Pure parsing is separated from the AX walk so it can be unit-tested; the walk
 //! itself needs a live Notification Center and is exercised by the probe.
 
+#[cfg(target_os = "macos")]
 use cua_ax::Element;
 
 /// NotificationCenter.app, which draws banners and the history panel.
@@ -33,7 +34,9 @@ pub const NOTIFICATION_CENTER_BUNDLE_ID: &str = "com.apple.notificationcenterui"
 /// ControlCenter, which owns the menu-bar clock that opens the history panel.
 pub const CONTROL_CENTER_BUNDLE_ID: &str = "com.apple.controlcenter";
 
+#[cfg(target_os = "macos")]
 const CLOCK_EXTRA_ID: &str = "com.apple.menuextra.clock";
+#[cfg(target_os = "macos")]
 const LIST_ITEMS_ID: &str = "AXNotificationListItems";
 const SUBROLE_SINGLE: &str = "AXNotificationCenterBanner";
 /// Not observed on 26.2 (only banner-style notifications were available to
@@ -42,10 +45,12 @@ const SUBROLE_SINGLE: &str = "AXNotificationCenterBanner";
 const SUBROLE_ALERT: &str = "AXNotificationCenterAlert";
 const SUBROLE_STACK: &str = "AXNotificationCenterBannerStack";
 
+#[cfg(target_os = "macos")]
 /// Depth bound for the walk. The deepest notification measured sits at depth 6
 /// (`window > group > group > scroll area > list > banner`); 12 leaves room for
 /// a redesign without letting a pathological tree run away.
 const MAX_DEPTH: usize = 12;
+#[cfg(target_os = "macos")]
 /// Node bound for the walk, for the same reason.
 const MAX_NODES: usize = 4_000;
 
@@ -216,12 +221,14 @@ fn source_app_name(description: &str, parts: [&Option<String>; 3]) -> Option<Str
 
 // ── live reads ───────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 /// A notification together with the element that carries its actions.
 pub(crate) struct Located {
     pub element: Element,
     pub notification: Notification,
 }
 
+#[cfg(target_os = "macos")]
 impl Located {
     /// The full advertised name of the action labelled `label`, if offered.
     pub fn advertised(&self, label: &str) -> Option<String> {
@@ -241,6 +248,7 @@ impl Located {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Every notification currently in NotificationCenter's tree.
 pub(crate) fn collect(root: &Element) -> Vec<Located> {
     let mut out = Vec::new();
@@ -251,6 +259,7 @@ pub(crate) fn collect(root: &Element) -> Vec<Located> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn walk(e: &Element, depth: usize, in_history: bool, budget: &mut usize, out: &mut Vec<Located>) {
     if *budget == 0 || depth > MAX_DEPTH {
         return;
@@ -291,6 +300,7 @@ fn walk(e: &Element, depth: usize, in_history: bool, budget: &mut usize, out: &m
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Whether the history panel is open: its list container is in the tree.
 pub(crate) fn history_open(root: &Element) -> bool {
     fn find(e: &Element, depth: usize, budget: &mut usize) -> bool {
@@ -307,6 +317,7 @@ pub(crate) fn history_open(root: &Element) -> bool {
     root.children().iter().any(|c| find(c, 1, &mut budget))
 }
 
+#[cfg(target_os = "macos")]
 /// The menu-bar clock, which toggles the history panel when pressed.
 pub(crate) fn clock_extra(control_center_pid: libc::pid_t) -> Option<Element> {
     Element::for_pid(control_center_pid)

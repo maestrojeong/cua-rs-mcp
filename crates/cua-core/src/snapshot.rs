@@ -1,6 +1,72 @@
 //! Turning an accessibility tree into something worth spending tokens on.
 
-use cua_ax::AxNode;
+use crate::platform::leaf::CGRect;
+
+/// One walked element, as tree rendering needs to see it.
+///
+/// Rendering is the same on every platform — the outline format is part of
+/// the tool contract an agent learns once — so it is written against this
+/// rather than against a platform's node type. Backends report roles in the
+/// macOS AX vocabulary (`AXButton`, `AXTextField`, …); the Linux backend maps
+/// AT-SPI roles onto it, so the outline, the structural-role filter and the
+/// safety heuristics that read roles mean the same thing everywhere.
+pub trait TreeNode {
+    /// Position in the walk, and the `[N]` handle actions refer to.
+    fn index(&self) -> usize;
+    fn parent(&self) -> Option<usize>;
+    fn role(&self) -> &str;
+    fn subrole(&self) -> Option<&str>;
+    fn label(&self) -> Option<&str>;
+    fn value(&self) -> Option<&str>;
+    fn frame(&self) -> Option<CGRect>;
+    fn enabled(&self) -> bool;
+    fn focused(&self) -> bool;
+    fn selected(&self) -> bool;
+    /// Whether the element's value attribute is writable.
+    fn settable(&self) -> bool;
+    /// Whether this node gets an `[N]` handle at all.
+    fn is_actionable(&self) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+impl TreeNode for cua_ax::AxNode {
+    fn index(&self) -> usize {
+        self.index
+    }
+    fn parent(&self) -> Option<usize> {
+        self.parent
+    }
+    fn role(&self) -> &str {
+        &self.role
+    }
+    fn subrole(&self) -> Option<&str> {
+        self.subrole.as_deref()
+    }
+    fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+    fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+    fn frame(&self) -> Option<CGRect> {
+        self.frame
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn focused(&self) -> bool {
+        self.focused
+    }
+    fn selected(&self) -> bool {
+        self.selected
+    }
+    fn settable(&self) -> bool {
+        self.settable
+    }
+    fn is_actionable(&self) -> bool {
+        cua_ax::AxNode::is_actionable(self)
+    }
+}
 
 /// Roles that carry no information for an agent.
 ///
@@ -38,7 +104,7 @@ const STRUCTURAL_ROLES: &[&str] = &[
 /// Indentation is by tree depth rather than by JSON nesting because it costs
 /// roughly a third of the tokens for the same information, and because a
 /// truncated outline is still readable while truncated JSON is not.
-pub fn render_tree(nodes: &[AxNode], opts: RenderOptions) -> String {
+pub fn render_tree<N: TreeNode>(nodes: &[N], opts: RenderOptions) -> String {
     let mut out = String::with_capacity(nodes.len() * 48);
     let mut skipped = 0usize;
 
@@ -51,7 +117,7 @@ pub fn render_tree(nodes: &[AxNode], opts: RenderOptions) -> String {
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     let mut roots: Vec<usize> = Vec::new();
     for (pos, node) in nodes.iter().enumerate() {
-        match node.parent {
+        match node.parent() {
             // A parent beyond the slice means the walk was truncated between
             // this node and its parent; treat it as a root rather than dropping
             // the whole subtree.
@@ -107,7 +173,7 @@ pub fn render_tree(nodes: &[AxNode], opts: RenderOptions) -> String {
         if collapse {
             out.push_str(&format!(
                 "  (+{descendants} elements — pass scope_element_id={} to expand)",
-                node.index
+                node.index()
             ));
             collapsed += descendants;
         }
@@ -196,18 +262,17 @@ const TEXT_ROLES: &[&str] = &[
 /// exposes — buttons, groups, toolbars — so trusting it alone tags a whole
 /// Chrome window `(editable)` and trains the model to try `set_value` on a
 /// toolbar. Require the role to be one where writing text is meaningful.
-fn is_text_editable(node: &AxNode) -> bool {
-    if !node.settable {
+fn is_text_editable<N: TreeNode>(node: &N) -> bool {
+    if !node.settable() {
         return false;
     }
-    TEXT_ROLES.contains(&node.role.as_str())
+    TEXT_ROLES.contains(&node.role())
         || node
-            .subrole
-            .as_deref()
+            .subrole()
             .is_some_and(|s| s.contains("Text") || s.contains("SearchField"))
 }
 
-fn should_render(node: &AxNode, opts: RenderOptions) -> bool {
+fn should_render<N: TreeNode>(node: &N, opts: RenderOptions) -> bool {
     if opts.include_noise {
         return true;
     }
@@ -216,50 +281,50 @@ fn should_render(node: &AxNode, opts: RenderOptions) -> bool {
         return true;
     }
     // As is anything carrying text the agent might be looking for.
-    if node.label.is_some() || node.value.is_some() {
+    if node.label().is_some() || node.value().is_some() {
         return true;
     }
     // Windows anchor the outline even when unlabeled.
-    if node.role == "AXWindow" {
+    if node.role() == "AXWindow" {
         return true;
     }
-    !STRUCTURAL_ROLES.contains(&node.role.as_str())
+    !STRUCTURAL_ROLES.contains(&node.role())
 }
 
-fn write_node(out: &mut String, node: &AxNode, opts: RenderOptions) {
+fn write_node<N: TreeNode>(out: &mut String, node: &N, opts: RenderOptions) {
     // Only actionable nodes get a handle. Handing the agent an index it cannot
     // act on invites a call that can only fail.
     if node.is_actionable() {
-        out.push_str(&format!("[{}] ", node.index));
+        out.push_str(&format!("[{}] ", node.index()));
     }
 
-    out.push_str(&node.role);
-    if let Some(sub) = &node.subrole {
+    out.push_str(node.role());
+    if let Some(sub) = node.subrole() {
         // Subrole is what distinguishes a close button from a plain button, and
         // a search field from a text field. Worth the tokens.
         out.push_str(&format!(":{}", sub.trim_start_matches("AX")));
     }
 
-    if let Some(label) = &node.label {
+    if let Some(label) = node.label() {
         out.push_str(&format!(" {:?}", truncate(label, 120)));
     }
 
-    if let Some(value) = &node.value {
+    if let Some(value) = node.value() {
         // Suppress a value that merely repeats the label, which is the common
         // case for buttons and static text and pure duplication in a prompt.
-        if node.label.as_deref() != Some(value.as_str()) {
+        if node.label() != Some(value) {
             out.push_str(&format!(" = {:?}", truncate(value, 200)));
         }
     }
 
     let mut flags: Vec<&str> = Vec::new();
-    if !node.enabled {
+    if !node.enabled() {
         flags.push("disabled");
     }
-    if node.focused {
+    if node.focused() {
         flags.push("focused");
     }
-    if node.selected {
+    if node.selected() {
         flags.push("selected");
     }
     if is_text_editable(node) {
@@ -270,7 +335,7 @@ fn write_node(out: &mut String, node: &AxNode, opts: RenderOptions) {
     }
 
     if opts.include_frames {
-        if let Some(f) = node.frame {
+        if let Some(f) = node.frame() {
             out.push_str(&format!(
                 " @{},{} {}x{}",
                 f.origin.x as i64, f.origin.y as i64, f.size.width as i64, f.size.height as i64
@@ -290,6 +355,75 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max).collect();
     format!("{cut}…")
+}
+
+// ── find ─────────────────────────────────────────────────────────────────────
+
+/// Case-insensitive substring search over a snapshot's nodes.
+///
+/// Searches label, value and role, in that priority order — a query like
+/// "Send" should find the button labeled Send before it finds an `AXSendButton`
+/// role — and returns rendered lines rather than raw nodes so the output format
+/// matches what `get_app_state` already showed the agent.
+///
+/// Actionable matches are listed first: a search is almost always the prelude to
+/// an action, and a non-actionable static-text hit is context at best.
+pub fn match_nodes<N: TreeNode>(nodes: &[N], needle: &str, limit: usize) -> Vec<String> {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(u8, &N)> = Vec::new();
+    for node in nodes {
+        let rank = if node
+            .label()
+            .is_some_and(|l| l.to_lowercase().contains(&needle))
+        {
+            0
+        } else if node
+            .value()
+            .is_some_and(|v| v.to_lowercase().contains(&needle))
+        {
+            1
+        } else if node.role().to_lowercase().contains(&needle) {
+            2
+        } else {
+            continue;
+        };
+        // Actionable-first, then match quality, then document order.
+        scored.push((rank + if node.is_actionable() { 0 } else { 3 }, node));
+    }
+
+    scored.sort_by_key(|(rank, node)| (*rank, node.index()));
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|(_, node)| render_match(node))
+        .collect()
+}
+
+pub fn render_match<N: TreeNode>(node: &N) -> String {
+    let mut s = String::new();
+    if node.is_actionable() {
+        s.push_str(&format!("[{}] ", node.index()));
+    } else {
+        s.push_str("(not actionable) ");
+    }
+    s.push_str(node.role());
+    if let Some(l) = node.label() {
+        s.push_str(&format!(" {l:?}"));
+    }
+    if let Some(v) = node.value() {
+        if node.label() != Some(v) {
+            let short: String = v.chars().take(80).collect();
+            s.push_str(&format!(" = {short:?}"));
+        }
+    }
+    if !node.enabled() {
+        s.push_str(" (disabled)");
+    }
+    s
 }
 
 /// A textual delta between two rendered trees — **not** a verification that the
@@ -409,10 +543,10 @@ fn diff_key(line: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use cua_ax::Element;
+    use cua_ax::{AxNode, Element};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     fn node(index: usize, parent: Option<usize>, role: &str, label: Option<&str>) -> AxNode {

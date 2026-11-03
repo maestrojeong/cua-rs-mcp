@@ -27,6 +27,7 @@
 
 use super::*;
 
+#[cfg(target_os = "macos")]
 /// Why `clipboard_get` must not return the text, or `None` when it may.
 ///
 /// Checked in the order a reader wants reported: the writer's own word first,
@@ -45,20 +46,46 @@ pub(crate) fn clipboard_read_refusal(
     frontmost: Option<&AppInfo>,
     allow_forbidden: bool,
 ) -> Option<String> {
+    clipboard_withheld(
+        types,
+        &[crate::clipboard::CONCEALED_TYPE],
+        "cmd+v",
+        source,
+        frontmost,
+        allow_forbidden,
+    )
+}
+
+/// [`clipboard_read_refusal`]'s policy for any platform: the same three checks
+/// in the same order, with the platform's own "this is a secret" type markers
+/// and paste chord supplied by the caller. On macOS the marker is
+/// `org.nspasteboard.ConcealedType`; KDE Klipper and KeePassXC on Linux publish
+/// `x-kde-passwordManagerHint` for the same purpose.
+pub fn clipboard_withheld(
+    types: &[String],
+    concealed_markers: &[&str],
+    paste_chord: &str,
+    source: Option<&str>,
+    frontmost: Option<&AppInfo>,
+    allow_forbidden: bool,
+) -> Option<String> {
     // Exact match on the whole UTI, as AppKit reports it. Deliberately not
     // lifted by CUA_ALLOW_FORBIDDEN_TARGETS: that flag overrides cua-rs's own
     // classification of *apps*, which can be wrong. This marker is not a
     // classification — it is the writer saying what the data is — so there is
     // nothing of cua-rs's to override.
-    if types.iter().any(|t| t == crate::clipboard::CONCEALED_TYPE) {
+    if let Some(marker) = types
+        .iter()
+        .find(|t| concealed_markers.contains(&t.as_str()))
+    {
         return Some(format!(
             "clipboard text withheld: the app that wrote it marked it as a secret \
              ({}), the nspasteboard.org convention password managers use so that \
              clipboard tools do not display or record a copied password. cua-rs \
              honors that marker unconditionally. Paste it where it is needed with \
-             press_key cmd+v instead — the text then goes from the clipboard to the \
+             press_key {paste_chord} instead — the text then goes from the clipboard to the \
              app without passing through this transcript",
-            crate::clipboard::CONCEALED_TYPE
+            marker
         ));
     }
     if allow_forbidden {
@@ -69,7 +96,7 @@ pub(crate) fn clipboard_read_refusal(
             return Some(format!(
                 "clipboard text withheld: the contents were written by `{src}`, which \
                  cua-rs treats as a forbidden target because it {why}, so they may be a \
-                 credential. Paste with press_key cmd+v to move the text without reading \
+                 credential. Paste with press_key {paste_chord} to move the text without reading \
                  it. CUA_ALLOW_FORBIDDEN_TARGETS=1 lifts this"
             ));
         }
@@ -92,12 +119,13 @@ pub(crate) fn clipboard_read_refusal(
 
 /// The yield watch, reduced to what the session gate needs to know.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum YieldReading<'a> {
+pub enum YieldReading<'a> {
     Off,
     Broken(&'a str),
     Watching { since_input_ms: Option<u64> },
 }
 
+#[cfg(target_os = "macos")]
 impl HumanWatch {
     pub(crate) fn reading(&self) -> YieldReading<'_> {
         match &self.watch {
@@ -110,13 +138,14 @@ impl HumanWatch {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// The gates a clipboard write passes: screen lock, then yield.
 pub(crate) fn guard_session(verb: &'static str, watch: &HumanWatch) -> Result<(), Refused> {
     session_gate(verb, session_locked(), watch.reading(), yield_idle_ms())
 }
 
 /// [`guard_session`] with every input passed in, for tests.
-pub(crate) fn session_gate(
+pub fn session_gate(
     verb: &'static str,
     locked: bool,
     watch: YieldReading<'_>,

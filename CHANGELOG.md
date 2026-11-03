@@ -5,6 +5,51 @@ caller can *notice* takes the minor slot, even when it is a bug fix — the tool
 descriptions are the API here, and an agent that learned the old behaviour is a
 caller.
 
+## 0.11.0
+
+### Linux support (partial), behind a new `PlatformAdapter` trait
+
+On macOS the tool surface is identical to 0.10.0: same 34 tools, same schemas,
+and a byte-identical `tools/list`. The minor bump is for the new platform
+target, and for the new error and delivery variants a Linux caller can see.
+
+- **`PlatformAdapter`** (`cua-core/src/platform`) is now the only way
+  `cua-mcp` reaches a platform. The macOS backend is unchanged code behind
+  `cfg(target_os = "macos")`, and its objc2 / `cua-ax` / `cua-hid` /
+  `cua-capture` dependencies are now target-specific.
+- **What moved.**
+  - Public session types moved to `session/types.rs`.
+  - The gate order moved into `safety::guard_with`, with a per-platform
+    `SessionProbe` supplying the session facts.
+  - Tree rendering and `find` matching are generic over `snapshot::TreeNode`.
+  - The clipboard read policy is now `safety::clipboard_withheld`.
+- **New crate `cua-ax-linux`.**
+  - The accessibility tree and element actions use AT-SPI2. They work under
+    X11 and Wayland.
+  - Screenshots, displays, the clipboard, EWMH window requests and the
+    yield-to-human idle reading use X11.
+  - Pointer and keystroke synthesis use XTEST, only with `CUA_LINUX_XTEST=1`,
+    because on Linux that input goes through the *shared* pointer and
+    keyboard.
+  - Notifications and `close_app` are not supported. Each refuses with its
+    reason.
+  - See the README's OS support table and DESIGN.md §15.
+- **New `CoreError` variants.** None is constructed on macOS.
+  - `PlatformUnsupported` → `PLATFORM_NOT_SUPPORTED`.
+  - `ElementUnsupported` → `ACTION_NOT_SUPPORTED`.
+  - `Accessibility` → `INTERNAL`.
+  - `Ax`, `Capture` and `PidClickUnavailable` now exist on macOS only.
+- **New `Delivery` variants:** `SharedInput` (`xtest (shared input)`) and
+  `WindowManager` (`wm`). New `ClipboardAccess::NoPrivacyLayer`. None is
+  produced on macOS.
+- **Forbidden targets on Linux.** Matched on the executable name: credential
+  stores, settings panels, polkit agents, `pinentry*`, screen lockers. These
+  live in a separate table that is empty on macOS, so the macOS classification
+  is unchanged.
+- **CI.** New `ubuntu-latest` job: fmt, isolated builds, clippy, and tests
+  inside a D-Bus session with the AT-SPI bus and Xvfb. The macOS job is
+  untouched.
+
 ## 0.10.0
 
 ### Window and app management

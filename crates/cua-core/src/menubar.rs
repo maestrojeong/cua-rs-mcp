@@ -26,6 +26,7 @@
 //! separators and its dynamically inserted rows while its titles are what the
 //! caller read.
 
+#[cfg(target_os = "macos")]
 use cua_ax::{attr, Element};
 
 /// One row of a menu bar menu.
@@ -64,6 +65,7 @@ pub enum MenuWalkError {
     /// The app's AX bridge failed while the menu hierarchy was being read.
     /// Kept separate from absence so a busy app is never described as one that
     /// does not publish a menu bar or the requested row.
+    #[cfg(target_os = "macos")]
     Ax(cua_ax::AxError),
     /// The application element publishes no `AXMenuBar` at all — a background
     /// agent, or an app that has not finished launching.
@@ -84,6 +86,7 @@ pub enum MenuWalkError {
 impl std::fmt::Display for MenuWalkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(target_os = "macos")]
             Self::Ax(e) => write!(f, "could not read this app's menu bar: {e}"),
             Self::NoMenuBar => write!(f, "this app publishes no menu bar"),
             Self::NoSuchItem {
@@ -121,6 +124,7 @@ impl std::fmt::Display for MenuWalkError {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl From<cua_ax::AxError> for MenuWalkError {
     fn from(value: cua_ax::AxError) -> Self {
         Self::Ax(value)
@@ -191,6 +195,7 @@ pub fn menu_shortcut(cmd_char: Option<&str>, modifiers: Option<f64>) -> Option<S
     Some(parts.join("+"))
 }
 
+#[cfg(target_os = "macos")]
 /// Read one level of a menu, or press a leaf, by walking `AXMenuBar` along
 /// `steps`.
 ///
@@ -258,6 +263,7 @@ pub(crate) fn walk(
     ))
 }
 
+#[cfg(target_os = "macos")]
 /// The menu rows directly under `level`, described.
 fn rows_of(level: &Element, path: &str) -> std::result::Result<Vec<MenuItem>, MenuWalkError> {
     level_items(level)?
@@ -266,6 +272,7 @@ fn rows_of(level: &Element, path: &str) -> std::result::Result<Vec<MenuItem>, Me
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 /// The child elements of `level` that are menu rows.
 ///
 /// An `AXMenuBar`'s children are `AXMenuBarItem`s and an `AXMenu`'s are
@@ -283,6 +290,7 @@ fn level_items(level: &Element) -> std::result::Result<Vec<Element>, MenuWalkErr
         .collect())
 }
 
+#[cfg(target_os = "macos")]
 /// The `AXMenu` a row owns, when it owns one. A row with a submenu has exactly
 /// one `AXMenu` child; a leaf has none.
 fn submenu_of(item: &Element) -> std::result::Result<Option<Element>, MenuWalkError> {
@@ -292,6 +300,7 @@ fn submenu_of(item: &Element) -> std::result::Result<Option<Element>, MenuWalkEr
         .find(|c| c.role().as_deref() == Some("AXMenu")))
 }
 
+#[cfg(target_os = "macos")]
 fn describe(el: &Element, path: &str) -> std::result::Result<MenuItem, MenuWalkError> {
     let title = el.label().unwrap_or_default();
     Ok(MenuItem {
@@ -309,6 +318,7 @@ fn describe(el: &Element, path: &str) -> std::result::Result<MenuItem, MenuWalkE
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn join(path: &str, step: &str) -> String {
     if path.is_empty() {
         step.to_string()
@@ -317,6 +327,7 @@ fn join(path: &str, step: &str) -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parent_path(path: &str) -> String {
     match path.rsplit_once('>') {
         Some((head, _)) => head.trim_end().to_string(),
@@ -438,6 +449,7 @@ mod tests {
         assert!(e.to_string().contains("the menu bar"), "{e}");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_ax_failure_is_not_described_as_an_absent_menu_bar() {
         let e = MenuWalkError::Ax(cua_ax::AxError::CannotComplete);

@@ -31,6 +31,10 @@ use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardTypeString};
 use objc2_foundation::{NSObjectProtocol, NSString};
 
+/// Defined with the other platform-neutral session types; named `Access`
+/// here, as it always was, for this module's own callers.
+pub use crate::session::ClipboardAccess as Access;
+
 /// The UTI `NSPasteboardTypeString` resolves to. Kept as a constant so policy
 /// code and tests can name it without touching AppKit.
 pub const STRING_TYPE: &str = "public.utf8-plain-text";
@@ -43,38 +47,6 @@ pub const CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
 /// The nspasteboard.org marker naming the bundle id of the app that wrote the
 /// current contents, when the writer bothers to say.
 pub const SOURCE_TYPE: &str = "org.nspasteboard.source";
-
-/// What the system will let this process read, as of macOS 26.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    /// Never prompted yet: the first content read may raise a system alert.
-    Default,
-    /// The user is asked on each programmatic content read.
-    Ask,
-    AlwaysAllow,
-    /// Content reads return nothing, silently. A "no text" answer under this
-    /// is not evidence that the clipboard is empty.
-    AlwaysDeny,
-    /// A value this build does not know.
-    Other(isize),
-    /// The OS predates the setting (before macOS 26): reads are unrestricted.
-    NotApplicable,
-}
-
-impl Access {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Access::Default => "default (macOS may ask the user on the first read)",
-            Access::Ask => "ask (macOS asks the user on each read)",
-            Access::AlwaysAllow => "always allow",
-            Access::AlwaysDeny => {
-                "ALWAYS DENY (macOS hides the contents from this process; the clipboard may not be empty)"
-            }
-            Access::Other(_) => "unrecognized",
-            Access::NotApplicable => "unrestricted (this macOS has no pasteboard privacy setting)",
-        }
-    }
-}
 
 /// The metadata of the current contents — never the contents themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]

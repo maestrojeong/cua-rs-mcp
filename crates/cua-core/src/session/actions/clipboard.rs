@@ -7,49 +7,6 @@
 use super::*;
 use crate::clipboard;
 
-/// What `clipboard_get` found in the text slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipboardContents {
-    /// Plain text was on the clipboard.
-    Text(String),
-    /// No plain-text representation: an image, a file list, or nothing at all.
-    /// Not an error — the type list says what is there instead.
-    NoText,
-    /// There may be text, and policy kept it back. The reason quotes the
-    /// evidence. The text was never read into this process.
-    Withheld(String),
-}
-
-/// One clipboard read.
-#[derive(Debug, Clone)]
-pub struct ClipboardRead {
-    pub contents: ClipboardContents,
-    /// Every type on the clipboard. Format names only, never contents, so they
-    /// are returned in every branch, including a withheld one.
-    pub types: Vec<String>,
-    pub change_count: isize,
-    /// What macOS 26 pasteboard privacy will let this process read. Under
-    /// [`ClipboardAccess::AlwaysDeny`] a `NoText` is not evidence of anything.
-    pub access: ClipboardAccess,
-}
-
-/// One clipboard write or clear.
-#[derive(Debug, Clone)]
-pub struct ClipboardWrite {
-    pub verb: &'static str,
-    /// The change count the write produced.
-    pub change_count: isize,
-    /// Characters written; `0` for a clear.
-    pub chars: usize,
-    /// Whether a metadata re-read agrees with what was written: same change
-    /// count (nobody wrote in between), and the type list is plain text for a
-    /// set or empty for a clear. Checked without reading the contents back,
-    /// because that read is the one macOS 26 may raise an alert for.
-    pub verified: bool,
-}
-
-pub use clipboard::Access as ClipboardAccess;
-
 impl Inner {
     pub(super) fn clipboard_get(&self) -> Result<ClipboardRead> {
         let before = clipboard::peek();

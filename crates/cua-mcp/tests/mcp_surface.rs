@@ -241,6 +241,8 @@ fn a_chord_is_attempted_via_pid_by_default() {
     );
 }
 
+// Pins the macOS backend's own contract (see the Linux counterparts below).
+#[cfg(target_os = "macos")]
 #[test]
 fn cua_key_ax_only_restores_the_old_chord_refusal() {
     // The escape hatch back to the pre-pid-tier contract: with it set, a
@@ -755,6 +757,8 @@ fn close_app_advertises_the_confirmation_and_launch_app_the_opt_in() {
     );
 }
 
+// Pins the macOS backend's own contract (see the Linux counterparts below).
+#[cfg(target_os = "macos")]
 #[test]
 fn close_app_without_confirmation_is_refused_before_anything_quits() {
     // Finder is always running and is also protected, so this asserts the
@@ -783,4 +787,46 @@ fn list_displays_needs_no_grant() {
     );
     let text = call_text(&responses, 3);
     assert!(text.contains("active displays"), "{text}");
+}
+
+/// On Linux the tools that have no backend answer a structured refusal that
+/// names the platform and the reason — never a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_unsupported_tools_refuse_with_a_reason_instead_of_no_oping() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_notifications","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"close_app","arguments":{"app":"anything","confirm_destructive":true}}}"#,
+        ],
+    );
+    for id in [3, 4] {
+        let text = call_text(&responses, id);
+        assert_eq!(
+            response(&responses, id)["result"]["isError"],
+            true,
+            "{text}"
+        );
+        assert!(
+            text.contains("is not supported on linux"),
+            "an unsupported tool must say so, with the platform: {text}"
+        );
+    }
+}
+
+/// The Linux backend selects itself at compile time and reports Linux
+/// remedies, not System Settings ones.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_check_permissions_gives_linux_remedies() {
+    let responses = talk(
+        &[],
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"check_permissions","arguments":{}}}"#,
+        ],
+    );
+    let text = call_text(&responses, 3);
+    assert!(text.contains("accessibility:"), "{text}");
+    assert!(!text.contains("System Settings"), "{text}");
 }

@@ -178,6 +178,7 @@ impl ErrorOutcome {
 
             KeyNoAccessibilityEquivalent { .. }
             | KeyVerbUnsupported { .. }
+            | ElementUnsupported { .. }
             | NotificationActionUnavailable { .. } => (ErrorCode::ActionNotSupported, None),
 
             // Notification Center itself (or ControlCenter's clock) is not
@@ -187,8 +188,14 @@ impl ErrorOutcome {
 
             KeyChordUnparseable { .. } => (ErrorCode::InvalidArgs, None),
 
+            // A capability the tool surface has and this platform's backend
+            // cannot provide. Never constructed on macOS.
+            PlatformUnsupported { .. } => (ErrorCode::PlatformNotSupported, None),
+
+            #[cfg(target_os = "macos")]
+            PidClickUnavailable { .. } => (ErrorCode::ActionFailed, None),
+
             PidKeyUnavailable { .. }
-            | PidClickUnavailable { .. }
             | PidClickFailed { .. }
             | WindowClickRefused { .. }
             | DragRefused { .. }
@@ -205,7 +212,12 @@ impl ErrorOutcome {
             // it gets the same code with its own reason.
             FocusMismatch { .. } => (ErrorCode::PolicyDenied, Some(PolicyReason::StrictFocus)),
 
-            Ax(_) | Capture(_) | WorkerGone | NativePanic => (ErrorCode::Internal, None),
+            #[cfg(target_os = "macos")]
+            Ax(_) | Capture(_) => (ErrorCode::Internal, None),
+
+            // The non-macOS counterpart of `Ax(_)`: a platform accessibility
+            // call failed in a way no variant above names.
+            Accessibility { .. } | WorkerGone | NativePanic => (ErrorCode::Internal, None),
         };
 
         // `NativePanic` is the one variant where "was anything dispatched"
